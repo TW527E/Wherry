@@ -123,11 +123,15 @@ export class XCollector implements Collector {
 
   async collect(since?: string): Promise<SourceSnapshot> {
     const page = await this.browserPage();
-    const url = `https://x.com/${encodeURIComponent(this.config.handle)}/with_replies`;
-    // The collector reuses one long-lived page. X is an SPA that does not auto-refresh, and a
-    // goto to the URL it is already on serves the stale cached timeline (verified: the profile
-    // kept showing days-old tweets until a reload, which then surfaced the newest post). Navigate,
-    // then force a reload so X refetches the current timeline every cycle.
+    // Read the main profile timeline, NOT /with_replies. Verified against the live account: the
+    // main timeline reliably renders the newest top-level tweets (today's posts appeared at once),
+    // while /with_replies served a stale, days-old view that never surfaced recent posts — which
+    // is exactly why collection kept reporting an old `newest`. The main timeline covers thread
+    // roots (what we sync); self-reply continuations are not read from here.
+    const url = `https://x.com/${encodeURIComponent(this.config.handle)}`;
+    // The collector reuses one long-lived page. X is an SPA that does not auto-refresh, and a goto
+    // to the URL it is already on can serve a stale cached timeline, so force a reload when we are
+    // already there to make X refetch the current timeline every cycle.
     const alreadyThere = page.url().startsWith(url);
     if (alreadyThere) await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
     else await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
