@@ -140,6 +140,34 @@ test('a destination without a publisher fails loudly instead of spinning', async
   assert.equal(await worker.run(at(960)), 0);
 });
 
+test('a reminder delivery carries the interactive buttons and arms a reminder record', async () => {
+  const cfg = config(['telegram']);
+  const store = new Store(':memory:');
+  const engine = new Engine(store, cfg, transport);
+  engine.ingest(snapshot([], at(0), 'bluesky', 'bluesky-account'), at(0));
+  // A native root post enqueues a manual X reminder job.
+  const native = post({ id: 'at://did:plc:x/1', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'remind me' });
+  engine.ingest(snapshot([native], at(10), 'bluesky', 'bluesky-account'), at(10));
+  const reminderJob = store.jobs(100).find(j => j.kind === 'reminder')!;
+  assert.ok(reminderJob, 'a native root produced a reminder job');
+
+  let noticeButtons: string[] | undefined;
+  const publisher: Publisher = {
+    destination: 'telegram',
+    async publish(part) {
+      if (part.key === 'notice') noticeButtons = part.buttons?.map(b => b.data);
+      return { id: `tg-${part.key}`, messageIds: [777], chatId: '999' };
+    },
+  };
+  const worker = new Worker(engine, new Map<Destination, Publisher>([['telegram', publisher]]));
+  await worker.run(at(20));
+  assert.deepEqual(noticeButtons, ['rem:y', 'rem:n'], 'the notice offers 要發 / 不發');
+  const reminder = store.getReminder(777);
+  assert.ok(reminder, 'the reminder message is recorded for later button/link handling');
+  assert.equal(reminder?.state, 'offered');
+  assert.equal(reminder?.mirrorId, `mirror:${reminderJob.aggregateId}`);
+});
+
 test('preview mode records intended deliveries without any remote call', async () => {
   const { store, engine } = sealedBatch();
   const seen: string[] = [];

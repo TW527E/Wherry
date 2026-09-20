@@ -43,15 +43,24 @@ export class TelegramClient implements Publisher {
       return { id: String(response.result.message_id), messageIds: [response.result.message_id], chatId };
     }
     const text = `${htmlEscape(part.text)}${link}`; if (text.length > MAX_TEXT) throw new Error('Telegram message requires core text splitter before publish');
-    const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...(reply ? { reply_parameters: reply } : {}) });
+    const markup = part.buttons?.length ? { reply_markup: { inline_keyboard: [part.buttons.map(b => ({ text: b.text, callback_data: b.data }))] } } : {};
+    const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...(reply ? { reply_parameters: reply } : {}), ...markup });
     return { id: String(result.message_id), messageIds: [result.message_id], chatId };
   }
   async sendPlain(text: string, audience: TelegramAudience = 'ops'): Promise<RemoteRef> {
     const chatId = this.chat(audience); const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: htmlEscape(text), parse_mode: 'HTML' });
     return { id: String(result.message_id), messageIds: [result.message_id], chatId };
   }
-  async getUpdates(offset?: number): Promise<Array<{ update_id: number; message?: TelegramUpdateMessage }>> {
-    return this.call('getUpdates', { timeout: 0, limit: 100, ...(offset === undefined ? {} : { offset }) });
+  /** Replace a message's text (and clear its buttons). Used to update the reminder after a tap. */
+  async editMessageText(chatId: string, messageId: number, text: string): Promise<void> {
+    await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text: htmlEscape(text), parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+  }
+  /** Acknowledge a button tap so Telegram stops the client-side spinner; text is an optional toast. */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    await this.call('answerCallbackQuery', { callback_query_id: callbackQueryId, ...(text ? { text } : {}) }).catch(() => undefined);
+  }
+  async getUpdates(offset?: number): Promise<Array<{ update_id: number; message?: TelegramUpdateMessage; callback_query?: TelegramCallbackQuery }>> {
+    return this.call('getUpdates', { timeout: 0, limit: 100, allowed_updates: ['message', 'callback_query'], ...(offset === undefined ? {} : { offset }) });
   }
   /** Register the command list so Telegram shows the "/" menu and autocomplete in the chat. */
   async setMyCommands(commands: Array<{ command: string; description: string }>): Promise<void> {
@@ -85,5 +94,12 @@ export interface TelegramUpdateMessage {
   text?: string;
   caption?: string;
   document?: TelegramDocument;
+  reply_to_message?: { message_id: number };
+}
+export interface TelegramCallbackQuery {
+  id: string;
+  from: { id: number };
+  data?: string;
+  message?: { message_id: number; chat: { id: number | string; type: string } };
 }
 

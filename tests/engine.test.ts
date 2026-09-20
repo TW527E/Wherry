@@ -219,6 +219,21 @@ test('a batch matching a pending mirror is suppressed and never publishes', () =
   assert.equal(store.jobs(100).filter(j => j.kind === 'publish').length, 0);
 });
 
+test('an X post manually registered as a mirror is ignored on the next scan', () => {
+  const { store, engine } = setup();
+  // The owner posted natively, then (via the reminder "要發" flow) registered their manual X copy.
+  const native = post({ id: 'at://did:plc:x/9', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'echo guard' });
+  engine.ingest(snapshot([native], at(10), 'bluesky', 'bluesky-account'), at(10));
+  store.matchMirror('mirror:bluesky:at://did:plc:x/9', '12345');
+  assert.equal(store.mirrorMatchesXId('12345'), true);
+
+  // That exact X id later shows up in an X scan; it must be dropped, not turned into a batch.
+  engine.ingest(snapshot([post({ id: '12345', createdAt: at(20), text: 'echo guard' })], at(650)), at(650));
+  assert.equal(store.getBatch('x:12345'), undefined, 'no batch is opened for a registered manual mirror');
+  assert.equal(store.getPost('x', '12345')?.classification, 'ignored');
+  assert.equal(store.getPost('x', '12345')?.reason, 'manual_mirror_registered');
+});
+
 test('unsupported phase-one content is held instead of being silently degraded', () => {
   const notes = [
     post({ id: '700', createdAt: at(10), attachments: [{ kind: 'video', alt: '' }] }),

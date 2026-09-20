@@ -141,6 +141,9 @@ export class Engine {
   private ingestX(post: SourcePost, now: string): void {
     if (post.repost || post.visibility !== 'public') { this.store.addPost(post, 'ignored', 'repost_or_non_public', now); return; }
     if (!post.relationKnown || post.replyToId === undefined) { this.store.addPost(post, 'mirror_review', 'reply_relationship_unknown', now); return; }
+    // Deterministic anti-echo: the owner told us (via the reminder's "要發" flow) that this exact X
+    // post is their manual copy of a downstream post, so never sync it back.
+    if (this.store.mirrorMatchesXId(post.id)) { this.store.addPost(post, 'ignored', 'manual_mirror_registered', now); return; }
     if (post.replyToId === null) {
       const id = `x:${post.id}`;
       const unsupported = unsupportedReason(post);
@@ -253,7 +256,11 @@ export class Engine {
     const members = job.kind === 'publish' ? this.store.batchPosts(job.aggregateId).map(p => p.post) : [this.store.postByKey(job.aggregateId)?.post].filter((p): p is SourcePost => Boolean(p));
     if (!members.length) throw new Error('Job source not found');
     const output: PublishPart[] = [];
-    if (job.kind === 'reminder') output.push({ key: 'notice', sourcePostId: members[0]!.id, text: `🔔 ${members[0]!.platform} 有新內容，請手動發到 X。\n任務：${job.aggregateId}\n下方為可複製的內容。發出後可用 /mirror ${job.aggregateId} <X網址> 登記。`, images: [] });
+    if (job.kind === 'reminder') output.push({
+      key: 'notice', sourcePostId: members[0]!.id,
+      text: `🔔 你在 ${members[0]!.platform} 發了新內容。要不要也發到 X？\n下方是可直接複製的內容。請選擇：`,
+      images: [], buttons: [{ text: '1️⃣ 要發', data: 'rem:y' }, { text: '2️⃣ 不發', data: 'rem:n' }],
+    });
     for (const post of members) {
       const unsupported = unsupportedReason(post);
       if (unsupported) throw new Error(unsupported);
@@ -319,6 +326,11 @@ export class Worker {
             audience: job.kind === 'reminder' ? 'private' : 'public', idempotencyKey: `${job.id}:${part.key}`,
           });
           store.finishStep(job.id, part.key, ref);
+          // The interactive reminder notice carries buttons; record its message so a later button
+          // tap / link reply can be resolved back to this batch and its anti-echo mirror.
+          if (part.key === 'notice' && job.kind === 'reminder' && ref.chatId && ref.messageIds?.[0]) {
+            store.armReminder(ref.messageIds[0], ref.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
+          }
           if (part.key !== 'notice') { parent = ref; root ??= ref; }
         }
         store.updateJob(job.id, 'succeeded');

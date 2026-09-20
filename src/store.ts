@@ -17,6 +17,9 @@ const schema = [
   'CREATE TABLE IF NOT EXISTS steps (job_id TEXT NOT NULL REFERENCES jobs(id), step_key TEXT NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL, result TEXT, started_at TEXT NOT NULL, PRIMARY KEY(job_id,step_key))',
   'CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, entity_id TEXT)',
   'CREATE TABLE IF NOT EXISTS command_receipts (update_id INTEGER PRIMARY KEY, at TEXT NOT NULL)',
+  // One row per interactive "post this to X" reminder message the bot sent. Keyed by the Telegram
+  // message_id so a later button tap or link reply can find the batch/mirror it belongs to.
+  "CREATE TABLE IF NOT EXISTS reminders (message_id INTEGER PRIMARY KEY, chat_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, mirror_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', x_url TEXT, at TEXT NOT NULL)",
 ] as const;
 
 export class Store {
@@ -45,6 +48,13 @@ export class Store {
   }
   events(limit = 100): EventRecord[] {
     return this.db.prepare('SELECT at,level,message,entity_id FROM events ORDER BY id DESC LIMIT ?').all(limit).map(r => ({ at: String(r.at), level: r.level as EventRecord['level'], message: String(r.message), entityId: r.entity_id ? String(r.entity_id) : undefined }));
+  }
+  /** Highest event row id so far (0 when there are none). Used to seed the Telegram error offset. */
+  maxEventId(): number { const row = this.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM events').get(); return Number(row?.id ?? 0); }
+  /** Error events with id greater than `afterId`, oldest first, for forwarding to Telegram in order. */
+  errorEventsAfter(afterId: number, limit = 20): Array<{ id: number; at: string; message: string; entityId?: string }> {
+    return this.db.prepare("SELECT id,at,message,entity_id FROM events WHERE level='error' AND id>? ORDER BY id ASC LIMIT ?").all(afterId, limit)
+      .map(r => ({ id: Number(r.id), at: String(r.at), message: String(r.message), entityId: r.entity_id ? String(r.entity_id) : undefined }));
   }
   static postKey(platform: SourcePlatform, id: string): string { return `${platform}:${id}`; }
   addPost(post: SourcePost, classification: Classification, reason: string, now: string, batchId?: string): boolean {
@@ -90,6 +100,19 @@ export class Store {
     return this.db.prepare('SELECT * FROM mirrors WHERE expires_at >= ?').all(threshold).map(r => ({ id: String(r.id), post: decode<SourcePost>(r.payload), expired: String(r.expires_at) < now, state: String(r.state) }));
   }
   matchMirror(id: string, xId: string): void { this.db.prepare("UPDATE mirrors SET state='matched',matched_x_id=? WHERE id=?").run(xId, id); }
+  /** True when some mirror was manually registered to this X post id — a deterministic anti-echo hit. */
+  mirrorMatchesXId(xId: string): boolean { return Boolean(this.db.prepare('SELECT 1 FROM mirrors WHERE matched_x_id=? LIMIT 1').get(xId)); }
+  /** Record the interactive reminder message so a later button tap / link reply can be resolved. */
+  armReminder(messageId: number, chatId: string, aggregateId: string, mirrorId: string, now: string): void {
+    this.db.prepare("INSERT INTO reminders(message_id,chat_id,aggregate_id,mirror_id,state,at) VALUES(?,?,?,?,'offered',?) ON CONFLICT(message_id) DO NOTHING").run(messageId, chatId, aggregateId, mirrorId, now);
+  }
+  getReminder(messageId: number): { messageId: number; chatId: string; aggregateId: string; mirrorId: string; state: string; xUrl?: string } | undefined {
+    const row = this.db.prepare('SELECT * FROM reminders WHERE message_id=?').get(messageId);
+    return row ? { messageId: Number(row.message_id), chatId: String(row.chat_id), aggregateId: String(row.aggregate_id), mirrorId: String(row.mirror_id), state: String(row.state), xUrl: row.x_url ? String(row.x_url) : undefined } : undefined;
+  }
+  setReminderState(messageId: number, state: string, xUrl?: string): void {
+    this.db.prepare('UPDATE reminders SET state=?,x_url=COALESCE(?,x_url) WHERE message_id=?').run(state, xUrl || null, messageId);
+  }
   enqueue(kind: Job['kind'], aggregateId: string, destination: Destination, now: string, dueAt = now): string {
     const existing = this.db.prepare('SELECT id FROM jobs WHERE kind=? AND aggregate_id=? AND destination=?').get(kind, aggregateId, destination);
     if (existing) return String(existing.id);

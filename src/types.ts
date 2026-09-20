@@ -67,6 +67,11 @@ export interface PreparedVideo {
   sha256: string;
 }
 
+export interface InlineButton {
+  text: string;
+  data: string;
+}
+
 export interface PublishPart {
   key: string;
   sourcePostId: string;
@@ -75,6 +80,8 @@ export interface PublishPart {
   images: PreparedImage[];
   sourceUrl?: string;
   isFooter?: boolean;
+  /** Inline keyboard, one row of buttons, attached only by Telegram (e.g. the interactive reminder). */
+  buttons?: InlineButton[];
 }
 
 export interface RemoteRef {
