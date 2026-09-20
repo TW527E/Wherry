@@ -1,0 +1,19 @@
+services:
+  bridge:
+    build: .
+    image: crosspost-bridge:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      # The image ships Chromium; X_BROWSER=auto uses it (or set =path with CHROMIUM_PATH).
+      X_BROWSER: auto
+      CHROMIUM_PATH: /usr/bin/chromium
+    volumes:
+      # Holds the SQLite database, downloaded media, and the private X browser profile.
+      - ./data:/app/data
+    # Keep the UI off the public interface. Reach it through an SSH tunnel instead.
+    ports:
+      - "127.0.0.1:3000:3000"
+    security_opt:
+      - no-new-privileges:true

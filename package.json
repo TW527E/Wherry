@@ -1,0 +1,41 @@
+{
+  "name": "crosspost-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "X-first personal cross-posting with manual X publishing and Telegram assistance",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts serve",
+    "start": "node dist/cli.js serve",
+    "cli": "tsx src/cli.ts",
+    "check": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts",
+    "verify": "npm run check && npm test && npm run build"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.18.3",
+    "cheerio": "^1.1.2",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.6.2",
+    "ipaddr.js": "^2.3.0",
+    "playwright-core": "^1.56.1",
+    "sharp": "^0.35.4",
+    "twitter-text": "^3.1.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/twitter-text": "^3.1.10",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "core-js@2.6.12": true,
+    "esbuild@0.28.2": true,
+    "fsevents@2.3.3": true
+  }
+}

@@ -1,0 +1,105 @@
+import { resolve } from 'node:path';
+import { z } from 'zod';
+import { BROWSER_CHOICES } from './platforms/browser.js';
+import type { Destination } from './types.js';
+
+const bool = (value: string | undefined, fallback: boolean): boolean => value === undefined ? fallback : value === 'true';
+const integer = (value: string | undefined, fallback: number, min: number, max: number): number => {
+  const n = value === undefined ? fallback : Number(value);
+  return z.number().int().min(min).max(max).parse(n);
+};
+
+export interface AppConfig {
+  dataDir: string;
+  databasePath: string;
+  mode: 'preview' | 'live';
+  host: string;
+  port: number;
+  webToken: string;
+  pollSeconds: number;
+  threadWindowSeconds: number;
+  settleSeconds: number;
+  sourceFreshnessSeconds: number;
+  maxImageBytes: number;
+  maxDownloadBytes: number;
+  maxAttempts: number;
+  destinations: Destination[];
+  x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number };
+  bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
+  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string };
+  telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const dataDir = resolve(env.DATA_DIR || 'data');
+  const mode = z.enum(['preview', 'live']).parse(env.APP_MODE || 'preview');
+  const destinations = z.array(z.enum(['bluesky', 'sharkey', 'telegram'])).parse(
+    (env.DESTINATIONS || '').split(',').map(s => s.trim()).filter(Boolean),
+  );
+  const config: AppConfig = {
+    dataDir,
+    databasePath: resolve(dataDir, 'crosspost.sqlite'),
+    mode,
+    host: env.HOST || '127.0.0.1',
+    port: integer(env.PORT, 3000, 1, 65535),
+    webToken: env.WEB_TOKEN || '',
+    pollSeconds: integer(env.POLL_SECONDS, 120, 30, 86400),
+    threadWindowSeconds: integer(env.THREAD_WINDOW_SECONDS, 600, 30, 3600),
+    settleSeconds: integer(env.THREAD_SETTLE_SECONDS, 180, 30, 1800),
+    sourceFreshnessSeconds: integer(env.SOURCE_FRESHNESS_SECONDS, 300, 30, 3600),
+    maxImageBytes: 2_000_000,
+    maxDownloadBytes: integer(env.MAX_DOWNLOAD_BYTES, 20_000_000, 1_000, 100_000_000),
+    maxAttempts: integer(env.MAX_ATTEMPTS, 5, 1, 20),
+    destinations: [...new Set(destinations)],
+    x: {
+      enabled: bool(env.X_ENABLED, false), handle: env.X_HANDLE || '',
+      profileDir: resolve(env.X_PROFILE_DIR || `${dataDir}/x-profile`),
+      browser: (env.X_BROWSER || 'auto').trim().toLowerCase(),
+      executablePath: env.CHROMIUM_PATH || '', headless: bool(env.X_HEADLESS, true),
+      maxPages: integer(env.X_MAX_PAGES, 4, 1, 10),
+    },
+    bluesky: {
+      enabled: bool(env.BLUESKY_ENABLED, false), identifier: env.BLUESKY_IDENTIFIER || '',
+      appPassword: env.BLUESKY_APP_PASSWORD || '', serviceUrl: env.BLUESKY_SERVICE_URL || 'https://bsky.social',
+      publicUrl: 'https://public.api.bsky.app',
+    },
+    sharkey: {
+      enabled: bool(env.SHARKEY_ENABLED, false), baseUrl: env.SHARKEY_URL || 'https://dvd.chat',
+      token: env.SHARKEY_TOKEN || '', userId: env.SHARKEY_USER_ID || '', username: env.SHARKEY_USERNAME || '',
+    },
+    telegram: {
+      enabled: bool(env.TELEGRAM_ENABLED, false), token: env.TELEGRAM_BOT_TOKEN || '',
+      ownerId: env.TELEGRAM_OWNER_ID || '', privateChatId: env.TELEGRAM_PRIVATE_CHAT_ID || env.TELEGRAM_OWNER_ID || '',
+      opsChatId: env.TELEGRAM_OPS_CHAT_ID || '', publicChatId: env.TELEGRAM_PUBLIC_CHAT_ID || '',
+      pollCommands: bool(env.TELEGRAM_POLL_COMMANDS, false),
+    },
+  };
+  if (config.host !== '127.0.0.1' && config.host !== '::1' && config.webToken.length < 32) {
+    throw new Error('WEB_TOKEN must have at least 32 characters when binding outside loopback');
+  }
+  // A destination that is never observed cannot rule out a manual mirror of that post on X.
+  // Requiring the matching source keeps the anti-loop check meaningful instead of silently guessing.
+  for (const destination of config.destinations) {
+    if (destination === 'bluesky' && !config.bluesky.enabled) throw new Error('DESTINATIONS includes bluesky, so BLUESKY_ENABLED must also be true (mirror detection requires observing that account)');
+    if (destination === 'sharkey' && !config.sharkey.enabled) throw new Error('DESTINATIONS includes sharkey, so SHARKEY_ENABLED must also be true (mirror detection requires observing that account)');
+  }
+  if (config.x.enabled && !/^[A-Za-z0-9_]{1,15}$/.test(config.x.handle)) throw new Error('Set a valid X_HANDLE before enabling X');
+  if (!(BROWSER_CHOICES as readonly string[]).includes(config.x.browser)) {
+    throw new Error(`X_BROWSER must be one of: ${BROWSER_CHOICES.join(', ')}`);
+  }
+  if (config.x.browser === 'path' && !config.x.executablePath) throw new Error('X_BROWSER=path requires CHROMIUM_PATH');
+  for (const id of [config.telegram.ownerId, config.telegram.privateChatId, config.telegram.opsChatId, config.telegram.publicChatId]) {
+    if (id && !/^-?\d+$/.test(id)) throw new Error('Telegram identities must be numeric IDs, not usernames');
+  }
+  return config;
+}
+
+export function publicConfig(config: AppConfig): Record<string, unknown> {
+  return {
+    mode: config.mode, destinations: config.destinations, pollSeconds: config.pollSeconds,
+    threadWindowSeconds: config.threadWindowSeconds, settleSeconds: config.settleSeconds,
+    sources: { x: config.x.enabled, bluesky: config.bluesky.enabled, sharkey: config.sharkey.enabled },
+    telegramCommands: config.telegram.pollCommands,
+    capabilities: { xWrites: false, phase: 1, video: false, scheduling: true },
+  };
+}

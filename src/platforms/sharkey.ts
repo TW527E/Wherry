@@ -1,0 +1,265 @@
+import type { AppConfig } from '../config.js';
+import type { Attachment, Collector, PublishContext, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import {
+  PlatformError, httpsBase, isoDate, jsonBody, multipart, nonempty, object, own, positiveInteger,
+  requestJson, schemaError, validateImage, warning, webUrl, type JsonObject,
+} from './parse.js';
+
+export type SharkeyConfig = AppConfig['sharkey'];
+export interface SharkeyOptions {
+  maxPages?: number;
+  /** Optional caller-owned collection window; no hidden watermark is advanced after a partial scan. */
+  sinceId?: string;
+  untilId?: string;
+  now?: () => Date;
+}
+export interface SharkeyLimits {
+  maxNoteTextLength: number;
+  maxCwLength: number;
+  maxAltTextLength: number;
+  maxFileBytes?: number;
+  canPublicNote: boolean;
+}
+interface SharkeyAccount { id: string; username: string; policies?: JsonObject }
+interface ParsedNote { post?: SourcePost; valid: boolean }
+const noteId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
+
+function parseNote(value: unknown, accountId: string, baseUrl: string): ParsedNote {
+  const note = object(value), user = object(note?.user);
+  if (!note || !noteId(note.id) || note.userId !== accountId || !isoDate(note.createdAt)
+    || (note.text !== null && typeof note.text !== 'string')) return { valid: false };
+  let valid = true;
+  if (!user || user.id !== accountId || (user.host !== null && user.host !== undefined)) valid = false;
+  if (!own(note, 'cw') || (note.cw !== null && typeof note.cw !== 'string')) valid = false;
+  if (!own(note, 'replyId') || (note.replyId !== null && !noteId(note.replyId))) valid = false;
+  if (!own(note, 'renoteId') || (note.renoteId !== null && !noteId(note.renoteId))) valid = false;
+  if (!Array.isArray(note.files) || note.files.length > 16) valid = false;
+  if (typeof note.localOnly !== 'boolean') valid = false;
+  const knownVisibility = ['public', 'home', 'followers', 'specified'].includes(String(note.visibility));
+  if (!knownVisibility) valid = false;
+  if (own(note, 'isSensitive') && typeof note.isSensitive !== 'boolean') valid = false;
+
+  const files = Array.isArray(note.files) ? note.files : [];
+  let sensitive = note.isSensitive === true;
+  const attachments: Attachment[] = [];
+  for (const raw of files) {
+    const file = object(raw), props = object(file?.properties);
+    const mime = typeof file?.type === 'string' ? file.type : '';
+    const url = webUrl(file?.url);
+    const alt = typeof file?.comment === 'string' ? file.comment : '';
+    if (!file || !noteId(file.id) || !mime || !url || !positiveInteger(file.size)
+      || !own(file, 'comment') || (file.comment !== null && typeof file.comment !== 'string') || typeof file.isSensitive !== 'boolean') valid = false;
+    if (file?.isSensitive === true) sensitive = true;
+    if (props && ((own(props, 'width') && !positiveInteger(props.width)) || (own(props, 'height') && !positiveInteger(props.height)))) valid = false;
+    const kind = mime.startsWith('image/') ? 'image' : mime.startsWith('video/') ? 'video' : mime.startsWith('audio/') ? 'audio' : 'unknown';
+    attachments.push({ kind, url, mimeType: mime || undefined, alt,
+      size: positiveInteger(file?.size) ? file.size : undefined,
+      width: positiveInteger(props?.width) ? props.width : undefined,
+      height: positiveInteger(props?.height) ? props.height : undefined,
+      animated: mime === 'image/gif' || mime === 'image/apng' || props?.isAnimated === true ? true : undefined });
+  }
+  if (own(note, 'fileIds')) {
+    if (!Array.isArray(note.fileIds) || note.fileIds.length !== files.length
+      || note.fileIds.some((id, index) => !noteId(id) || id !== object(files[index])?.id)) valid = false;
+  }
+
+  let poll = false;
+  if (own(note, 'poll') && note.poll !== null) {
+    poll = true;
+    const detail = object(note.poll);
+    if (!detail || typeof detail.multiple !== 'boolean' || !Array.isArray(detail.choices) || detail.choices.length < 2
+      || detail.choices.some(choice => typeof object(choice)?.text !== 'string' || !count(object(choice)?.votes))) valid = false;
+    if (detail && own(detail, 'expiresAt') && detail.expiresAt !== null && !isoDate(detail.expiresAt)) valid = false;
+  }
+
+  let relationKnown = own(note, 'replyId') && (note.replyId === null || noteId(note.replyId));
+  let rootId: string | undefined = note.replyId === null ? note.id : undefined;
+  let replyToAuthorId: string | null | undefined = note.replyId === null ? null : undefined;
+  if (noteId(note.replyId)) {
+    const parent = object(note.reply);
+    if (!parent || parent.id !== note.replyId || !noteId(parent.userId)) relationKnown = false;
+    else {
+      replyToAuthorId = parent.userId;
+      const visited = new Set<string>([note.id]);
+      let ancestor: JsonObject | undefined = parent;
+      for (let depth = 0; ancestor && depth < 10; depth++) {
+        if (!noteId(ancestor.id) || visited.has(ancestor.id)) { relationKnown = false; break; }
+        visited.add(ancestor.id);
+        if (ancestor.replyId === null) { rootId = ancestor.id; break; }
+        const next = object(ancestor.reply);
+        if (!next || next.id !== ancestor.replyId) break;
+        ancestor = next;
+      }
+    }
+  }
+  if (!relationKnown) valid = false;
+  const text = note.text ?? '';
+  const cw = typeof note.cw === 'string' ? note.cw : undefined;
+  const renote = noteId(note.renoteId) ? note.renoteId : undefined;
+  const repost = Boolean(renote && !text && !files.length && !poll && !cw);
+  const quoteUrl = renote && !repost ? `${baseUrl}/notes/${encodeURIComponent(renote)}` : undefined;
+  const restricted = note.visibility !== 'public' || note.localOnly === true || note.channelId != null;
+  return { valid, post: {
+    platform: 'sharkey', id: note.id, authorId: accountId, createdAt: note.createdAt, text,
+    url: `${baseUrl}/notes/${encodeURIComponent(note.id)}`, rootId,
+    replyToId: note.replyId === null ? null : noteId(note.replyId) ? note.replyId : undefined,
+    replyToAuthorId, relationKnown,
+    visibility: !knownVisibility ? 'unknown' : restricted ? 'restricted' : 'public',
+    repost, quoteUrl, poll, cw, sensitive, attachments, metadataComplete: valid,
+  } };
+}
+
+/** Uses only the injected transport. No remote request happens in the constructor. */
+export class SharkeyClient implements Publisher, Collector {
+  readonly destination = 'sharkey' as const;
+  readonly platform = 'sharkey' as const;
+  private readonly baseUrl: string;
+  private readonly maxPages: number;
+  private readonly now: () => Date;
+  private account?: SharkeyAccount;
+  private accountPromise?: Promise<SharkeyAccount>;
+  private limits?: SharkeyLimits;
+  private limitsPromise?: Promise<SharkeyLimits>;
+
+  constructor(private readonly config: SharkeyConfig, private readonly transport: Transport, private readonly options: SharkeyOptions = {}) {
+    this.baseUrl = httpsBase(config.baseUrl, 'Sharkey instance');
+    this.maxPages = options.maxPages ?? 3;
+    if (!positiveInteger(this.maxPages) || this.maxPages > 3) throw new PlatformError('Sharkey maxPages must be between 1 and 3', { code: 'InvalidPagination' });
+    if ((options.sinceId !== undefined && !noteId(options.sinceId)) || (options.untilId !== undefined && !noteId(options.untilId))) {
+      throw new PlatformError('Sharkey collection cursors must be note IDs', { code: 'InvalidPagination' });
+    }
+    this.now = options.now ?? (() => new Date());
+  }
+
+  private api(method: string, body: JsonObject, mutation = false): Promise<unknown> {
+    return requestJson(this.transport, `${this.baseUrl}/api/${method}`,
+      jsonBody({ ...body, ...(this.config.token ? { i: this.config.token } : {}) }), `Sharkey ${method}`, mutation);
+  }
+
+  private async discover(): Promise<SharkeyAccount> {
+    if (this.account) return this.account;
+    if (this.accountPromise) return this.accountPromise;
+    this.accountPromise = (async () => {
+      const body: JsonObject = this.config.userId ? { userId: this.config.userId } : { username: this.config.username, host: null };
+      if (!this.config.token && !this.config.userId && !this.config.username) throw new PlatformError('Configure a Sharkey token, user ID or username', { code: 'MissingAccount' });
+      const result = object(await this.api(this.config.token ? 'i' : 'users/show', this.config.token ? {} : body));
+      if (!noteId(result?.id) || !nonempty(result?.username) || (result.host !== null && result.host !== undefined)) throw schemaError('Sharkey account discovery');
+      if ((this.config.userId && this.config.userId !== result.id) || (this.config.username && this.config.username.toLowerCase() !== result.username.toLowerCase())) {
+        throw new PlatformError('The Sharkey token belongs to a different configured account', { code: 'AccountMismatch' });
+      }
+      if (own(result, 'policies') && !object(result.policies)) throw schemaError('Sharkey account policies');
+      this.account = { id: result.id, username: result.username, policies: object(result.policies) };
+      return this.account;
+    })();
+    try { return await this.accountPromise; } finally { this.accountPromise = undefined; }
+  }
+
+  async getLimits(): Promise<SharkeyLimits> {
+    if (this.limits) return { ...this.limits };
+    if (this.limitsPromise) return { ...await this.limitsPromise };
+    this.limitsPromise = (async () => {
+      const account = await this.discover();
+      const meta = object(await this.api('meta', { detail: true }));
+      if (!meta || !positiveInteger(meta.maxNoteTextLength) || (own(meta, 'policies') && !object(meta.policies))) throw schemaError('Sharkey instance policies');
+      const policies = { ...object(meta.policies), ...account.policies };
+      const maxCwLength = meta.maxCwLength ?? 500;
+      const maxAltTextLength = meta.maxFileCommentLength ?? 20_000;
+      if (!positiveInteger(maxCwLength) || !positiveInteger(maxAltTextLength)) throw schemaError('Sharkey text policies');
+      if (own(policies, 'canPublicNote') && typeof policies.canPublicNote !== 'boolean') throw schemaError('Sharkey publication policy');
+      const fileCeilings: number[] = [];
+      if (own(meta, 'maxFileSize')) {
+        if (!count(meta.maxFileSize)) throw schemaError('Sharkey instance file policy');
+        fileCeilings.push(meta.maxFileSize);
+      }
+      if (own(policies, 'maxFileSizeMb')) {
+        if (typeof policies.maxFileSizeMb !== 'number' || !Number.isFinite(policies.maxFileSizeMb) || policies.maxFileSizeMb < 0) throw schemaError('Sharkey role file policy');
+        fileCeilings.push(Math.floor(policies.maxFileSizeMb * 1024 * 1024));
+      }
+      // Do not invent a 100 MB limit. Missing/proxy/parser ceilings remain server-enforced (413 / quota errors).
+      this.limits = { maxNoteTextLength: meta.maxNoteTextLength, maxCwLength, maxAltTextLength,
+        maxFileBytes: fileCeilings.length ? Math.min(...fileCeilings) : undefined, canPublicNote: policies.canPublicNote !== false };
+      return this.limits;
+    })();
+    try { return { ...await this.limitsPromise }; } finally { this.limitsPromise = undefined; }
+  }
+
+  async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
+    if (!this.config.token) throw new PlatformError('A Sharkey API token is required for publishing', { code: 'MissingCredentials' });
+    if (!nonempty(context.idempotencyKey)) throw new PlatformError('A durable idempotency key is required', { code: 'MissingIdempotencyKey' });
+    if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Phase 1 accepts at most four static images', { code: 'TooManyImages' });
+    if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
+    if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Sharkey CW must be text', { code: 'InvalidCW' });
+    if (context.parent && !noteId(context.parent.id)) throw new PlatformError('Sharkey replies require a note ID', { code: 'InvalidReply' });
+    if (context.root && !context.parent) throw new PlatformError('A thread root without a parent is not a valid reply', { code: 'InvalidReply' });
+    for (const image of part.images) validateImage(image);
+    const limits = await this.getLimits();
+    if (!limits.canPublicNote) throw new PlatformError('The account role cannot create public notes', { code: 'PublicNotesNotAllowed' });
+    if (part.text.length > limits.maxNoteTextLength || (part.cw?.length ?? 0) > limits.maxCwLength) throw new PlatformError('Split text/CW to the Sharkey instance limits before publishing', { code: 'TextTooLong' });
+    for (const image of part.images) {
+      validateImage(image, limits.maxFileBytes);
+      if (image.alt.length > limits.maxAltTextLength) throw new PlatformError('Image alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
+    }
+    const fileIds: string[] = [];
+    const sensitive = part.cw !== undefined && part.cw.length > 0;
+    for (let index = 0; index < part.images.length; index++) {
+      const image = part.images[index]!;
+      const form = multipart({ i: this.config.token, comment: image.alt, isSensitive: String(sensitive), force: 'true' }, [
+        { field: 'file', filename: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, mimeType: image.mimeType, bytes: image.bytes },
+      ]);
+      const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,
+        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey image upload', true));
+      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true) || (file.comment !== undefined && file.comment !== image.alt)) throw schemaError('Sharkey image upload', true);
+      fileIds.push(file.id);
+    }
+    // Sharkey does not promise a notes/create idempotency nonce. Never automatically replay an uncertain mutation.
+    const result = object(await this.api('notes/create', {
+      text: part.text || null, visibility: 'public', localOnly: false,
+      ...(part.cw !== undefined ? { cw: part.cw } : {}), ...(fileIds.length ? { fileIds } : {}),
+      ...(context.parent ? { replyId: context.parent.id } : {}),
+    }, true));
+    const note = object(result?.createdNote);
+    if (!noteId(note?.id)) throw schemaError('Sharkey note creation', true);
+    return { id: note.id, uri: webUrl(note.uri), url: `${this.baseUrl}/notes/${encodeURIComponent(note.id)}` };
+  }
+
+  async collect(): Promise<SourceSnapshot> {
+    let accountId = this.config.userId || this.config.username;
+    let complete = true;
+    const warnings: string[] = [];
+    const posts = new Map<string, SourcePost>();
+    try {
+      const account = await this.discover();
+      accountId = account.id;
+      let untilId = this.options.untilId;
+      const cursors = new Set<string>(untilId ? [untilId] : []);
+      for (let page = 0; page < this.maxPages; page++) {
+        const result = await this.api('users/notes', {
+          userId: account.id, limit: 100, withReplies: true, withRenotes: true, withChannelNotes: true,
+          ...(this.options.sinceId ? { sinceId: this.options.sinceId } : {}), ...(untilId ? { untilId } : {}),
+        });
+        if (!Array.isArray(result) || result.length > 100) { complete = false; warnings.push('Sharkey notes response is not a bounded note array'); break; }
+        let progress = 0;
+        for (const raw of result) {
+          const parsed = parseNote(raw, account.id, this.baseUrl);
+          if (!parsed.valid) complete = false;
+          if (parsed.post) {
+            if (!posts.has(parsed.post.id)) { posts.set(parsed.post.id, parsed.post); progress++; }
+            else { complete = false; warnings.push('Sharkey feed repeated a note ID'); }
+          }
+        }
+        if (result.length < 100) break;
+        const next = object(result[result.length - 1])?.id;
+        if (!noteId(next) || cursors.has(next) || progress === 0) { complete = false; warnings.push('Sharkey pagination did not make progress'); break; }
+        cursors.add(next); untilId = next;
+        if (page + 1 === this.maxPages) { complete = false; warnings.push('Sharkey feed exceeded the bounded pagination window'); }
+      }
+    } catch (error) { complete = false; warnings.push(warning(error)); }
+    if (!complete && !warnings.length) warnings.push('Some Sharkey notes have incomplete relation, visibility or media metadata');
+    return { platform: this.platform, accountId, posts: [...posts.values()], fetchedAt: this.now().toISOString(), complete, warnings: [...new Set(warnings)] };
+  }
+}
+
+export { SharkeyClient as SharkeyPublisher, SharkeyClient as SharkeyCollector };
+export const createSharkeyPublisher = (config: SharkeyConfig, transport: Transport, options?: SharkeyOptions): SharkeyClient => new SharkeyClient(config, transport, options);
+export const createSharkeyCollector = createSharkeyPublisher;
