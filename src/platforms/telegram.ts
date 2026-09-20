@@ -57,6 +57,10 @@ export class TelegramClient implements Publisher {
   async setMyCommands(commands: Array<{ command: string; description: string }>): Promise<void> {
     await this.call('setMyCommands', { commands });
   }
+  /** Delete a message (e.g. an uploaded session file) so the account secret does not linger in chat. */
+  async deleteMessage(chatId: string, messageId: number): Promise<void> {
+    await this.call('deleteMessage', { chat_id: chatId, message_id: messageId });
+  }
   /**
    * Download a document a user sent to the bot. Two calls: getFile resolves the storage path,
    * then a plain GET fetches the bytes from the file endpoint. Capped so a stray large upload
@@ -79,6 +83,7 @@ export interface TelegramUpdateMessage {
   chat: { id: number | string; type: string };
   from?: { id: number };
   text?: string;
+  caption?: string;
   document?: TelegramDocument;
 }
 

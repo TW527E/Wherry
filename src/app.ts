@@ -86,8 +86,23 @@ export function createRuntime(config = loadConfig()): Runtime {
         updateOffset = Math.max(updateOffset, update.update_id + 1); store.setSetting('telegram:update_offset', updateOffset);
         if (!store.commandOnce(update.update_id, new Date().toISOString())) continue;
         const message = update.message; if (!message || String(message.chat.id) !== config.telegram.privateChatId || String(message.from?.id || '') !== config.telegram.ownerId) continue;
-        if (message.document) { await handleSessionUpload(message, { config, telegram, store }); continue; }
-        await handleCommand(message.text || '', { engine, telegram, store });
+        const text = (message.text || '').trim();
+        const caption = (message.caption || '').trim();
+        const isSessionCmd = (s: string): boolean => s.split(/\s+/u)[0]?.split('@')[0]?.toLowerCase() === '/session';
+        if (message.document) {
+          // Never auto-install an uploaded file. Only process it when explicitly gated by /session:
+          // the file's caption is /session, or /session was armed by a prior message.
+          const armed = store.setting<boolean>('telegram:session_armed', false);
+          if (isSessionCmd(caption) || armed) { store.setSetting('telegram:session_armed', false); await handleSessionUpload(message, { config, telegram, store }); }
+          else await telegram.sendPlain('收到檔案，但基於安全我不會自動安裝。請改用 /session：可直接在檔案說明（caption）打 /session，或先傳 /session 再上傳。', 'private').catch(() => undefined);
+          continue;
+        }
+        if (isSessionCmd(text)) {
+          store.setSetting('telegram:session_armed', true);
+          await telegram.sendPlain('好的，請把 x-session.json 檔案傳過來（下一則訊息）。安裝成功後我會刪除該檔案訊息並回報結果。取消請打 /help。', 'private').catch(() => undefined);
+          continue;
+        }
+        await handleCommand(text, { engine, telegram, store });
       }
     } catch (error) { store.event('error', `Telegram command polling failed: ${safeError(error)}`); }
   };
@@ -118,11 +133,12 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
   { command: 'skip', args: '<batchId>', description: '略過（不同步）某個批次' },
   { command: 'mirror', args: '<batchId>', description: '標記為你手動鏡像，之後不再同步' },
   { command: 'retry', args: '<jobId>', description: '重試一個明確失敗的工作' },
+  { command: 'session', description: '更新 X 登入：接著上傳 x-session.json（或在檔案說明打 /session）' },
 ];
 
 function helpText(): string {
   const lines = TELEGRAM_COMMANDS.map(c => `/${c.command}${c.args ? ` ${c.args}` : ''} — ${c.description}`);
-  return ['📋 Crosspost Bridge 指令', ...lines, '', '💡 也可直接把 x-session.json 檔案傳到這個私人聊天來更新 X 登入。', 'ℹ️ X 發文一律手動；本工具只讀 X、把新貼文同步到 Bluesky / Sharkey。'].join('\n');
+  return ['📋 Crosspost Bridge 指令', ...lines, '', '💡 更新 X 登入：打 /session 再上傳 x-session.json（或直接在檔案說明打 /session）。上傳的檔案會在安裝後自動刪除。', 'ℹ️ X 發文一律手動；本工具只讀 X、把新貼文同步到 Bluesky / Sharkey。'].join('\n');
 }
 
 async function handleCommand(raw: string, context: CommandContext): Promise<void> {
@@ -162,16 +178,26 @@ async function handleSessionUpload(
   const document = message.document!;
   const name = document.file_name || '';
   if (!/\.json$/i.test(name)) { await context.telegram.sendPlain('收到檔案，但不是 .json；請上傳 export-session 產生的 x-session.json。', 'private').catch(() => undefined); return; }
+  const chatId = context.config.telegram.privateChatId;
   try {
     const bytes = await context.telegram.downloadFile(document.file_id, MAX_SESSION_BYTES);
+    // The file is a live account secret. Remove the upload message from chat as soon as we hold the
+    // bytes, then install. Deletion is best-effort (Telegram only allows it within 48h); report
+    // whether it succeeded so the owner can delete it manually if not.
+    let deleted = false;
+    try { await context.telegram.deleteMessage(chatId, message.message_id); deleted = true; }
+    catch (error) { context.store.event('error', `Could not delete uploaded session message: ${safeError(error)}`); }
+    const note = deleted ? '已刪除你上傳的檔案訊息。' : '⚠️ 無法自動刪除該檔案訊息，請你手動刪除，以免憑證留在對話中。';
     const file = parseSessionFile(bytes);
     const result = await installSession(context.config.x, file);
-    context.store.event('info', `X session uploaded via Telegram for @${file.handle || context.config.x.handle}; authenticated=${result.authenticated}`);
-    if (result.authenticated) await context.telegram.sendPlain('✅ X session 已安裝並驗證成功，之後的檢查就能讀到你的推文了。建議刪除剛才上傳的檔案訊息。', 'private');
-    else await context.telegram.sendPlain('⚠️ session 已安裝，但驗證時仍看到登入/驗證畫面。可能是 cookie 過期或被要求重新驗證，請在本機重新 login 後再匯出上傳。', 'private');
+    context.store.event('info', `X session uploaded via Telegram for @${file.handle || context.config.x.handle}; authenticated=${result.authenticated}; messageDeleted=${deleted}`);
+    if (result.authenticated) await context.telegram.sendPlain(`✅ X session 已安裝並驗證成功，之後的檢查就能讀到你的推文了。${note}`, 'private');
+    else await context.telegram.sendPlain(`⚠️ session 已安裝，但驗證時仍看到登入/驗證畫面（cookie 可能過期或被要求重新驗證，請在本機重新 login 後再匯出）。${note}`, 'private');
   } catch (error) {
     context.store.event('error', `X session upload failed: ${safeError(error)}`);
-    await context.telegram.sendPlain(`session 安裝失敗：${safeError(error)}`, 'private').catch(() => undefined);
+    // Even on failure, still try to remove the uploaded secret from chat history.
+    await context.telegram.deleteMessage(chatId, message.message_id).catch(() => undefined);
+    await context.telegram.sendPlain(`session 安裝失敗：${safeError(error)}（已嘗試刪除上傳的檔案訊息）`, 'private').catch(() => undefined);
   }
 }
 
