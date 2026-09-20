@@ -158,9 +158,38 @@ export class XCollector implements Collector {
         if (!own || seen.has(own)) continue;
         seen.add(own);
         const time = await article.locator('time').getAttribute('datetime').catch(() => null);
-        const text = await article.locator('[data-testid="tweetText"]').innerText().catch(() => '');
+        // X truncates a link's DISPLAY text ("youtube.com/watch…") while the real destination is the
+        // anchor href. Reading innerText would sync the broken truncated string, so reconstruct the
+        // text from the tweetText node: use each <a>'s href for external links, keep emoji alt text,
+        // and keep visible text for everything else.
+        const text = await article.locator('[data-testid="tweetText"]').first().evaluate((node: Element) => {
+          const walk = (el: Element): string => {
+            let out = '';
+            for (const child of Array.from(el.childNodes)) {
+              if (child.nodeType === 3) { out += child.textContent || ''; continue; } // text node
+              if (!(child instanceof Element)) continue;
+              if (child.tagName === 'IMG') { out += (child as HTMLImageElement).alt || ''; continue; } // emoji
+              if (child.tagName === 'A') {
+                const href = (child as HTMLAnchorElement).href;
+                const shown = child.textContent || '';
+                // Mentions/hashtags/cashtags and t.co-expanded display links: keep the real href for
+                // external URLs (display text is truncated with an ellipsis), else keep visible text.
+                out += /^https?:\/\//.test(href) && /[…]|\/\S*…/.test(shown) ? href
+                  : /^https?:\/\//.test(href) && !shown.startsWith('@') && !shown.startsWith('#') && !shown.startsWith('$') ? (shown.includes('…') ? href : shown)
+                  : shown;
+                continue;
+              }
+              out += walk(child);
+            }
+            return out;
+          };
+          return walk(node);
+        }).catch(() => '');
         const articleText = await article.innerText().catch(() => '');
         const replyMatch = articleText.match(/Replying to\s+(@[A-Za-z0-9_]{1,15})/i);
+        // A link-preview card puts its destination only in the card, not the tweet text. Capture it
+        // so a card-only tweet still carries its link downstream.
+        const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]').first().getAttribute('href').catch(() => null);
         const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
         const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
         const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: image.url, alt: image.alt }));
@@ -169,7 +198,16 @@ export class XCollector implements Collector {
         // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
         // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
         const quote = links.find(value => { try { const qid = new URL(value).pathname.match(statusPath)?.[1]; return Boolean(qid) && qid !== own; } catch { return false; } });
-        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId: this.config.handle, createdAt: time || undefined, text, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
+        // A card link that is not a quoted tweet and not already in the text is the tweet's only URL;
+        // append it so it survives the sync. (Quote cards are handled via quoteUrl, not here.)
+        let bodyText = text;
+        if (cardHref && !/^https?:\/\//.test(cardHref.match(statusPath)?.[0] || '') && !text.includes(cardHref)) {
+          try {
+            const cardId = new URL(cardHref).pathname.match(statusPath)?.[1];
+            if (!cardId || cardId === own) { const stripped = cardHref.split('?')[0]; if (stripped && !text.includes(stripped)) bodyText = text ? `${text}\n${stripped}` : stripped; }
+          } catch { /* ignore malformed card href */ }
+        }
+        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId: this.config.handle, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
         if (parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
       }
