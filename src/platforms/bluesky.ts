@@ -397,11 +397,13 @@ export class BlueskyClient implements Publisher, Collector {
     }
   }
 
-  async collect(): Promise<SourceSnapshot> {
+  async collect(since?: string): Promise<SourceSnapshot> {
     const warnings: string[] = [];
     let complete = true;
     let accountId = this.session?.did ?? this.config.identifier;
     const seen = new Map<string, SourcePost>();
+    let oldest: string | undefined;
+    let reachedWatermark = !since; // first scan (no watermark): the page budget is the natural bound
     try {
       const identity = await this.discover();
       accountId = identity.did;
@@ -417,19 +419,26 @@ export class BlueskyClient implements Publisher, Collector {
         }
         for (const entry of result.feed) {
           const parsed = parsePost(entry, identity.did, identity.pds);
-          if (!parsed.valid) complete = false;
+          // A post we cannot fully parse is not a reason to reject the whole window: the engine
+          // holds any post with metadataComplete:false downstream. Record it and move on.
+          if (!parsed.valid) warnings.push('a Bluesky post had incomplete metadata (held individually)');
           if (parsed.post) {
+            if (parsed.post.createdAt && (!oldest || parsed.post.createdAt < oldest)) oldest = parsed.post.createdAt;
             const previous = seen.get(parsed.post.id);
             if (!previous || (previous.repost && !parsed.post.repost)) seen.set(parsed.post.id, parsed.post);
           }
         }
-        if (!result.cursor) break;
+        // Once the oldest post seen is at/older than the last fetch, the gap since then is covered.
+        if (since && oldest && oldest <= since) { reachedWatermark = true; break; }
+        if (!result.cursor) { reachedWatermark = true; break; } // reached the end of the feed
         const next = result.cursor as string;
+        // A cursor that repeats or a zero-length page is a real gap — the window is untrustworthy.
         if (result.feed.length === 0 || cursors.has(next)) { complete = false; warnings.push('Bluesky pagination did not make progress'); break; }
         cursors.add(next); cursor = next;
-        if (page + 1 === this.maxPages) { complete = false; warnings.push('Bluesky feed exceeded the bounded pagination window'); }
       }
     } catch (error) { complete = false; warnings.push(warning(error)); }
+    // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
+    if (complete && !reachedWatermark) { complete = false; warnings.push('Bluesky backlog since the last scan exceeds the page budget; scan more often'); }
     if (!complete && !warnings.length) warnings.push('Some Bluesky posts have incomplete relation, media or moderation metadata');
     return { platform: this.platform, accountId, posts: [...seen.values()], fetchedAt: this.now().toISOString(), complete, warnings };
   }

@@ -89,7 +89,13 @@ export interface Publisher {
 
 export interface Collector {
   readonly platform: Exclude<SourcePlatform, 'local'>;
-  collect(): Promise<SourceSnapshot>;
+  /**
+   * Read the account's recent posts, newest first. `since` is the last successful fetch watermark
+   * (ISO time); when set, the collector pages back until it reaches posts at/older than it — so a
+   * snapshot is only `complete` when the whole gap since the last scan was covered. When unset
+   * (first scan), the bounded page budget is the natural limit and the snapshot is a clean baseline.
+   */
+  collect(since?: string): Promise<SourceSnapshot>;
   close?(): Promise<void>;
 }
 

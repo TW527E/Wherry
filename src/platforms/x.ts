@@ -121,7 +121,7 @@ export class XCollector implements Collector {
     return this.page;
   }
 
-  async collect(): Promise<SourceSnapshot> {
+  async collect(since?: string): Promise<SourceSnapshot> {
     const page = await this.browserPage();
     const url = `https://x.com/${encodeURIComponent(this.config.handle)}/with_replies`;
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
@@ -132,6 +132,8 @@ export class XCollector implements Collector {
     await page.locator('article[data-testid="tweet"]').first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
     const seen = new Set<string>(); const facts: TweetFacts[] = [];
     let stableRounds = 0; let previousCount = 0;
+    let oldest: string | undefined;
+    let reachedWatermark = !since; // first scan (no watermark): the scroll budget is the natural bound
     for (let round = 0; round < this.config.maxPages; round++) {
       const articles = await page.locator('article[data-testid="tweet"]').all();
       for (const article of articles) {
@@ -149,11 +151,14 @@ export class XCollector implements Collector {
         if (hasVideo) media.push({ kind: 'video', alt: '' });
         const quote = links.find(value => { try { const path = new URL(value).pathname; return /\/status\/\d+/.test(path) && !path.endsWith(`/status/${own}`); } catch { return false; } });
         const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId: this.config.handle, createdAt: time || undefined, text, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
+        if (parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
       }
+      // Once the oldest tweet seen is at/older than the last fetch, the gap since then is covered.
+      if (since && oldest && oldest <= since) { reachedWatermark = true; break; }
       if (seen.size === previousCount) stableRounds++; else stableRounds = 0;
       previousCount = seen.size;
-      if (stableRounds >= 1) break;
+      if (stableRounds >= 1) { reachedWatermark = true; break; } // reached the end of the timeline
       await page.mouse.wheel(0, 1800);
       await page.waitForTimeout(800);
     }
@@ -165,9 +170,10 @@ export class XCollector implements Collector {
         ? 'X page rendered tweets but none were parseable (tweet layout may have changed); no checkpoint advanced'
         : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
     }
-    const complete = stableRounds >= 1;
+    // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
+    const warnings = reachedWatermark ? [] : ['X backlog since the last scan exceeds the scroll budget; raise X_MAX_PAGES or scan more often'];
     const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
-    return { platform: 'x', accountId: this.config.handle, posts, fetchedAt: new Date().toISOString(), complete, warnings: complete ? [] : ['bounded X profile scan did not reach a stable page; retry without advancing checkpoint'] };
+    return { platform: 'x', accountId: this.config.handle, posts, fetchedAt: new Date().toISOString(), complete: reachedWatermark, warnings };
   }
   async close(): Promise<void> { await this.context?.close(); this.context = undefined; this.page = undefined; }
 }

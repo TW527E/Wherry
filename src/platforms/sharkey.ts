@@ -146,7 +146,11 @@ export class SharkeyClient implements Publisher, Collector {
     this.accountPromise = (async () => {
       const body: JsonObject = this.config.userId ? { userId: this.config.userId } : { username: this.config.username, host: null };
       if (!this.config.token && !this.config.userId && !this.config.username) throw new PlatformError('Configure a Sharkey token, user ID or username', { code: 'MissingAccount' });
-      const result = object(await this.api(this.config.token ? 'i' : 'users/show', this.config.token ? {} : body));
+      // Prefer the public users/show when an id/username is configured: it needs no read scope, so a
+      // write-only token (write:notes/write:drive) still works. Only fall back to `i` (needs
+      // read:account) when neither is set.
+      const useSelf = !this.config.userId && !this.config.username;
+      const result = object(await this.api(useSelf ? 'i' : 'users/show', useSelf ? {} : body));
       if (!noteId(result?.id) || !nonempty(result?.username) || (result.host !== null && result.host !== undefined)) throw schemaError('Sharkey account discovery');
       if ((this.config.userId && this.config.userId !== result.id) || (this.config.username && this.config.username.toLowerCase() !== result.username.toLowerCase())) {
         throw new PlatformError('The Sharkey token belongs to a different configured account', { code: 'AccountMismatch' });
@@ -226,11 +230,14 @@ export class SharkeyClient implements Publisher, Collector {
     return { id: note.id, uri: webUrl(note.uri), url: `${this.baseUrl}/notes/${encodeURIComponent(note.id)}` };
   }
 
-  async collect(): Promise<SourceSnapshot> {
+  async collect(since?: string): Promise<SourceSnapshot> {
     let accountId = this.config.userId || this.config.username;
     let complete = true;
     const warnings: string[] = [];
     const posts = new Map<string, SourcePost>();
+    let oldest: string | undefined;
+    // A caller-supplied window (options.untilId) means a bounded manual scan, not gap-closing.
+    let reachedWatermark = !since || Boolean(this.options.untilId);
     try {
       const account = await this.discover();
       accountId = account.id;
@@ -245,19 +252,26 @@ export class SharkeyClient implements Publisher, Collector {
         let progress = 0;
         for (const raw of result) {
           const parsed = parseNote(raw, account.id, this.baseUrl);
-          if (!parsed.valid) { complete = false; if (parsed.reason) warnings.push(`note rejected: ${parsed.reason}${parsed.post ? ` (id ${parsed.post.id})` : ''}`); }
+          // A note we cannot fully parse is held individually by the engine (metadataComplete:false);
+          // record it as a warning rather than rejecting the whole window.
+          if (!parsed.valid && parsed.reason) warnings.push(`note incomplete: ${parsed.reason}${parsed.post ? ` (id ${parsed.post.id})` : ''}`);
           if (parsed.post) {
+            if (parsed.post.createdAt && (!oldest || parsed.post.createdAt < oldest)) oldest = parsed.post.createdAt;
             if (!posts.has(parsed.post.id)) { posts.set(parsed.post.id, parsed.post); progress++; }
+            // A repeated id within a page is a real gap in the feed, not just a quality issue.
             else { complete = false; warnings.push('Sharkey feed repeated a note ID'); }
           }
         }
-        if (result.length < 100) break;
+        // Once the oldest note seen is at/older than the last fetch, the gap since then is covered.
+        if (since && oldest && oldest <= since) { reachedWatermark = true; break; }
+        if (result.length < 100) { reachedWatermark = true; break; } // reached the end of the feed
         const next = object(result[result.length - 1])?.id;
         if (!noteId(next) || cursors.has(next) || progress === 0) { complete = false; warnings.push('Sharkey pagination did not make progress'); break; }
         cursors.add(next); untilId = next;
-        if (page + 1 === this.maxPages) { complete = false; warnings.push('Sharkey feed exceeded the bounded pagination window'); }
       }
     } catch (error) { complete = false; warnings.push(warning(error)); }
+    // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
+    if (complete && !reachedWatermark) { complete = false; warnings.push('Sharkey backlog since the last scan exceeds the page budget; scan more often'); }
     if (!complete && !warnings.length) warnings.push('Some Sharkey notes have incomplete relation, visibility or media metadata');
     return { platform: this.platform, accountId, posts: [...posts.values()], fetchedAt: this.now().toISOString(), complete, warnings: [...new Set(warnings)] };
   }

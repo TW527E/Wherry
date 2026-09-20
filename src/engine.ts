@@ -364,7 +364,10 @@ export function splitHtml(text: string, escapedLimit: number, reserve = 0): stri
 export async function collectCycle(engine: Engine, collectors: Collector[], now = new Date().toISOString()): Promise<void> {
   const sorted = [...collectors].sort((a, b) => Number(a.platform === 'x') - Number(b.platform === 'x'));
   for (const collector of sorted) {
-    try { engine.ingest(await collector.collect(), now); }
+    // Pass the last successful fetch watermark so the collector pages back only as far as needed
+    // and can tell whether it closed the whole gap since the previous scan.
+    const since = engine.store.setting<string | undefined>(`fresh:${collector.platform}`, undefined);
+    try { engine.ingest(await collector.collect(since), now); }
     catch (error) { engine.store.event('error', `${collector.platform} collection failed: ${safeError(error)}`); }
   }
   engine.sealReady(now);

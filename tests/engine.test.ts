@@ -5,8 +5,8 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { Store } from '../src/store.js';
-import { Engine, decideMirror, unsupportedReason } from '../src/engine.js';
-import type { Destination, SourcePost, SourceSnapshot, Transport } from '../src/types.js';
+import { Engine, collectCycle, decideMirror, unsupportedReason } from '../src/engine.js';
+import type { Collector, Destination, SourcePost, SourceSnapshot, Transport } from '../src/types.js';
 
 const base = Date.parse('2026-09-19T00:00:00.000Z');
 const at = (offsetSeconds: number): string => new Date(base + offsetSeconds * 1000).toISOString();
@@ -50,6 +50,27 @@ function setup(destinations: Destination[] = ['bluesky', 'sharkey', 'telegram'])
   }
   return { config, store, engine };
 }
+
+test('collectCycle threads the last fetch watermark into the next collect', async () => {
+  // A bare engine with no prior snapshot, so the first scan genuinely has no watermark.
+  const engine = new Engine(new Store(':memory:'), makeConfig(['bluesky']), transport);
+  const sinceSeen: (string | undefined)[] = [];
+  let clock = at(10);
+  const collector: Collector = {
+    platform: 'bluesky',
+    async collect(since) {
+      sinceSeen.push(since);
+      // Complete, empty snapshot so the engine advances the fresh watermark to `clock`.
+      return { platform: 'bluesky', accountId: 'bluesky-account', posts: [], fetchedAt: clock, complete: true, warnings: [] };
+    },
+  };
+  await collectCycle(engine, [collector], clock);
+  clock = at(20);
+  await collectCycle(engine, [collector], clock);
+  // First cycle has no watermark; the second sees the first cycle's fetchedAt.
+  assert.equal(sinceSeen[0], undefined);
+  assert.equal(sinceSeen[1], at(10));
+});
 
 test('engine.action rejects an unknown verb and a malformed id', () => {
   const { engine } = setup();
