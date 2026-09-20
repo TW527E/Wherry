@@ -39,17 +39,22 @@ export function createRuntime(config = loadConfig()): Runtime {
   const publishers = new Map<Destination, Publisher>();
   let telegram: TelegramClient | undefined;
 
-  if (config.mode === 'live' && config.x.enabled) collectors.push(new XCollector(config.x, transport));
-  if (config.mode === 'live' && config.bluesky.enabled && config.bluesky.identifier && config.bluesky.appPassword) {
-    const client = new BlueskyClient(config.bluesky, transport); collectors.push(client); publishers.set('bluesky', client);
+  const live = config.mode === 'live';
+  // Collection is read-only and safe; it runs in every mode so preview can show what WOULD be synced.
+  // Only the publish step differs: live uses the real clients, preview swaps in stubs.
+  if (config.x.enabled) collectors.push(new XCollector(config.x, transport));
+  if (config.bluesky.enabled && config.bluesky.identifier && config.bluesky.appPassword) {
+    const client = new BlueskyClient(config.bluesky, transport); collectors.push(client);
+    if (live) publishers.set('bluesky', client);
   }
-  if (config.mode === 'live' && config.sharkey.enabled && config.sharkey.token) {
-    const client = new SharkeyClient(config.sharkey, transport); collectors.push(client); publishers.set('sharkey', client);
+  if (config.sharkey.enabled && config.sharkey.token) {
+    const client = new SharkeyClient(config.sharkey, transport); collectors.push(client);
+    if (live) publishers.set('sharkey', client);
   }
-  if (config.mode === 'live' && config.telegram.enabled && config.telegram.token) {
+  if (live && config.telegram.enabled && config.telegram.token) {
     telegram = new TelegramClient(config.telegram, transport); publishers.set('telegram', telegram);
   }
-  if (config.mode === 'preview') {
+  if (!live) {
     for (const destination of config.destinations) publishers.set(destination, new PreviewPublisher(destination, store));
   }
   const engine = new Engine(store, config, transport);
@@ -64,7 +69,7 @@ export function createRuntime(config = loadConfig()): Runtime {
     if (running || stopped) return;
     running = true;
     try {
-      if (config.mode === 'live') await collectCycle(engine, collectors);
+      await collectCycle(engine, collectors);
       engine.sealReady();
       await worker.run();
     } finally { running = false; }
@@ -81,8 +86,8 @@ export function createRuntime(config = loadConfig()): Runtime {
       }
     } catch (error) { store.event('error', `Telegram command polling failed: ${safeError(error)}`); }
   };
-  if (config.mode === 'live') {
-    timer = setInterval(() => void once(), config.pollSeconds * 1000); timer.unref();
+  timer = setInterval(() => void once(), config.pollSeconds * 1000); timer.unref();
+  if (live && telegram && config.telegram.pollCommands) {
     commandTimer = setInterval(() => void commandCycle(), 5000); commandTimer.unref();
   }
   return {

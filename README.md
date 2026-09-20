@@ -41,10 +41,13 @@ cp .env.example .env      # 填入設定
 npm install
 npm run verify            # 型別檢查 + 測試 + 建置
 npm run cli -- doctor     # 檢查設定與能力
+npm run cli -- login      # 開瀏覽器手動登入 X 一次（只需一次）
 npm run cli -- serve      # 啟動排程、worker 與網頁介面
 ```
 
-預設 `APP_MODE=preview`：整條流程照跑，但只寫入記錄，**不會**對外發布。確認行為正確後再改成 `live`。
+**`login` 是必要的一步**：X 讀取靠一個持久化瀏覽器 profile，裡面要有已登入的 session。`login` 會用你選定的瀏覽器開一個可見視窗，你手動登入（含兩步驟驗證），回終端機按 Enter 後 session 就存進 `X_PROFILE_DIR`。之後所有 `scan` / `serve` 都用無頭模式重用這份登入，不必再登。沒做這一步的話，無頭瀏覽器會撞到 X 的登入牆、讀不到任何推文（`scan` 會回報 session 未登入）。
+
+預設 `APP_MODE=preview`：**讀取、分類、組批次照常執行**（讀 X 是唯讀的、任何模式都安全），只有最後「發布」那步換成 stub 不對外送出。所以 preview 下你按「立刻檢查」就能看到工具偵測到你的新推文、預計會發什麼。確認行為正確後再改成 `live` 才會真的發到下游。
 
 網頁介面預設只在 `127.0.0.1:3000`。若綁到其他位址，`WEB_TOKEN` 必須至少 32 字元，且所有寫入請求都要帶 `Authorization: Bearer <token>`。
 
@@ -175,7 +178,7 @@ cp .env.example .env && vi .env
 docker compose up -d --build
 ```
 
-首次登入 X profile（用你選定的瀏覽器登入一次，憑證留在 volume）：
+首次登入 X profile（只需一次，憑證留在 volume）。VPS 通常沒有桌面環境開不了可見瀏覽器，建議**在本機用 `npm run cli -- login` 登入，再把整個 `data/x-profile` 目錄上傳到伺服器的對應 volume**。若伺服器上真的有可見瀏覽器，也可以直接跑：
 
 ```bash
 docker compose run --rm --entrypoint /usr/bin/chromium bridge \

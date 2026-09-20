@@ -130,3 +130,42 @@ export class XCollector implements Collector {
   }
   async close(): Promise<void> { await this.context?.close(); this.context = undefined; this.page = undefined; }
 }
+
+/**
+ * One-time interactive login. Opens a visible browser on the SAME persistent profile the
+ * headless collector uses, navigates to X, and returns once the profile is authenticated
+ * (or the caller signals done). Cookies are written to profileDir on context close, so all
+ * later headless scans reuse the session. This never posts — it only establishes read access.
+ */
+export async function loginInteractive(
+  config: AppConfig['x'],
+  options: { waitForEnter: () => Promise<void>; log?: (message: string) => void } ,
+): Promise<{ authenticated: boolean }> {
+  const log = options.log ?? (() => {});
+  const plan = resolveBrowserPlan({ choice: config.browser, executablePath: config.executablePath });
+  verifyBrowserPlan(plan);
+  const launchOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
+    headless: false,
+    serviceWorkers: 'block',
+    viewport: { width: 1280, height: 900 },
+  };
+  if (plan.executablePath) launchOptions.executablePath = plan.executablePath;
+  else if (plan.channel) launchOptions.channel = plan.channel;
+  const context = await chromium.launchPersistentContext(config.profileDir, launchOptions);
+  try {
+    const page = context.pages()[0] || await context.newPage();
+    await page.goto('https://x.com/login', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+    log('瀏覽器已開啟。請在該視窗完成 X 登入（帳號、密碼、兩步驟驗證都做完，看到首頁時間軸為止）。');
+    log('完成後回到這個終端機按 Enter，工具會儲存登入狀態並關閉瀏覽器。');
+    await options.waitForEnter();
+    // Verify the session actually reads the target profile without hitting a login wall.
+    const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
+    await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+    const title = await page.title().catch(() => '');
+    const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+    const authenticated = !/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${body}`);
+    return { authenticated };
+  } finally {
+    await context.close();
+  }
+}

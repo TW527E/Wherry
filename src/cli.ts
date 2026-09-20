@@ -4,6 +4,8 @@ import { loadConfig } from './config.js';
 import { createRuntime, createWeb } from './app.js';
 import { safeError } from './engine.js';
 import { resolveBrowserPlan, verifyBrowserPlan } from './platforms/browser.js';
+import { loginInteractive } from './platforms/x.js';
+import { createInterface } from 'node:readline/promises';
 
 const usage = `crosspost-bridge — X-first cross-posting with manual X publishing
 
@@ -16,6 +18,7 @@ Usage:
   crosspost-bridge schedule <iso> <text> Create a local scheduled post (no X write)
   crosspost-bridge action <verb> <id>    skip | approve | mirror | retry
   crosspost-bridge doctor                Validate configuration and report capabilities
+  crosspost-bridge login                 Open a visible browser to log into X once (saves the session)
 
 X publishing is always manual. This tool only reads X and can never post to it.`;
 
@@ -69,6 +72,19 @@ async function main(): Promise<number> {
         runtime.engine.action(verb, id);
         console.log(`applied ${verb} to ${id}`);
         return 0;
+      }
+      case 'login': {
+        if (!config.x.enabled) throw new Error('X_ENABLED is false; enable X before logging in');
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          const result = await loginInteractive(config.x, {
+            waitForEnter: async () => { await rl.question('登入完成後按 Enter 繼續…'); },
+            log: message => console.log(message),
+          });
+          if (result.authenticated) console.log(`登入成功，session 已存到 ${config.x.profileDir}。之後 scan/serve 就能讀到你的推文了。`);
+          else console.log('看起來仍未通過登入（偵測到登入或驗證畫面）。請重跑 login 並確認完成登入後再按 Enter。');
+          return result.authenticated ? 0 : 1;
+        } finally { rl.close(); }
       }
       case 'doctor': {
         const browser = resolveBrowserPlan({ choice: config.x.browser, executablePath: config.x.executablePath });
