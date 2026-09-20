@@ -110,7 +110,10 @@ export class Engine {
       }
       if (!baselineAt) this.store.setSetting(`baseline:${snapshot.platform}`, snapshot.fetchedAt);
       this.store.setSetting(`fresh:${snapshot.platform}`, snapshot.fetchedAt);
-      this.store.event('info', `${snapshot.platform}: ${added} new records from ${snapshot.posts.length} collected${baselineAt ? '' : ' (baseline only)'}${snapshot.warnings.length ? ` — ${snapshot.warnings.join('; ')}` : ''}`);
+      // Newest collected post vs. baseline: if newest <= baseline, the scrape isn't seeing anything
+      // newer than the watermark (either nothing new was posted, or the collector missed it).
+      const newest = sorted.length ? sorted[sorted.length - 1]!.createdAt : '(none)';
+      this.store.event('info', `${snapshot.platform}: ${added} new records from ${snapshot.posts.length} collected${baselineAt ? '' : ' (baseline only)'}; newest=${newest} baseline=${baselineAt ?? snapshot.fetchedAt}${snapshot.warnings.length ? ` — ${snapshot.warnings.join('; ')}` : ''}`);
       return { added, baseline: !baselineAt };
     });
   }
