@@ -56,6 +56,17 @@ export interface PreparedImage {
   sha256: string;
 }
 
+export interface PreparedVideo {
+  path: string;            // transcoded MP4 on disk (may be large; not held in memory)
+  mimeType: 'video/mp4';
+  alt: string;
+  width: number;
+  height: number;
+  durationSeconds: number;
+  size: number;
+  sha256: string;
+}
+
 export interface PublishPart {
   key: string;
   sourcePostId: string;

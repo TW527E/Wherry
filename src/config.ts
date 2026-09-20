@@ -25,6 +25,7 @@ export interface AppConfig {
   maxAttempts: number;
   destinations: Destination[];
   x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string; sandbox: boolean };
+  media: { video: boolean; ffmpegPath: string; ffprobePath: string };
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
   sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
@@ -61,6 +62,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // Chromium's sandbox cannot start as root on Linux and needs --no-sandbox there.
       // Default: off when running as root on Linux, on everywhere else. X_SANDBOX overrides.
       sandbox: bool(env.X_SANDBOX, !(process.platform === 'linux' && typeof process.getuid === 'function' && process.getuid() === 0)),
+    },
+    media: {
+      video: bool(env.VIDEO_ENABLED, false),
+      ffmpegPath: env.FFMPEG_PATH || 'ffmpeg',
+      ffprobePath: env.FFPROBE_PATH || 'ffprobe',
     },
     bluesky: {
       enabled: bool(env.BLUESKY_ENABLED, false), identifier: env.BLUESKY_IDENTIFIER || '',
