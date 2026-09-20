@@ -72,6 +72,17 @@ test('collectCycle threads the last fetch watermark into the next collect', asyn
   assert.equal(sinceSeen[1], at(10));
 });
 
+test('a repost by another author does not reject the whole snapshot', () => {
+  const { engine } = setup(['bluesky']);
+  const repost = post({ id: 'r1', createdAt: at(30), authorId: 'someone-else', platform: 'bluesky', repost: true });
+  const own = post({ id: 'o1', createdAt: at(31), authorId: 'bluesky-account', platform: 'bluesky' });
+  // The repost carries the original author's id; the guard must accept it and the own post.
+  assert.doesNotThrow(() => engine.ingest(snapshot([repost, own], at(32), 'bluesky', 'bluesky-account'), at(32)));
+  // A non-repost by another author is still rejected.
+  const foreign = post({ id: 'f1', createdAt: at(33), authorId: 'someone-else', platform: 'bluesky' });
+  assert.throws(() => engine.ingest(snapshot([foreign], at(34), 'bluesky', 'bluesky-account'), at(34)), /mismatched platform\/account/);
+});
+
 test('engine.action rejects an unknown verb and a malformed id', () => {
   const { engine } = setup();
   assert.throws(() => engine.action('drop' as never, 'batch-1'), /action must be one of/);

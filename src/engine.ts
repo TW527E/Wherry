@@ -82,7 +82,9 @@ export class Engine {
     const snapshot = snapshotSchema.parse(value) as SourceSnapshot;
     if (!snapshot.complete) throw new Error(`Incomplete ${snapshot.platform} snapshot; checkpoint unchanged${snapshot.warnings.length ? ` (${snapshot.warnings.join('; ')})` : ''}`);
     if (Date.parse(snapshot.fetchedAt) > Date.parse(now) + 60_000) throw new Error('Snapshot clock is in the future');
-    if (snapshot.posts.some(p => p.platform !== snapshot.platform || p.authorId.toLowerCase() !== snapshot.accountId.toLowerCase())) {
+    // A repost legitimately carries the original author's id, not the account's, so it is exempt
+    // from the identity guard; every original post must still belong to the collected account.
+    if (snapshot.posts.some(p => p.platform !== snapshot.platform || (!p.repost && p.authorId.toLowerCase() !== snapshot.accountId.toLowerCase()))) {
       throw new Error('Snapshot contains mismatched platform/account');
     }
     const identity = this.store.setting<string | undefined>(`account:${snapshot.platform}`, undefined);
