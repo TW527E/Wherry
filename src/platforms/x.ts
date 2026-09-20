@@ -130,6 +130,12 @@ export class XCollector implements Collector {
     // X is a client-side app: the timeline renders after domcontentloaded. Wait for the first
     // tweet to appear before parsing, so an early read does not look like an empty profile.
     await page.locator('article[data-testid="tweet"]').first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
+    // A logged-out/stale session serves a short public preview (a few tweets, infinite scroll
+    // blocked) with no login WORDS, so the regex above misses it. Require a positive signed-in
+    // signal — the account switcher or compose button only render for an authenticated session —
+    // otherwise we would silently treat a truncated preview as a complete, up-to-date timeline.
+    const signedIn = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="SideNav_NewTweet_Button"], [aria-label="Post"]').first().count().catch(() => 0);
+    if (!signedIn) throw new Error('X session appears logged out (no account/compose controls rendered); re-run login or upload a fresh session. No checkpoint advanced');
     const seen = new Set<string>(); const facts: TweetFacts[] = [];
     let stableRounds = 0; let previousCount = 0;
     let oldest: string | undefined;
