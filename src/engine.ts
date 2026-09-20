@@ -80,7 +80,7 @@ export class Engine {
 
   ingest(value: unknown, now = new Date().toISOString()): { added: number; baseline: boolean } {
     const snapshot = snapshotSchema.parse(value) as SourceSnapshot;
-    if (!snapshot.complete) throw new Error(`Incomplete ${snapshot.platform} snapshot; checkpoint unchanged`);
+    if (!snapshot.complete) throw new Error(`Incomplete ${snapshot.platform} snapshot; checkpoint unchanged${snapshot.warnings.length ? ` (${snapshot.warnings.join('; ')})` : ''}`);
     if (Date.parse(snapshot.fetchedAt) > Date.parse(now) + 60_000) throw new Error('Snapshot clock is in the future');
     if (snapshot.posts.some(p => p.platform !== snapshot.platform || p.authorId.toLowerCase() !== snapshot.accountId.toLowerCase())) {
       throw new Error('Snapshot contains mismatched platform/account');

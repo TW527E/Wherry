@@ -21,24 +21,27 @@ export interface SharkeyLimits {
   canPublicNote: boolean;
 }
 interface SharkeyAccount { id: string; username: string; policies?: JsonObject }
-interface ParsedNote { post?: SourcePost; valid: boolean }
+interface ParsedNote { post?: SourcePost; valid: boolean; reason?: string }
 const noteId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 
 function parseNote(value: unknown, accountId: string, baseUrl: string): ParsedNote {
   const note = object(value), user = object(note?.user);
   if (!note || !noteId(note.id) || note.userId !== accountId || !isoDate(note.createdAt)
-    || (note.text !== null && typeof note.text !== 'string')) return { valid: false };
+    || (note.text !== null && typeof note.text !== 'string')) return { valid: false, reason: 'note id/userId/createdAt/text shape' };
   let valid = true;
-  if (!user || user.id !== accountId || (user.host !== null && user.host !== undefined)) valid = false;
-  if (!own(note, 'cw') || (note.cw !== null && typeof note.cw !== 'string')) valid = false;
-  if (!own(note, 'replyId') || (note.replyId !== null && !noteId(note.replyId))) valid = false;
-  if (!own(note, 'renoteId') || (note.renoteId !== null && !noteId(note.renoteId))) valid = false;
-  if (!Array.isArray(note.files) || note.files.length > 16) valid = false;
-  if (typeof note.localOnly !== 'boolean') valid = false;
+  let reason: string | undefined;
+  // Record the first field that fails so a rejected snapshot names its cause instead of a generic error.
+  const fail = (field: string): void => { valid = false; reason ??= field; };
+  if (!user || user.id !== accountId || (user.host !== null && user.host !== undefined)) fail('user.id/host');
+  if (!own(note, 'cw') || (note.cw !== null && typeof note.cw !== 'string')) fail('cw');
+  if (!own(note, 'replyId') || (note.replyId !== null && !noteId(note.replyId))) fail('replyId');
+  if (!own(note, 'renoteId') || (note.renoteId !== null && !noteId(note.renoteId))) fail('renoteId');
+  if (!Array.isArray(note.files) || note.files.length > 16) fail('files');
+  if (typeof note.localOnly !== 'boolean') fail('localOnly');
   const knownVisibility = ['public', 'home', 'followers', 'specified'].includes(String(note.visibility));
-  if (!knownVisibility) valid = false;
-  if (own(note, 'isSensitive') && typeof note.isSensitive !== 'boolean') valid = false;
+  if (!knownVisibility) fail('visibility');
+  if (own(note, 'isSensitive') && typeof note.isSensitive !== 'boolean') fail('isSensitive');
 
   const files = Array.isArray(note.files) ? note.files : [];
   let sensitive = note.isSensitive === true;
@@ -49,9 +52,9 @@ function parseNote(value: unknown, accountId: string, baseUrl: string): ParsedNo
     const url = webUrl(file?.url);
     const alt = typeof file?.comment === 'string' ? file.comment : '';
     if (!file || !noteId(file.id) || !mime || !url || !positiveInteger(file.size)
-      || !own(file, 'comment') || (file.comment !== null && typeof file.comment !== 'string') || typeof file.isSensitive !== 'boolean') valid = false;
+      || !own(file, 'comment') || (file.comment !== null && typeof file.comment !== 'string') || typeof file.isSensitive !== 'boolean') fail('file shape');
     if (file?.isSensitive === true) sensitive = true;
-    if (props && ((own(props, 'width') && !positiveInteger(props.width)) || (own(props, 'height') && !positiveInteger(props.height)))) valid = false;
+    if (props && ((own(props, 'width') && !positiveInteger(props.width)) || (own(props, 'height') && !positiveInteger(props.height)))) fail('file dimensions');
     const kind = mime.startsWith('image/') ? 'image' : mime.startsWith('video/') ? 'video' : mime.startsWith('audio/') ? 'audio' : 'unknown';
     attachments.push({ kind, url, mimeType: mime || undefined, alt,
       size: positiveInteger(file?.size) ? file.size : undefined,
@@ -61,7 +64,7 @@ function parseNote(value: unknown, accountId: string, baseUrl: string): ParsedNo
   }
   if (own(note, 'fileIds')) {
     if (!Array.isArray(note.fileIds) || note.fileIds.length !== files.length
-      || note.fileIds.some((id, index) => !noteId(id) || id !== object(files[index])?.id)) valid = false;
+      || note.fileIds.some((id, index) => !noteId(id) || id !== object(files[index])?.id)) fail('fileIds');
   }
 
   let poll = false;
@@ -69,8 +72,8 @@ function parseNote(value: unknown, accountId: string, baseUrl: string): ParsedNo
     poll = true;
     const detail = object(note.poll);
     if (!detail || typeof detail.multiple !== 'boolean' || !Array.isArray(detail.choices) || detail.choices.length < 2
-      || detail.choices.some(choice => typeof object(choice)?.text !== 'string' || !count(object(choice)?.votes))) valid = false;
-    if (detail && own(detail, 'expiresAt') && detail.expiresAt !== null && !isoDate(detail.expiresAt)) valid = false;
+      || detail.choices.some(choice => typeof object(choice)?.text !== 'string' || !count(object(choice)?.votes))) fail('poll');
+    if (detail && own(detail, 'expiresAt') && detail.expiresAt !== null && !isoDate(detail.expiresAt)) fail('poll.expiresAt');
   }
 
   let relationKnown = own(note, 'replyId') && (note.replyId === null || noteId(note.replyId));
@@ -93,14 +96,14 @@ function parseNote(value: unknown, accountId: string, baseUrl: string): ParsedNo
       }
     }
   }
-  if (!relationKnown) valid = false;
+  if (!relationKnown) fail('reply relation');
   const text = note.text ?? '';
   const cw = typeof note.cw === 'string' ? note.cw : undefined;
   const renote = noteId(note.renoteId) ? note.renoteId : undefined;
   const repost = Boolean(renote && !text && !files.length && !poll && !cw);
   const quoteUrl = renote && !repost ? `${baseUrl}/notes/${encodeURIComponent(renote)}` : undefined;
   const restricted = note.visibility !== 'public' || note.localOnly === true || note.channelId != null;
-  return { valid, post: {
+  return { valid, reason, post: {
     platform: 'sharkey', id: note.id, authorId: accountId, createdAt: note.createdAt, text,
     url: `${baseUrl}/notes/${encodeURIComponent(note.id)}`, rootId,
     replyToId: note.replyId === null ? null : noteId(note.replyId) ? note.replyId : undefined,
@@ -242,7 +245,7 @@ export class SharkeyClient implements Publisher, Collector {
         let progress = 0;
         for (const raw of result) {
           const parsed = parseNote(raw, account.id, this.baseUrl);
-          if (!parsed.valid) complete = false;
+          if (!parsed.valid) { complete = false; if (parsed.reason) warnings.push(`note rejected: ${parsed.reason}${parsed.post ? ` (id ${parsed.post.id})` : ''}`); }
           if (parsed.post) {
             if (!posts.has(parsed.post.id)) { posts.set(parsed.post.id, parsed.post); progress++; }
             else { complete = false; warnings.push('Sharkey feed repeated a note ID'); }
