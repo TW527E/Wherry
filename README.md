@@ -91,10 +91,14 @@ npm run cli -- action mirror <id>       # 標記為手動鏡像
 npm run cli -- action approve <id>      # 人工放行被保留的批次
 npm run cli -- action retry <jobId>     # 重試明確失敗的工作
 npm run cli -- doctor                   # 檢查設定
+npm run cli -- login                    # 本機開瀏覽器登入 X（只需一次）
+npm run cli -- export-session           # 匯出 X 登入到 X_SESSION_FILE
+npm run cli -- import-session           # 在伺服器安裝 X_SESSION_FILE 的登入
 ```
 
 Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true`，且只接受 `TELEGRAM_OWNER_ID`）：
 `/status`、`/sync`、`/skip <id>`、`/mirror <id>`、`/approve <id>`、`/retry <job>`、`/help`。
+另外，**直接把 `x-session.json` 檔案傳到私人聊天即可更新 X 登入**（見下方部署段的方式 A）。
 
 ---
 
@@ -178,12 +182,40 @@ cp .env.example .env && vi .env
 docker compose up -d --build
 ```
 
-首次登入 X profile（只需一次，憑證留在 volume）。VPS 通常沒有桌面環境開不了可見瀏覽器，建議**在本機用 `npm run cli -- login` 登入，再把整個 `data/x-profile` 目錄上傳到伺服器的對應 volume**。若伺服器上真的有可見瀏覽器，也可以直接跑：
+首次登入 X（只需一次）。VPS 通常沒有桌面環境、開不了可見瀏覽器，所以**在本機登入、把 session 帶到伺服器**。有三種方式，擇一即可：
+
+**方式 A — Telegram 上傳（最方便，推薦）**
+
+```bash
+# 在本機（有桌面環境）：
+npm run cli -- login              # 開瀏覽器登入 X 一次
+npm run cli -- export-session     # 匯出登入到 data/x-session.json
+```
+
+然後把產生的 `data/x-session.json` 直接**傳給你的 Telegram 機器人的「私人聊天」**（就是拖檔案進去傳送）。伺服器端在 `serve` 執行時會自動收下、驗證、安裝到 X profile，並回你一則成功/失敗訊息。安裝後建議把那則上傳訊息刪掉。
+
+> 只有 `TELEGRAM_OWNER_ID` 本人在私人聊天上傳才會被接受；其他來源一律忽略。檔案會嚴格驗證（必須是 export-session 產生的格式、含有效的 X 登入 cookie），大小上限 256KB。
+> 注意：session 檔＝你的 X 登入憑證。經 Telegram 傳輸代表 Telegram 伺服器與持有 bot token 者理論上能看到內容；這是為了方便換來的取捨。若不接受，用方式 B 或 C。
+
+**方式 B — 本機匯出、scp 到伺服器安裝**
+
+```bash
+# 本機匯出後：
+scp data/x-session.json user@host:/path/to/data/x-session.json
+# 伺服器上：
+npm run cli -- import-session     # 讀 X_SESSION_FILE 安裝到 profile
+```
+
+**方式 C — 直接搬整個 profile 目錄**
+
+在本機 `npm run cli -- login` 後，把整個 `data/x-profile` 目錄上傳到伺服器對應的 volume。若伺服器上真的有可見瀏覽器，也可以直接跑：
 
 ```bash
 docker compose run --rm --entrypoint /usr/bin/chromium bridge \
   --user-data-dir=/app/data/x-profile --no-first-run https://x.com/login
 ```
+
+session 過期或被要求重新驗證時，重跑本機 `login` + `export-session`，再上傳一次即可。
 
 在非容器環境（例如桌機測試）可以用系統已安裝的 Chrome／Edge 讀取 X：
 

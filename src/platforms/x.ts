@@ -2,6 +2,18 @@ import { chromium, type BrowserContext, type Page } from 'playwright-core';
 import type { AppConfig } from '../config.js';
 import type { Attachment, Collector, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import { resolveBrowserPlan, verifyBrowserPlan, type BrowserPlan } from './browser.js';
+import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
+
+function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters<typeof chromium.launchPersistentContext>[1] {
+  const plan = resolveBrowserPlan({ choice: config.browser, executablePath: config.executablePath });
+  verifyBrowserPlan(plan);
+  const options: Parameters<typeof chromium.launchPersistentContext>[1] = {
+    headless, serviceWorkers: 'block', viewport: { width: 1280, height: 900 },
+  };
+  if (plan.executablePath) options.executablePath = plan.executablePath;
+  else if (plan.channel) options.channel = plan.channel;
+  return options;
+}
 
 export interface TweetFacts {
   id: string;
@@ -142,16 +154,7 @@ export async function loginInteractive(
   options: { waitForEnter: () => Promise<void>; log?: (message: string) => void } ,
 ): Promise<{ authenticated: boolean }> {
   const log = options.log ?? (() => {});
-  const plan = resolveBrowserPlan({ choice: config.browser, executablePath: config.executablePath });
-  verifyBrowserPlan(plan);
-  const launchOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
-    headless: false,
-    serviceWorkers: 'block',
-    viewport: { width: 1280, height: 900 },
-  };
-  if (plan.executablePath) launchOptions.executablePath = plan.executablePath;
-  else if (plan.channel) launchOptions.channel = plan.channel;
-  const context = await chromium.launchPersistentContext(config.profileDir, launchOptions);
+  const context = await chromium.launchPersistentContext(config.profileDir, launchOptionsFor(config, false));
   try {
     const page = context.pages()[0] || await context.newPage();
     await page.goto('https://x.com/login', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
@@ -160,6 +163,53 @@ export async function loginInteractive(
     await options.waitForEnter();
     // Verify the session actually reads the target profile without hitting a login wall.
     const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
+    await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+    const title = await page.title().catch(() => '');
+    const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+    const authenticated = !/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${body}`);
+    return { authenticated };
+  } finally {
+    await context.close();
+  }
+}
+
+/**
+ * Export the X login from an already-logged-in profile as a portable session file.
+ * Runs headless (only reads cookies); throws if the profile holds no X auth cookie.
+ */
+export async function exportSession(config: AppConfig['x']): Promise<SessionFile> {
+  const context = await chromium.launchPersistentContext(config.profileDir, launchOptionsFor(config, true));
+  try {
+    const state = await context.storageState() as StorageState;
+    return buildSessionFile(state, config.handle);
+  } finally {
+    await context.close();
+  }
+}
+
+/**
+ * Install a validated session file into the headless profile on this machine by seeding its
+ * cookies into the persistent context, then closing so they persist to disk. Used on a
+ * GUI-less server that received the file over Telegram or scp. Returns whether the seeded
+ * session actually reads the profile without hitting a login wall.
+ */
+export async function installSession(config: AppConfig['x'], file: SessionFile): Promise<{ authenticated: boolean }> {
+  const context = await chromium.launchPersistentContext(config.profileDir, launchOptionsFor(config, true));
+  try {
+    await context.addCookies(file.state.cookies.map(cookie => ({
+      name: cookie.name, value: cookie.value, domain: cookie.domain, path: cookie.path || '/',
+      expires: typeof cookie.expires === 'number' ? cookie.expires : -1,
+      httpOnly: Boolean(cookie.httpOnly), secure: cookie.secure !== false,
+      sameSite: (['Strict', 'Lax', 'None'] as const).includes(cookie.sameSite) ? cookie.sameSite : 'Lax',
+    })));
+    const page = context.pages()[0] || await context.newPage();
+    const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
+    await page.route('**/*', async route => {
+      const url = new URL(route.request().url());
+      if (!['http:', 'https:'].includes(url.protocol) || !(allowedHosts.has(url.hostname.toLowerCase()) || url.hostname.endsWith('.x.com'))) { await route.abort(); return; }
+      if (!['GET', 'HEAD'].includes(route.request().method())) { await route.abort(); return; }
+      await route.continue();
+    });
     await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
     const title = await page.title().catch(() => '');
     const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');

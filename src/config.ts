@@ -24,7 +24,7 @@ export interface AppConfig {
   maxDownloadBytes: number;
   maxAttempts: number;
   destinations: Destination[];
-  x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number };
+  x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string };
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
   sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
@@ -57,6 +57,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       browser: (env.X_BROWSER || 'auto').trim().toLowerCase(),
       executablePath: env.CHROMIUM_PATH || '', headless: bool(env.X_HEADLESS, true),
       maxPages: integer(env.X_MAX_PAGES, 4, 1, 10),
+      sessionFile: resolve(env.X_SESSION_FILE || `${dataDir}/x-session.json`),
     },
     bluesky: {
       enabled: bool(env.BLUESKY_ENABLED, false), identifier: env.BLUESKY_IDENTIFIER || '',

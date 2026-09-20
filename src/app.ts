@@ -6,8 +6,9 @@ import { Store } from './store.js';
 import { Engine, Worker, collectCycle, safeError } from './engine.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
-import { TelegramClient, type TelegramAudience } from './platforms/telegram.js';
-import { XCollector } from './platforms/x.js';
+import { TelegramClient, type TelegramAudience, type TelegramUpdateMessage } from './platforms/telegram.js';
+import { XCollector, installSession } from './platforms/x.js';
+import { parseSessionFile, MAX_SESSION_BYTES } from './platforms/session.js';
 import type { Collector, Destination, Publisher, RemoteRef } from './types.js';
 
 class PreviewPublisher implements Publisher {
@@ -51,8 +52,11 @@ export function createRuntime(config = loadConfig()): Runtime {
     const client = new SharkeyClient(config.sharkey, transport); collectors.push(client);
     if (live) publishers.set('sharkey', client);
   }
-  if (live && config.telegram.enabled && config.telegram.token) {
-    telegram = new TelegramClient(config.telegram, transport); publishers.set('telegram', telegram);
+  // The Telegram client is built whenever configured: command polling and session uploads are
+  // owner-only reads/admin and safe in any mode. It only becomes a publisher in live.
+  if (config.telegram.enabled && config.telegram.token) {
+    telegram = new TelegramClient(config.telegram, transport);
+    if (live) publishers.set('telegram', telegram);
   }
   if (!live) {
     for (const destination of config.destinations) publishers.set(destination, new PreviewPublisher(destination, store));
@@ -82,6 +86,7 @@ export function createRuntime(config = loadConfig()): Runtime {
         updateOffset = Math.max(updateOffset, update.update_id + 1); store.setSetting('telegram:update_offset', updateOffset);
         if (!store.commandOnce(update.update_id, new Date().toISOString())) continue;
         const message = update.message; if (!message || String(message.chat.id) !== config.telegram.privateChatId || String(message.from?.id || '') !== config.telegram.ownerId) continue;
+        if (message.document) { await handleSessionUpload(message, { config, telegram, store }); continue; }
         await handleCommand(message.text || '', { engine, telegram, store });
       }
     } catch (error) { store.event('error', `Telegram command polling failed: ${safeError(error)}`); }
@@ -102,7 +107,7 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
   const [command, id, extra] = raw.trim().split(/\s+/u);
   if (!command) return;
   try {
-    if (command === '/help') await context.telegram.sendPlain('/status /sync /skip <batch> /mirror <batch> /approve <batch> /retry <job>', 'private');
+    if (command === '/help') await context.telegram.sendPlain('/status /sync /skip <batch> /mirror <batch> /approve <batch> /retry <job>\n直接上傳 x-session.json 檔案可更新 X 登入。', 'private');
     else if (command === '/status') await context.telegram.sendPlain(JSON.stringify({ jobs: context.store.jobs(20), events: context.store.events(10) }, null, 2).slice(0, 3900), 'private');
     else if (command === '/sync') { await context.engine.sealReady(); await context.telegram.sendPlain('已要求立即檢查；X 發文仍需手動。', 'private'); }
     else if (command === '/skip' && id) { context.engine.action('skip', id); await context.telegram.sendPlain(`已跳過 ${id}`, 'private'); }
@@ -111,6 +116,32 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
     else if (command === '/retry' && id) { context.engine.action('retry', id); await context.telegram.sendPlain(`已排入重試 ${id}`, 'private'); }
     else await context.telegram.sendPlain('未知指令，使用 /help。', 'private');
   } catch (error) { await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
+}
+
+/**
+ * Owner uploaded a document to the private chat: treat it as an X session file. Only the owner's
+ * private chat reaches here (checked by the caller). We download with a hard byte cap, validate the
+ * envelope + auth cookie before touching the profile, then seed the headless profile. The cookies
+ * are the account session, so we never echo their values back — only pass/fail and the handle.
+ */
+async function handleSessionUpload(
+  message: TelegramUpdateMessage,
+  context: { config: AppConfig; telegram: TelegramClient; store: Store },
+): Promise<void> {
+  const document = message.document!;
+  const name = document.file_name || '';
+  if (!/\.json$/i.test(name)) { await context.telegram.sendPlain('收到檔案，但不是 .json；請上傳 export-session 產生的 x-session.json。', 'private').catch(() => undefined); return; }
+  try {
+    const bytes = await context.telegram.downloadFile(document.file_id, MAX_SESSION_BYTES);
+    const file = parseSessionFile(bytes);
+    const result = await installSession(context.config.x, file);
+    context.store.event('info', `X session uploaded via Telegram for @${file.handle || context.config.x.handle}; authenticated=${result.authenticated}`);
+    if (result.authenticated) await context.telegram.sendPlain('✅ X session 已安裝並驗證成功，之後的檢查就能讀到你的推文了。建議刪除剛才上傳的檔案訊息。', 'private');
+    else await context.telegram.sendPlain('⚠️ session 已安裝，但驗證時仍看到登入/驗證畫面。可能是 cookie 過期或被要求重新驗證，請在本機重新 login 後再匯出上傳。', 'private');
+  } catch (error) {
+    context.store.event('error', `X session upload failed: ${safeError(error)}`);
+    await context.telegram.sendPlain(`session 安裝失敗：${safeError(error)}`, 'private').catch(() => undefined);
+  }
 }
 
 const writeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);

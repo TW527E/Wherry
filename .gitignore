@@ -7,3 +7,5 @@ data/
 *.log
 .DS_Store
 .mimosa/
+x-session.json
+*.session.json
