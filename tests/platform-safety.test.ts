@@ -2,6 +2,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { isPublicAddress, SafeHttp, validatePublicUrl, HttpError } from '../src/security/http.js';
 import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape } from '../src/text.js';
+import { blueskyRecordKey } from '../src/platforms/bluesky.js';
+
+test('blueskyRecordKey produces a valid, deterministic TID', () => {
+  // app.bsky.feed.post requires a TID rkey (13-char base32-sortable, top bit clear).
+  const tid = /^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$/;
+  const a = blueskyRecordKey('job1:part0');
+  assert.match(a, tid);
+  assert.equal(a, blueskyRecordKey('job1:part0'), 'same idempotency key must yield the same rkey (retry safety)');
+  assert.notEqual(a, blueskyRecordKey('job1:footer'), 'different keys must differ');
+  assert.throws(() => blueskyRecordKey(''), /idempotency key/);
+});
 
 test('blocked address ranges are rejected', () => {
   for (const value of ['127.0.0.1', '0.0.0.0', '10.1.2.3', '172.16.5.4', '192.168.1.1', '169.254.169.254', '100.64.0.1', '198.18.0.5', '224.0.0.1', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '2002::1', 'ff02::1']) {

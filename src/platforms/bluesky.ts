@@ -63,10 +63,23 @@ export function blueskyLinkFacets(text: string): Array<{ index: { byteStart: num
   return facets;
 }
 
-/** Custom AT record keys need not be TIDs. Stable, legal, lowercase, and never contains a slash. */
+const TID_ALPHABET = '234567abcdefghijklmnopqrstuvwxyz'; // base32-sortable ("s32")
+
+/**
+ * app.bsky.feed.post requires its record key to be a valid TID (13-char base32-sortable string
+ * encoding a 64-bit integer with the top bit clear), not an arbitrary string. We still need the
+ * key to be DETERMINISTIC per idempotency key so a retry hits RecordAlreadyExists and reconciles
+ * by content instead of creating a duplicate. So derive the TID from the hash rather than the
+ * clock: take 64 bits of sha256(idempotencyKey), clear the top bit, and s32-encode to 13 chars.
+ * The rkey does not drive feed ordering (createdAt does), so a non-time-based TID is fine.
+ */
 export function blueskyRecordKey(idempotencyKey: string): string {
   if (!nonempty(idempotencyKey)) throw new PlatformError('A durable idempotency key is required', { code: 'MissingIdempotencyKey' });
-  return `cp${createHash('sha256').update(idempotencyKey).digest('hex')}`;
+  const digest = createHash('sha256').update(idempotencyKey).digest();
+  let value = digest.readBigUInt64BE(0) & 0x7fffffffffffffffn; // clear top bit → valid TID range
+  let key = '';
+  for (let i = 0; i < 13; i++) { key = TID_ALPHABET[Number(value & 31n)] + key; value >>= 5n; }
+  return key;
 }
 
 function publicDidUrl(did: string): string {
