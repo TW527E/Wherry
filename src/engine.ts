@@ -110,7 +110,7 @@ export class Engine {
       }
       if (!baselineAt) this.store.setSetting(`baseline:${snapshot.platform}`, snapshot.fetchedAt);
       this.store.setSetting(`fresh:${snapshot.platform}`, snapshot.fetchedAt);
-      this.store.event('info', `${snapshot.platform}: ${added} new records${baselineAt ? '' : ' (baseline only)'}`);
+      this.store.event('info', `${snapshot.platform}: ${added} new records from ${snapshot.posts.length} collected${baselineAt ? '' : ' (baseline only)'}${snapshot.warnings.length ? ` — ${snapshot.warnings.join('; ')}` : ''}`);
       return { added, baseline: !baselineAt };
     });
   }
