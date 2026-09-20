@@ -24,7 +24,7 @@ export interface AppConfig {
   maxDownloadBytes: number;
   maxAttempts: number;
   destinations: Destination[];
-  x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string };
+  x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string; sandbox: boolean };
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
   sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
@@ -58,6 +58,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       executablePath: env.CHROMIUM_PATH || '', headless: bool(env.X_HEADLESS, true),
       maxPages: integer(env.X_MAX_PAGES, 4, 1, 10),
       sessionFile: resolve(env.X_SESSION_FILE || `${dataDir}/x-session.json`),
+      // Chromium's sandbox cannot start as root on Linux and needs --no-sandbox there.
+      // Default: off when running as root on Linux, on everywhere else. X_SANDBOX overrides.
+      sandbox: bool(env.X_SANDBOX, !(process.platform === 'linux' && typeof process.getuid === 'function' && process.getuid() === 0)),
     },
     bluesky: {
       enabled: bool(env.BLUESKY_ENABLED, false), identifier: env.BLUESKY_IDENTIFIER || '',
