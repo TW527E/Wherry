@@ -9,6 +9,13 @@ function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters
   verifyBrowserPlan(plan);
   const options: Parameters<typeof chromium.launchPersistentContext>[1] = {
     headless, serviceWorkers: 'block', viewport: { width: 1280, height: 900 },
+    // X and Google refuse logins from browsers that advertise automation. Playwright adds
+    // --enable-automation (which sets navigator.webdriver=true) by default; drop it and the
+    // AutomationControlled blink feature so the interactive login is not flagged as a bot.
+    // The sandbox is left enabled (we do not pass --no-sandbox).
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--disable-blink-features=AutomationControlled'],
+    chromiumSandbox: true,
   };
   if (plan.executablePath) options.executablePath = plan.executablePath;
   else if (plan.channel) options.channel = plan.channel;
