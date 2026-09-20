@@ -165,7 +165,10 @@ export class XCollector implements Collector {
         const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
         const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: image.url, alt: image.alt }));
         if (hasVideo) media.push({ kind: 'video', alt: '' });
-        const quote = links.find(value => { try { const path = new URL(value).pathname; return /\/status\/\d+/.test(path) && !path.endsWith(`/status/${own}`); } catch { return false; } });
+        // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
+        // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
+        // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
+        const quote = links.find(value => { try { const qid = new URL(value).pathname.match(statusPath)?.[1]; return Boolean(qid) && qid !== own; } catch { return false; } });
         const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId: this.config.handle, createdAt: time || undefined, text, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
         if (parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
