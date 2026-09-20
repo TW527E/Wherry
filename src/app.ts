@@ -93,6 +93,10 @@ export function createRuntime(config = loadConfig()): Runtime {
   };
   timer = setInterval(() => void once(), config.pollSeconds * 1000); timer.unref();
   if (live && telegram && config.telegram.pollCommands) {
+    // Register the "/" menu so Telegram shows command autocomplete. Best-effort: a failure here
+    // must not stop command polling from starting.
+    void telegram.setMyCommands(TELEGRAM_COMMANDS.map(c => ({ command: c.command, description: c.description })))
+      .catch(error => store.event('error', `Telegram setMyCommands failed: ${safeError(error)}`));
     commandTimer = setInterval(() => void commandCycle(), 5000); commandTimer.unref();
   }
   return {
@@ -103,18 +107,45 @@ export function createRuntime(config = loadConfig()): Runtime {
 }
 
 interface CommandContext { engine: Engine; telegram: TelegramClient; store: Store }
+
+/** Single source of truth for the bot's commands: drives the Telegram "/" menu and /help. */
+export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; description: string }> = [
+  { command: 'help', description: '顯示所有指令說明' },
+  { command: 'status', description: '查看目前的任務、批次與近期事件' },
+  { command: 'sync', description: '立即檢查一次（X 發文仍需手動）' },
+  { command: 'pending', description: '列出等待你處理的批次與其 ID' },
+  { command: 'approve', args: '<batchId>', description: '批准一個被保留的批次，發布到下游' },
+  { command: 'skip', args: '<batchId>', description: '略過（不同步）某個批次' },
+  { command: 'mirror', args: '<batchId>', description: '標記為你手動鏡像，之後不再同步' },
+  { command: 'retry', args: '<jobId>', description: '重試一個明確失敗的工作' },
+];
+
+function helpText(): string {
+  const lines = TELEGRAM_COMMANDS.map(c => `/${c.command}${c.args ? ` ${c.args}` : ''} — ${c.description}`);
+  return ['📋 Crosspost Bridge 指令', ...lines, '', '💡 也可直接把 x-session.json 檔案傳到這個私人聊天來更新 X 登入。', 'ℹ️ X 發文一律手動；本工具只讀 X、把新貼文同步到 Bluesky / Sharkey。'].join('\n');
+}
+
 async function handleCommand(raw: string, context: CommandContext): Promise<void> {
-  const [command, id, extra] = raw.trim().split(/\s+/u);
-  if (!command) return;
+  // Accept "/cmd", "/cmd@BotName" and arguments; ignore anything that is not a slash command.
+  const parts = raw.trim().split(/\s+/u);
+  const command = (parts[0] || '').split('@')[0]!.toLowerCase();
+  const id = parts[1]; const extra = parts.slice(2).join(' ');
+  if (!command.startsWith('/')) return;
   try {
-    if (command === '/help') await context.telegram.sendPlain('/status /sync /skip <batch> /mirror <batch> /approve <batch> /retry <job>\n直接上傳 x-session.json 檔案可更新 X 登入。', 'private');
+    if (command === '/help' || command === '/start') await context.telegram.sendPlain(helpText(), 'private');
     else if (command === '/status') await context.telegram.sendPlain(JSON.stringify({ jobs: context.store.jobs(20), events: context.store.events(10) }, null, 2).slice(0, 3900), 'private');
     else if (command === '/sync') { await context.engine.sealReady(); await context.telegram.sendPlain('已要求立即檢查；X 發文仍需手動。', 'private'); }
+    else if (command === '/pending') {
+      const held = context.store.batches(50).filter(b => ['review', 'open'].includes(b.state));
+      const body = held.length ? held.map(b => `• ${b.id}\n  狀態：${b.state}（${b.reason}）`).join('\n') : '目前沒有等待處理的批次。';
+      await context.telegram.sendPlain(`待處理批次（${held.length}）\n${body}`, 'private');
+    }
     else if (command === '/skip' && id) { context.engine.action('skip', id); await context.telegram.sendPlain(`已跳過 ${id}`, 'private'); }
     else if (command === '/mirror' && id) { context.engine.action('mirror', id); await context.telegram.sendPlain(`已標記鏡像 ${id}，不會同步。${extra || ''}`, 'private'); }
     else if (command === '/approve' && id) { context.engine.action('approve', id); await context.telegram.sendPlain(`已批准 ${id} 發布到下游。`, 'private'); }
     else if (command === '/retry' && id) { context.engine.action('retry', id); await context.telegram.sendPlain(`已排入重試 ${id}`, 'private'); }
-    else await context.telegram.sendPlain('未知指令，使用 /help。', 'private');
+    else if (['/skip', '/mirror', '/approve', '/retry'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
+    else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
   } catch (error) { await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
 }
 

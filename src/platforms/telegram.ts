@@ -53,6 +53,10 @@ export class TelegramClient implements Publisher {
   async getUpdates(offset?: number): Promise<Array<{ update_id: number; message?: TelegramUpdateMessage }>> {
     return this.call('getUpdates', { timeout: 0, limit: 100, ...(offset === undefined ? {} : { offset }) });
   }
+  /** Register the command list so Telegram shows the "/" menu and autocomplete in the chat. */
+  async setMyCommands(commands: Array<{ command: string; description: string }>): Promise<void> {
+    await this.call('setMyCommands', { commands });
+  }
   /**
    * Download a document a user sent to the bot. Two calls: getFile resolves the storage path,
    * then a plain GET fetches the bytes from the file endpoint. Capped so a stray large upload
