@@ -124,7 +124,13 @@ export class XCollector implements Collector {
   async collect(since?: string): Promise<SourceSnapshot> {
     const page = await this.browserPage();
     const url = `https://x.com/${encodeURIComponent(this.config.handle)}/with_replies`;
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    // The collector reuses one long-lived page. X is an SPA that does not auto-refresh, and a
+    // goto to the URL it is already on serves the stale cached timeline (verified: the profile
+    // kept showing days-old tweets until a reload, which then surfaced the newest post). Navigate,
+    // then force a reload so X refetches the current timeline every cycle.
+    const alreadyThere = page.url().startsWith(url);
+    if (alreadyThere) await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    else await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const title = await page.title(); const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
     if (/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${bodyText}`)) throw new Error('X session is not authenticated or is challenged; no checkpoint advanced');
     // X is a client-side app: the timeline renders after domcontentloaded. Wait for the first
