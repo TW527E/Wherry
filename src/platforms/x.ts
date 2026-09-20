@@ -43,6 +43,16 @@ export interface TweetFacts {
 const statusPath = /^\/(?:[^/]+)\/status\/(\d+)/;
 const allowedHosts = new Set(['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'twimg.com', 'pbs.twimg.com', 'video.twimg.com']);
 
+/**
+ * Hosts the X web app must reach to boot and render. Besides x.com itself, the SPA loads its
+ * JS/CSS bundles from *.twimg.com (abs.twimg.com, abs-0.twimg.com) and images from pbs/video.
+ * If these are blocked the timeline never renders and the page yields zero tweet elements.
+ */
+function isAllowedXHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return allowedHosts.has(host) || host.endsWith('.x.com') || host.endsWith('.twimg.com') || host.endsWith('.twitter.com');
+}
+
 function validMediaUrl(value: string | undefined): string | undefined {
   if (!value) return;
   try { const url = new URL(value); if (url.protocol !== 'https:' || !allowedHosts.has(url.hostname.toLowerCase())) return; return url.href; } catch { return; }
@@ -104,7 +114,7 @@ export class XCollector implements Collector {
     this.page = this.context.pages()[0] || await this.context.newPage();
     await this.page.route('**/*', async route => {
       const request = route.request(); const url = new URL(request.url());
-      if (!['http:', 'https:'].includes(url.protocol) || !allowedHosts.has(url.hostname.toLowerCase()) && !url.hostname.endsWith('.x.com')) { await route.abort(); return; }
+      if (!['http:', 'https:'].includes(url.protocol) || !isAllowedXHost(url.hostname)) { await route.abort(); return; }
       if (!['GET', 'HEAD'].includes(request.method())) { await route.abort(); return; }
       await route.continue();
     });
@@ -117,6 +127,9 @@ export class XCollector implements Collector {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const title = await page.title(); const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
     if (/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${bodyText}`)) throw new Error('X session is not authenticated or is challenged; no checkpoint advanced');
+    // X is a client-side app: the timeline renders after domcontentloaded. Wait for the first
+    // tweet to appear before parsing, so an early read does not look like an empty profile.
+    await page.locator('article[data-testid="tweet"]').first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
     const seen = new Set<string>(); const facts: TweetFacts[] = [];
     let stableRounds = 0; let previousCount = 0;
     for (let round = 0; round < this.config.maxPages; round++) {
@@ -144,7 +157,14 @@ export class XCollector implements Collector {
       await page.mouse.wheel(0, 1800);
       await page.waitForTimeout(800);
     }
-    if (!facts.length) throw new Error('X profile yielded no parseable posts; no checkpoint advanced');
+    if (!facts.length) {
+      // Distinguish a genuinely empty timeline from a page that never rendered any tweet element
+      // (blocked assets, layout change, or a too-early read), so the log points at the real cause.
+      const sawArticles = await page.locator('article[data-testid="tweet"]').count();
+      throw new Error(sawArticles > 0
+        ? 'X page rendered tweets but none were parseable (tweet layout may have changed); no checkpoint advanced'
+        : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
+    }
     const complete = stableRounds >= 1;
     const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
     return { platform: 'x', accountId: this.config.handle, posts, fetchedAt: new Date().toISOString(), complete, warnings: complete ? [] : ['bounded X profile scan did not reach a stable page; retry without advancing checkpoint'] };
@@ -215,7 +235,7 @@ export async function installSession(config: AppConfig['x'], file: SessionFile):
     const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
     await page.route('**/*', async route => {
       const url = new URL(route.request().url());
-      if (!['http:', 'https:'].includes(url.protocol) || !(allowedHosts.has(url.hostname.toLowerCase()) || url.hostname.endsWith('.x.com'))) { await route.abort(); return; }
+      if (!['http:', 'https:'].includes(url.protocol) || !isAllowedXHost(url.hostname)) { await route.abort(); return; }
       if (!['GET', 'HEAD'].includes(route.request().method())) { await route.abort(); return; }
       await route.continue();
     });
