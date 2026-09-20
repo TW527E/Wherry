@@ -51,6 +51,15 @@ function setup(destinations: Destination[] = ['bluesky', 'sharkey', 'telegram'])
   return { config, store, engine };
 }
 
+test('engine.action rejects an unknown verb and a malformed id', () => {
+  const { engine } = setup();
+  assert.throws(() => engine.action('drop' as never, 'batch-1'), /action must be one of/);
+  assert.throws(() => engine.action('skip', "'; DROP TABLE batches; --"), /plain identifier/);
+  assert.throws(() => engine.action('skip', ''), /plain identifier/);
+  // A well-formed but unknown id passes validation and fails later on lookup, not on injection.
+  assert.throws(() => engine.action('skip', 'no-such-batch'), /Batch not found/);
+});
+
 test('the first snapshot becomes a baseline and never backfills', () => {
   const config = makeConfig();
   const store = new Store(':memory:');

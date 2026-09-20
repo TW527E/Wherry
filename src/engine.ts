@@ -217,6 +217,10 @@ export class Engine {
   }
 
   action(action: 'skip' | 'mirror' | 'approve' | 'retry', id: string, now = new Date().toISOString()): void {
+    // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
+    // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
+    if (!['skip', 'mirror', 'approve', 'retry'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry');
+    if (typeof id !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(id)) throw new Error('id must be a plain identifier');
     if (action === 'retry') {
       const job = this.store.getJob(id);
       if (!job || !['failed', 'review'].includes(job.state)) throw new Error('Only explicitly failed/review jobs can retry; unknown deliveries require reconciliation');
