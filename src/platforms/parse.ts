@@ -84,14 +84,34 @@ function errorCode(payload: unknown): string | undefined {
     ?? (positiveInteger(data?.error_code) ? `TELEGRAM_${data.error_code}` : undefined);
 }
 
-/** Do not include server messages, credential-bearing URLs, or reflected request bodies in errors. */
+/**
+ * The server's human-readable rejection reason (XRPC/Misskey `message`), sanitized: URLs and long
+ * opaque tokens are redacted and the length is capped, so it can go in logs without leaking
+ * credentials or reflected request bodies. This is the "why" a bare code like InvalidRequest omits.
+ */
+function safeDetail(payload: unknown): string | undefined {
+  const data = object(payload);
+  const raw = typeof data?.message === 'string' ? data.message
+    : typeof object(data?.error)?.message === 'string' ? (object(data?.error)!.message as string) : undefined;
+  if (!raw) return;
+  const cleaned = raw
+    .replace(/https?:\/\/\S+/gi, '<url>')
+    .replace(/[A-Za-z0-9._-]{40,}/g, '<token>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+  return cleaned || undefined;
+}
+
+/** Do not include credential-bearing URLs or reflected request bodies in errors; server detail is sanitized. */
 export function apiFailure(operation: string, status: number, headers: Record<string, string>, payload: unknown, mutation: boolean): PlatformError {
   const code = errorCode(payload);
+  const detail = safeDetail(payload);
   const explicitRejection = code !== undefined && new Set([
     'RecordAlreadyExists', 'NO_FREE_SPACE', 'MAX_FILE_SIZE_EXCEEDED', 'FILE_TOO_BIG',
     'RATE_LIMIT_EXCEEDED', 'AUTHENTICATION_FAILED', 'PERMISSION_DENIED', 'ExpiredToken', 'InvalidToken',
   ]).has(code);
-  return new PlatformError(`${operation} rejected${code ? ` (${code})` : ''}; HTTP ${status}`, {
+  return new PlatformError(`${operation} rejected${code ? ` (${code})` : ''}; HTTP ${status}${detail ? `: ${detail}` : ''}`, {
     status,
     code: code ?? `HTTP_${status}`,
     retryAfter: retryDelay(headers, payload),
