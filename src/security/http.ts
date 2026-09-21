@@ -116,6 +116,9 @@ export class SafeHttp implements Transport {
         request.end(body);
       });
       if ([301, 302, 303, 307, 308].includes(response.status) && response.headers.location) {
+        // The caller wants to inspect the redirect target itself (e.g. expand a t.co short link)
+        // rather than fetch the destination body. Hand back the 3xx with its Location untouched.
+        if (options.followRedirects === false) return response;
         if (mutation(method)) throw new HttpError('Redirect of a mutating request requires review', response.status, undefined, true);
         if (redirects >= maxRedirects) throw new HttpError('Too many external redirects');
         const next = new URL(response.headers.location, url);

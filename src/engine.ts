@@ -293,7 +293,61 @@ export class Engine {
     this.store.event('info', `Owner action: ${action}`, id);
   }
 
+  /**
+   * The downstream mirror candidates a held X batch might be a manual copy of, within the search
+   * window. Their ids double as the "mirror codes" the notice shows: the owner replies with a code
+   * plus the matching downstream URL to confirm the manual mirror. Only genuine, unexpired
+   * candidates are listed so a code always resolves to a real downstream post.
+   */
+  mirrorCandidates(now = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string }> {
+    return this.store.mirrors(now)
+      .filter(candidate => !candidate.expired && candidate.state === 'pending')
+      .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id }));
+  }
+
+  /**
+   * Build the interactive Telegram notice for a held X batch: what it is, the X root link, the
+   * suspected-mirror reason, and the downstream mirror codes to reply with. Kept as a string so the
+   * worker delivers it through the same durable step as any other Telegram part.
+   */
+  reviewNoticeText(batch: Batch, now = new Date().toISOString()): string {
+    const posts = this.store.batchPosts(batch.id).map(p => p.post);
+    const root = posts[0];
+    const url = root ? fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`) : undefined;
+    const excerpt = root ? Array.from(cleanXLinks(root.text)).slice(0, 100).join('') : '';
+    const candidates = this.mirrorCandidates(now);
+    const lines = [
+      '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
+      `原因：${batch.reason}`,
+      url ? `X 原文：${url}` : `批次：${batch.id}`,
+      excerpt ? `摘要：${htmlEscape(excerpt)}` : '',
+      '',
+      '• 按「發送到其他平台」＝這是新內容，立刻同步到下游。',
+      '• 按「略過」＝不要同步這則。',
+      '• 按「這是我手動鏡像的」後，回覆本則訊息並附上「鏡像代碼 + 對應平台貼文連結」，即可登記為手動鏡像、阻止反向同步。',
+    ];
+    if (candidates.length) {
+      lines.push('', '可用的鏡像代碼（點一下即可複製，回覆時貼上代碼與該平台的貼文連結，順序不限）：');
+      for (const candidate of candidates) lines.push(`${candidate.platform}：<code>${htmlEscape(candidate.id)}</code>`);
+    } else {
+      lines.push('', '（目前沒有待認領的下游貼文；若確定是手動鏡像，仍可回覆代碼與連結，或用網頁後台處理。）');
+    }
+    return lines.filter((line, index) => line !== '' || lines[index - 1] !== '').join('\n');
+  }
+
   async parts(job: Job): Promise<PublishPart[]> {
+    if (job.kind === 'ops') {
+      const batch = this.store.getBatch(job.aggregateId);
+      if (!batch) throw new Error('Job source not found');
+      return [{
+        key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
+        images: [], buttons: [
+          { text: '✅ 發送到其他平台', data: `rev:a:${batch.id}` },
+          { text: '🚫 略過', data: `rev:s:${batch.id}` },
+          { text: '🪞 這是我手動鏡像的', data: `rev:m:${batch.id}` },
+        ],
+      }];
+    }
     const batch = job.kind === 'publish' ? this.store.getBatch(job.aggregateId) : undefined;
     const members = job.kind === 'publish' ? this.store.batchPosts(job.aggregateId).map(p => p.post) : [this.store.postByKey(job.aggregateId)?.post].filter((p): p is SourcePost => Boolean(p));
     if (!members.length) throw new Error('Job source not found');

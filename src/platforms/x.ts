@@ -41,6 +41,14 @@ export interface TweetFacts {
 }
 
 const statusPath = /^\/(?:[^/]+)\/status\/(\d+)/;
+// t.co is X's link shortener. In the DOM the anchor href is the short link and the visible text
+// is a TRUNCATED (…) copy of the real URL, so a truncated link leaks a t.co short link downstream.
+// These match the short-link forms so they can be expanded to the real destination via redirects.
+const shortLinkPattern = /https?:\/\/t\.co\/[A-Za-z0-9]+/gi;
+const isShortLinkHost = (hostname: string): boolean => {
+  const host = hostname.toLowerCase();
+  return host === 't.co' || host.endsWith('.t.co');
+};
 const allowedHosts = new Set(['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'twimg.com', 'pbs.twimg.com', 'video.twimg.com']);
 
 /**
@@ -114,7 +122,51 @@ export class XCollector implements Collector {
   private context?: BrowserContext;
   private page?: Page;
   private plan?: BrowserPlan;
+  // Resolved t.co → real URL, kept for the collector's lifetime: the same short link appears across
+  // many tweets (and re-appears every scan), so resolve each destination at most once.
+  private readonly shortLinks = new Map<string, string | null>();
   constructor(private readonly config: AppConfig['x'], private readonly transport?: Transport) {}
+
+  /**
+   * Expand every t.co short link in `text` to its real destination. X only exposes the real URL as
+   * truncated display text, so the DOM leaves a bare `https://t.co/xxxx` in the text; left alone it
+   * reaches every downstream platform. Each short link is resolved by reading the redirect Location
+   * (without fetching the destination body), following at most a few hops in case a link chains
+   * through another shortener. A link that cannot be resolved is left as-is rather than dropped.
+   */
+  private async resolveShortLinks(text: string, signal?: AbortSignal): Promise<string> {
+    if (!this.transport || !shortLinkPattern.test(text)) return text;
+    const unique = new Set(text.match(shortLinkPattern) ?? []);
+    for (const short of unique) {
+      if (this.shortLinks.has(short) || signal?.aborted) continue;
+      this.shortLinks.set(short, await this.expandShortLink(short, signal));
+    }
+    return text.replace(shortLinkPattern, match => this.shortLinks.get(match) || match);
+  }
+
+  /** Follow t.co redirects (Location only, never the body) up to a few hops; null if unresolvable. */
+  private async expandShortLink(short: string, signal?: AbortSignal): Promise<string | null> {
+    let current = short;
+    for (let hop = 0; hop < 4; hop++) {
+      if (signal?.aborted) return null;
+      let response;
+      try {
+        response = await this.transport!.request(current, { method: 'HEAD', followRedirects: false, timeoutMs: 8_000, maxBytes: 65_536 });
+      } catch { return null; }
+      const location = response.headers.location;
+      if (![301, 302, 303, 307, 308].includes(response.status) || !location) {
+        // Reached a non-redirect: only accept it if we actually moved off the shortener.
+        return current !== short ? current : null;
+      }
+      let next: URL;
+      try { next = new URL(location, current); } catch { return null; }
+      if (next.protocol !== 'https:' && next.protocol !== 'http:') return null;
+      // Landed on the real destination (no longer a shortener): that is the resolved URL.
+      if (!isShortLinkHost(next.hostname)) return next.href;
+      current = next.href;
+    }
+    return null;
+  }
 
   /** Resolved browser plan; available after the first collect or an explicit `browserPlan()` call. */
   browserPlan(): BrowserPlan | undefined { return this.plan; }
@@ -268,6 +320,9 @@ export class XCollector implements Collector {
             if (!cardId || cardId === own) { const stripped = cardHref; if (stripped && !text.includes(stripped)) bodyText = text ? `${text}\n${stripped}` : stripped; }
           } catch { /* ignore malformed card href */ }
         }
+        // Expand any t.co short link the DOM left in the text to its real destination before the
+        // post is handed downstream, so other platforms show the real URL, not a t.co short link.
+        bodyText = await this.resolveShortLinks(bodyText, signal);
         const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
         if (!/pinned|置頂/i.test(articleText) && parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);

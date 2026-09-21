@@ -91,7 +91,19 @@ export class TelegramClient implements Publisher {
     await this.call('answerCallbackQuery', { callback_query_id: callbackQueryId, ...(text ? { text } : {}) }).catch(() => undefined);
   }
   async getUpdates(offset?: number): Promise<Array<{ update_id: number; message?: TelegramUpdateMessage; callback_query?: TelegramCallbackQuery }>> {
-    return this.call('getUpdates', { timeout: 0, limit: 100, allowed_updates: ['message', 'callback_query'], ...(offset === undefined ? {} : { offset }) });
+    // Long-poll: Telegram holds the connection open up to `timeout` seconds until an update
+    // arrives, so a command is delivered near-instantly instead of waiting for the next poll tick.
+    // The HTTP timeout MUST exceed the long-poll window, or the transport would abort a healthy
+    // idle poll as a timeout; +10s leaves headroom for Telegram's slack and the round-trip. This
+    // bypasses `call` because `call` cannot widen `timeoutMs` past the transport's 30s default.
+    const LONG_POLL = 25;
+    const response = await requestJson(this.transport, this.endpoint('getUpdates'),
+      { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ timeout: LONG_POLL, limit: 100, allowed_updates: ['message', 'callback_query'], ...(offset === undefined ? {} : { offset }) }),
+        maxBytes: 2_000_000, timeoutMs: (LONG_POLL + 10) * 1000 },
+      'Telegram getUpdates', true) as TelegramResponse<Array<{ update_id: number; message?: TelegramUpdateMessage; callback_query?: TelegramCallbackQuery }>>;
+    if (response.ok !== true || !Array.isArray(response.result)) throw schemaError('Telegram getUpdates', true);
+    return response.result;
   }
   /** Register the command list so Telegram shows the "/" menu and autocomplete in the chat. */
   async setMyCommands(commands: Array<{ command: string; description: string }>): Promise<void> {

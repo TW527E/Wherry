@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Batch, Classification, Destination, EventRecord, Job, JobState, Reminder, ReminderState, RemoteRef, SourcePlatform, SourcePost, StoredPost } from './types.js';
+import type { Batch, Classification, Destination, EventRecord, Job, JobState, Reminder, ReminderState, RemoteRef, ReviewNotice, ReviewNoticeState, SourcePlatform, SourcePost, StoredPost } from './types.js';
 
 type Row = Record<string, unknown>;
 const decode = <T>(value: unknown): T => JSON.parse(String(value)) as T;
@@ -20,6 +20,7 @@ const schema = [
   'CREATE TABLE IF NOT EXISTS command_receipts (update_id INTEGER PRIMARY KEY, at TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS manual_x_links (mirror_id TEXT NOT NULL REFERENCES mirrors(id), x_id TEXT NOT NULL, PRIMARY KEY(mirror_id,x_id))',
   "CREATE TABLE IF NOT EXISTS reminders (message_id INTEGER NOT NULL, chat_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, mirror_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', x_url TEXT, at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, synced_revision INTEGER NOT NULL DEFAULT 0, edit_after TEXT, PRIMARY KEY(chat_id,message_id))",
+  "CREATE TABLE IF NOT EXISTS review_notices (batch_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'offered', synced_sig TEXT NOT NULL DEFAULT '', edit_after TEXT, at TEXT NOT NULL)",
 ] as const;
 
 export class Store {
@@ -131,6 +132,12 @@ export class Store {
     this.db.prepare("UPDATE mirrors SET state='matched',matched_x_id=? WHERE id=?").run(xId, id);
   }
   mirrorMatchesXId(xId: string): boolean { return Boolean(this.db.prepare('SELECT 1 FROM manual_x_links WHERE x_id=? LIMIT 1').get(xId)); }
+  /** A single mirror candidate by its id, if it still exists and has not expired past the search window. */
+  getMirror(id: string, now: string): { id: string; post: SourcePost; expired: boolean; state: string } | undefined {
+    const threshold = new Date(Date.parse(now) - 7 * 86400_000).toISOString();
+    const row = this.db.prepare('SELECT * FROM mirrors WHERE id=? AND expires_at >= ?').get(id, threshold);
+    return row ? { id: String(row.id), post: decode<SourcePost>(row.payload), expired: String(row.expires_at) < now, state: String(row.state) } : undefined;
+  }
   armReminder(messageId: number, chatId: string, aggregateId: string, mirrorId: string, now: string): void {
     this.db.prepare("INSERT OR IGNORE INTO reminders(message_id,chat_id,aggregate_id,mirror_id,state,at) VALUES(?,?,?,?,'offered',?)").run(messageId, chatId, aggregateId, mirrorId, now);
   }
@@ -156,6 +163,40 @@ export class Store {
   }
   deferReminderEdit(reminder: Reminder, after: string): void {
     this.db.prepare('UPDATE reminders SET edit_after=? WHERE message_id=? AND chat_id=? AND revision=?').run(after, reminder.messageId, reminder.chatId, reminder.revision);
+  }
+  /** Record the Telegram message that carries a review batch's buttons, so a tap resolves the batch. */
+  armReviewNotice(batchId: string, chatId: string, messageId: number, now: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO review_notices(batch_id,chat_id,message_id,state,at) VALUES(?,?,?,'offered',?)").run(batchId, chatId, messageId, now);
+  }
+  private reviewNoticeRow(row: Row): ReviewNotice {
+    return { batchId: String(row.batch_id), chatId: String(row.chat_id), messageId: Number(row.message_id), state: row.state as ReviewNoticeState,
+      syncedSig: String(row.synced_sig ?? ''), editAfter: row.edit_after ? String(row.edit_after) : undefined, at: String(row.at) };
+  }
+  /** True once a review batch already has (or is queued to get) a notice — guards against re-notifying. */
+  hasReviewNotice(batchId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM review_notices WHERE batch_id=? LIMIT 1").get(batchId)
+      || this.db.prepare("SELECT 1 FROM jobs WHERE kind='ops' AND aggregate_id=? LIMIT 1").get(batchId));
+  }
+  getReviewNotice(messageId: number, chatId: string): ReviewNotice | undefined {
+    const row = this.db.prepare('SELECT * FROM review_notices WHERE message_id=? AND chat_id=?').get(messageId, chatId);
+    return row ? this.reviewNoticeRow(row) : undefined;
+  }
+  getReviewNoticeByBatch(batchId: string): ReviewNotice | undefined {
+    const row = this.db.prepare('SELECT * FROM review_notices WHERE batch_id=?').get(batchId);
+    return row ? this.reviewNoticeRow(row) : undefined;
+  }
+  reviewNotices(): ReviewNotice[] {
+    return this.db.prepare('SELECT * FROM review_notices ORDER BY at').all().map(row => this.reviewNoticeRow(row));
+  }
+  setReviewNoticeState(batchId: string, state: ReviewNoticeState): void {
+    this.db.prepare('UPDATE review_notices SET state=? WHERE batch_id=?').run(state, batchId);
+  }
+  /** Mark the message body actually written to Telegram, so flush only edits again on a real change. */
+  reviewNoticeSynced(batchId: string, signature: string): void {
+    this.db.prepare('UPDATE review_notices SET synced_sig=?,edit_after=NULL WHERE batch_id=?').run(signature, batchId);
+  }
+  deferReviewNoticeEdit(batchId: string, after: string): void {
+    this.db.prepare('UPDATE review_notices SET edit_after=? WHERE batch_id=?').run(after, batchId);
   }
   enqueue(kind: Job['kind'], aggregateId: string, destination: Destination, now: string, dueAt = now): string {
     const existing = this.db.prepare('SELECT id FROM jobs WHERE kind=? AND aggregate_id=? AND destination=?').get(kind, aggregateId, destination);

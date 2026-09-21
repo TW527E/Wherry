@@ -69,7 +69,12 @@ export function createRuntime(config = loadConfig()): Runtime {
   let releaseLock: () => void;
   try { releaseLock = store.acquireRuntimeLock(); } catch (error) { store.close(); throw error; }
   store.recoverInterrupted();
-  const serial = new SerialWork();
+  // Two independent serial lanes so a quick owner command never queues behind a running scan.
+  // heavy: the collect → seal → publish cycle (tens of seconds). control: Telegram commands,
+  // button taps, reminder replies and session uploads (millisecond DB reads/writes). Cross-lane
+  // safety rests on SQLite transactions + atomic claimJob + batch-state checks, not on ordering.
+  const heavy = new SerialWork();
+  const control = new SerialWork();
   const notifications = telegram ? new TelegramNotifications({ config, engine, telegram, store }) : undefined;
   const timers: NodeJS.Timeout[] = [];
   // Aborted on stop() so an in-flight collection scroll ends promptly instead of running out its
@@ -85,7 +90,7 @@ export function createRuntime(config = loadConfig()): Runtime {
   const runCycle = (publish: boolean): Promise<void> => {
     if (stopped) return Promise.resolve();
     if (cycle) return cycle;
-    cycle = serial.run(async () => {
+    cycle = heavy.run(async () => {
       if (stopped) return;
       await collectCycle(engine, collectors, undefined, shutdown.signal);
       if (publish && !stopped) { engine.sealReady(); await worker.run(); }
@@ -103,7 +108,7 @@ export function createRuntime(config = loadConfig()): Runtime {
         if (stopped) break;
         try {
           if (update.callback_query) {
-            await serial.run(() => handleCallback(update.callback_query!, { config, engine, telegram, store }));
+            await control.run(() => handleCallback(update.callback_query!, { config, engine, telegram, store }));
           } else {
             const message = update.message;
             if (!message || message.chat.type !== 'private' || String(message.chat.id) !== config.telegram.privateChatId || String(message.from?.id ?? '') !== config.telegram.ownerId) continue;
@@ -115,7 +120,7 @@ export function createRuntime(config = loadConfig()): Runtime {
               const armed = store.setting<number>('telegram:session_until', 0) > Date.now();
               store.setSetting('telegram:session_until', 0);
               if (sessionCaption || armed) {
-                await serial.run(async () => {
+                await control.run(async () => {
                   for (const collector of collectors) if (collector.platform === 'x') await collector.close?.();
                   await handleSessionUpload(message, { config, telegram, store });
                 });
@@ -129,13 +134,16 @@ export function createRuntime(config = loadConfig()): Runtime {
               continue;
             }
             if (command === '/sync') {
-              await once();
-              await telegram.sendPlain('已完成一次收集與佇列檢查；結果請看 /status。X 發文仍需手動。', 'private');
+              // Kick the collect/publish cycle on the heavy lane WITHOUT awaiting it, so the reply
+              // is instant and the control lane stays free for other commands. runCycle's own
+              // single-flight guard means a repeat /sync during a run just joins the in-flight one.
+              void once();
+              await telegram.sendPlain('已開始一次收集與佇列檢查（背景執行）；完成後結果請看 /status。X 發文仍需手動。', 'private');
               continue;
             }
-            await serial.run(async () => {
+            await control.run(async () => {
               if (await handleReminderReply(message, { config, engine, telegram, store })) return;
-              await handleCommand(text, { engine, telegram, store });
+              await handleCommand(text, { engine, telegram, store, worker });
             });
           }
         } catch (error) {
@@ -162,7 +170,15 @@ export function createRuntime(config = loadConfig()): Runtime {
     if (live && telegram && config.telegram.pollCommands) {
       menu = telegram.setMyCommands(TELEGRAM_COMMANDS.map(c => ({ command: c.command, description: c.description })))
         .catch(error => { store.event('error', `Telegram setMyCommands failed: ${safeError(error)}`); });
-      every(5000, commandCycle);
+      // getUpdates long-polls (holds up to ~25s), so instead of a fixed tick that would either
+      // stack calls or add latency after each return, re-arm the next poll as soon as the previous
+      // one settles. A small floor avoids a hot loop if a poll returns immediately or errors fast.
+      const pollLoop = (): void => {
+        if (stopped) return;
+        void commandCycle().catch(error => { store.event('error', `Background task failed: ${safeError(error)}`); })
+          .finally(() => { if (!stopped) { const t = setTimeout(pollLoop, 500); t.unref(); timers.push(t); } });
+      };
+      pollLoop();
     }
   };
   return {
@@ -176,7 +192,8 @@ export function createRuntime(config = loadConfig()): Runtime {
       worker.stop();
       stopping = (async () => {
         await Promise.allSettled([cycle, commands, menu]);
-        await serial.drain();
+        await heavy.drain();
+        await control.drain();
         await notifications?.flush();
         try { for (const collector of collectors) await collector.close?.(); }
         finally { releaseLock(); store.close(); }
@@ -186,7 +203,7 @@ export function createRuntime(config = loadConfig()): Runtime {
   };
 }
 
-interface CommandContext { engine: Engine; telegram: TelegramClient; store: Store }
+interface CommandContext { engine: Engine; telegram: TelegramClient; store: Store; worker: Worker }
 
 /** Single source of truth for the bot's commands: drives the Telegram "/" menu and /help. */
 export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; description: string }> = [
@@ -234,8 +251,8 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
         await context.telegram.sendPlain(`已登記 ${link.url}。${result.alreadyDelivered ? '⚠️ 已有發布紀錄，請檢查遠端貼文。' : '已阻止後續反向同步。'}`, 'private');
       } else { context.engine.action('mirror', id); await context.telegram.sendPlain(`已標記鏡像 ${id}，不會同步。`, 'private'); }
     }
-    else if (command === '/approve' && id) { context.engine.action('approve', id); await context.telegram.sendPlain(`已批准 ${id} 發布到下游。`, 'private'); }
-    else if (['/retry', '/resync'].includes(command) && id) { context.engine.action('retry', id); await context.telegram.sendPlain(`已排入重試 ${id}`, 'private'); }
+    else if (command === '/approve' && id) { context.engine.action('approve', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已批准 ${id}，正在背景發布到下游；狀態請看 /status。`, 'private'); }
+    else if (['/retry', '/resync'].includes(command) && id) { context.engine.action('retry', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已排入重試 ${id}（背景執行）`, 'private'); }
     else if (['/skip', '/mirror', '/approve', '/retry', '/resync'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
     else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
   } catch (error) { context.store.event('error', `Telegram command failed: ${safeError(error)}`); await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
