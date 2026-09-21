@@ -355,13 +355,14 @@ render_unit() {
   local out="$1" p d e u g n
   p="$(sed_escape "$PREFIX")"; d="$(sed_escape "$DATA_DIR")"; e="$(sed_escape "$ENV_FILE")"
   u="$(sed_escape "$SERVICE_USER")"; g="$(sed_escape "$SERVICE_GROUP")"; n="$(sed_escape "$NODE_BIN")"
+  # ExecStart 的執行檔必須是字面絕對路徑：systemd 不會展開程式位置上的變數。
   sed -e "s|/opt/Twitter-Sharkey-Bluesky|$p|g" \
       -e "s|/var/lib/crosspost-bridge|$d|g" \
       -e "s|/etc/crosspost-bridge/crosspost-bridge.env|$e|g" \
       -e "s|^User=.*|User=$u|" \
       -e "s|^Group=.*|Group=$g|" \
       -e "s|^WorkingDirectory=.*|WorkingDirectory=$p|" \
-      -e "s|^Environment=NODE_BIN=.*|Environment=NODE_BIN=$n|" \
+      -e "s|^ExecStart=.*|ExecStart=$n $p/dist/cli.js serve|" \
       -e "s|^EnvironmentFile=.*|EnvironmentFile=$e|" \
       -e "s|^ReadWritePaths=.*|ReadWritePaths=$d|" \
       "$UNIT_TEMPLATE" > "$out"

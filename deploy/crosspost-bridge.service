@@ -11,9 +11,11 @@ Type=simple
 User=crosspost
 Group=crosspost
 WorkingDirectory=/opt/Twitter-Sharkey-Bluesky
-Environment=NODE_BIN=/usr/bin/node
 EnvironmentFile=/etc/crosspost-bridge/crosspost-bridge.env
-ExecStart=${NODE_BIN} /opt/Twitter-Sharkey-Bluesky/dist/cli.js serve
+# The executable must be a literal absolute path: systemd performs no variable expansion on
+# the program token of ExecStart. deploy/install.sh rewrites this line with the node binary
+# it detected (and rewrites it again on every `update`).
+ExecStart=/usr/bin/node /opt/Twitter-Sharkey-Bluesky/dist/cli.js serve
 Restart=on-failure
 RestartSec=10s
 TimeoutStartSec=120s

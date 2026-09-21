@@ -81,22 +81,27 @@ HOST=127.0.0.1
 PORT=3000
 X_PROFILE_DIR=/var/lib/crosspost-bridge/x-profile
 X_SESSION_FILE=/var/lib/crosspost-bridge/x-session.json
-# systemd unit 的 Node 路徑可在此覆寫；這是服務設定，不是應用功能。
-NODE_BIN=/usr/bin/node
 ```
+
+Node 的絕對路徑是寫在 unit 的 `ExecStart` 裡（systemd 不會展開程式位置上的變數），由 `deploy/install.sh` 依偵測結果產生，不在這個環境檔設定。
 
 先用 preview 做設定核對。若要在正式 live 服務中啟用互動 Telegram 管理，還要填好 bot／owner／chat ID，並設定 `TELEGRAM_POLL_COMMANDS=true`。只要 private／ops 錯誤告警，不需要開命令輪詢。X 發文永遠由你手動完成。
 
-安裝 unit 並啟動：
+安裝 unit 並啟動。unit 樣板的 `ExecStart` 預設寫 `/usr/bin/node`；先確認你的 node 就在那裡（`command -v node`），若不是，安裝後改掉那一行的執行檔路徑：
 
 ```bash
 sudo install -o root -g root -m 0644 deploy/crosspost-bridge.service \
   /etc/systemd/system/crosspost-bridge.service
+# node 不在 /usr/bin/node 時（把 /usr/bin/node 換成 command -v node 的結果）：
+# sudo sed -i "s|^ExecStart=/usr/bin/node |ExecStart=$(command -v node) |" \
+#   /etc/systemd/system/crosspost-bridge.service
 sudo systemd-analyze verify /etc/systemd/system/crosspost-bridge.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now crosspost-bridge.service
 sudo systemctl status --no-pager crosspost-bridge.service
 ```
+
+`ExecStart` 的執行檔必須是字面絕對路徑——systemd 不會展開程式位置上的變數（`ExecStart=${NODE_BIN} …` 會導致 `Failed at step EXEC … No such file or directory`）。用 `install.sh` 的話這行會自動填成偵測到的 node 路徑，不必手改。node 也必須裝在系統路徑：unit 有 `ProtectHome=true`，`/home` 底下（例如 nvm）的 node 無法被執行。
 
 本 unit 使用 `Restart=on-failure`、啟動限流與 60 秒的 SIGTERM 停止寬限。程式收到 SIGTERM 後會停止新輪詢、等待目前工作序列與瀏覽器關閉，再釋放資料目錄鎖。
 
@@ -148,7 +153,7 @@ sudo journalctl -u crosspost-bridge.service -f
 sudo systemctl restart crosspost-bridge.service
 ```
 
-若看到 `DATA_DIR is already in use`，表示服務或另一個 CLI 正在使用同一資料目錄；先用 `systemctl status`／`ps` 核對，不要手動刪 `runtime_lock` 或 SQLite。若 Node 路徑不同，將 `NODE_BIN=/實際/路徑/node` 放在 environment file 並執行 `daemon-reload`；服務仍須由該路徑執行 Node 24+。
+若看到 `DATA_DIR is already in use`，表示服務或另一個 CLI 正在使用同一資料目錄；先用 `systemctl status`／`ps` 核對，不要手動刪 `runtime_lock` 或 SQLite。若 Node 不是裝在 unit 裡寫的路徑，重跑 `sudo bash deploy/install.sh update`（會把偵測到的 node 絕對路徑重寫進 `ExecStart`），或手動改 unit 該行後 `daemon-reload`。注意：node 必須裝在系統路徑（如 NodeSource 的 `/usr/bin/node`）；unit 有 `ProtectHome=true`，放在 `/home` 底下的 node（例如 nvm）無法被執行。
 
 systemd unit 使用 `ProtectSystem=strict`，只允許 `/var/lib/crosspost-bridge` 寫入；不設 `PrivateNetwork`，因為平台 API、Telegram、媒體與 X 讀取都需要出站網路。若主機的 systemd 版本不支援某項沙盒設定，先用 `systemd-analyze verify /etc/systemd/system/crosspost-bridge.service` 找出確切錯誤，再做最小化 drop-in 調整；不要直接移除所有隔離設定。
 

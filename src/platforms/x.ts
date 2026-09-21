@@ -99,7 +99,10 @@ export class XCollector implements Collector {
   browserPlan(): BrowserPlan | undefined { return this.plan; }
 
   private async browserPage(): Promise<Page> {
-    if (this.page) return this.page;
+    if (this.page && !this.page.isClosed()) return this.page;
+    // The previous context died (Chromium crash, OOM kill, external close). A stale cached
+    // reference would fail every scan forever, so clear the remnants and relaunch below.
+    if (this.context || this.page) await this.close().catch(() => undefined);
     // Resolve once per collector lifetime so `doctor` and the collector agree on the browser.
     this.plan = resolveBrowserPlan({ choice: this.config.browser, executablePath: this.config.executablePath });
     verifyBrowserPlan(this.plan);
@@ -116,6 +119,21 @@ export class XCollector implements Collector {
   }
 
   async collect(since?: string): Promise<SourceSnapshot> {
+    try {
+      return await this.attempt(since);
+    } catch (error) {
+      const message = (error as { message?: string })?.message || '';
+      if (!/Target page, context or browser has been closed|Browser has been closed|Target closed/i.test(message)) throw error;
+      // The long-lived browser died mid-scan (crash or OOM kill). Reset and retry once with a
+      // fresh context so one crash costs a relaunch, not a permanently failing collector.
+      await this.close().catch(() => undefined);
+      const snapshot = await this.attempt(since);
+      snapshot.warnings.push('X browser context was closed mid-scan and had to be relaunched (Chromium crash or OOM kill?)');
+      return snapshot;
+    }
+  }
+
+  private async attempt(since?: string): Promise<SourceSnapshot> {
     const fetchedAt = new Date().toISOString();
     const page = await this.browserPage();
     // Read the main profile timeline, NOT /with_replies. Verified against the live account: the
@@ -132,9 +150,27 @@ export class XCollector implements Collector {
     else await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const title = await page.title(); const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
     if (/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${bodyText}`)) throw new Error('X session is not authenticated or is challenged; no checkpoint advanced');
-    // X is a client-side app: the timeline renders after domcontentloaded. Wait for the first
-    // tweet to appear before parsing, so an early read does not look like an empty profile.
-    await page.locator('article[data-testid="tweet"]').first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
+    // X is a client-side app and renders the timeline progressively after domcontentloaded.
+    // Reading at the instant the FIRST article appears can catch a partial screenful — e.g. an
+    // older tweet rendered before the newest one — and the watermark check below would then
+    // declare the gap covered against an incomplete window, silently blind to the newest post.
+    // So wait until the article count has plateaued (or ~15s cap) before trusting the render.
+    let settled = 0; let lastCount = -1;
+    for (let i = 0; i < 30; i++) {
+      const count = await page.locator('article[data-testid="tweet"]').count().catch(() => 0);
+      if (count === lastCount) settled++; else { settled = 0; lastCount = count; }
+      if (lastCount >= 1 && settled >= 3) break;
+      await page.waitForTimeout(500);
+    }
+    // An inline failure replaces the timeline with an error box. A healthy render shows several
+    // articles, so only probe for X's error wording when almost nothing rendered — a tweet that
+    // merely quotes the phrase must not fail the scan.
+    if (lastCount <= 2) {
+      const columnText = await page.locator('[data-testid="primaryColumn"]').innerText({ timeout: 2_000 }).catch(() => '');
+      if (/something went wrong|try reloading|發生錯誤|請嘗試重新載入|無法載入/i.test(columnText)) {
+        throw new Error('X timeline rendered an inline error state ("Something went wrong / Try reloading"); no checkpoint advanced');
+      }
+    }
     // A logged-out/stale session serves a short public preview (a few tweets, infinite scroll
     // blocked) with no login WORDS, so the regex above misses it. Require a positive signed-in
     // signal — the account switcher or compose button only render for an authenticated session —
@@ -209,10 +245,13 @@ export class XCollector implements Collector {
         if (!/pinned|置頂/i.test(articleText) && parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
       }
-      // Once the oldest tweet seen is at/older than the last fetch, the gap since then is covered.
-      if (since && oldest && oldest <= since) { reachedWatermark = true; break; }
+      // The gap since the last fetch is covered only once the oldest tweet seen is at/older than
+      // the watermark AND the render has stopped growing. The no-growth condition matters:
+      // breaking in the very first round against a partially rendered timeline is exactly how a
+      // slow render used to masquerade as "nothing new since the watermark".
       if (seen.size === previousCount) stableRounds++; else stableRounds = 0;
       previousCount = seen.size;
+      if (since && oldest && oldest <= since && stableRounds >= 1) { reachedWatermark = true; break; }
       if (stableRounds >= 2) break;
       await page.mouse.wheel(0, 1800);
       await page.waitForTimeout(800);
@@ -226,7 +265,9 @@ export class XCollector implements Collector {
         : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
     }
     // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
-    const warnings = reachedWatermark ? [] : ['X backlog since the last scan exceeds the scroll budget; raise X_MAX_PAGES or scan more often'];
+    const warnings = reachedWatermark ? [] : [oldest
+      ? 'X backlog since the last scan exceeds the scroll budget; raise X_MAX_PAGES or scan more often'
+      : 'X timeline exposed no dated, non-pinned post (render incomplete or layout changed)'];
     const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
     return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: reachedWatermark, warnings };
   }
