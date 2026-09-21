@@ -8,13 +8,19 @@ interface TelegramResponse<T> { ok: boolean; result?: T; description?: string; p
 interface TelegramMessage { message_id: number; chat: { id: number | string }; media_group_id?: string }
 const MAX_TEXT = 4096; const MAX_CAPTION = 1024;
 
-function multipart(fields: Record<string, string>, file?: { name: string; type: string; bytes: Uint8Array; field: string }): { body: Uint8Array; contentType: string } {
+interface MultipartFile { name: string; type: string; bytes: Uint8Array; field: string }
+
+function multipartMulti(fields: Record<string, string>, files: MultipartFile[]): { body: Uint8Array; contentType: string } {
   const boundary = `----crosspost-${crypto.randomUUID()}`; const encoder = new TextEncoder(); const chunks: Uint8Array[] = [];
   for (const [key, value] of Object.entries(fields)) chunks.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`));
-  if (file) { chunks.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.name}"\r\nContent-Type: ${file.type}\r\n\r\n`)); chunks.push(file.bytes); chunks.push(encoder.encode('\r\n')); }
+  for (const file of files) { chunks.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.name}"\r\nContent-Type: ${file.type}\r\n\r\n`)); chunks.push(file.bytes); chunks.push(encoder.encode('\r\n')); }
   chunks.push(encoder.encode(`--${boundary}--\r\n`)); const length = chunks.reduce((n, c) => n + c.length, 0); const body = new Uint8Array(length); let offset = 0;
   for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length; }
   return { body, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+function multipart(fields: Record<string, string>, file?: MultipartFile): { body: Uint8Array; contentType: string } {
+  return multipartMulti(fields, file ? [file] : []);
 }
 
 export class TelegramClient implements Publisher {
@@ -35,13 +41,30 @@ export class TelegramClient implements Publisher {
     const audience = context.audience === 'private' ? 'private' : context.audience === 'ops' ? 'ops' : 'public'; const chatId = this.chat(audience);
     const reply = context.parent?.messageIds?.[0] ? { message_id: context.parent.messageIds[0], allow_sending_without_reply: false } : undefined;
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
-    if (part.images.length > 1) throw new Error('Telegram publisher accepts one image per durable step');
+    if (part.images.length > 4) throw new Error('Telegram publisher accepts at most four images per durable step');
     if (part.images.length === 1) {
       const image = part.images[0]!; const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
       const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) }, { name: `crosspost.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, type: image.mimeType, bytes: image.bytes, field: 'photo' });
       const response = await requestJson(this.transport, this.endpoint('sendPhoto'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, 'Telegram sendPhoto', true) as TelegramResponse<TelegramMessage>;
       if (!response.ok || !response.result) throw schemaError('Telegram sendPhoto', true);
       return { id: String(response.result.message_id), messageIds: [response.result.message_id], chatId };
+    }
+    if (part.images.length > 1) {
+      // Several photos from one tweet post as a single album, caption (with the link) on the
+      // first item — the whole group is one durable step so a retry replays the same album.
+      const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
+      const files = part.images.map((image, index) => ({
+        name: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, type: image.mimeType, bytes: image.bytes, field: `photo${index}`,
+      }));
+      const media = part.images.map((image, index) => ({
+        type: 'photo', media: `attach://photo${index}`,
+        ...(index === 0 ? { caption, parse_mode: 'HTML' } : {}),
+      }));
+      const form = multipartMulti({ chat_id: chatId, media: JSON.stringify(media), ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) }, files);
+      const response = await requestJson(this.transport, this.endpoint('sendMediaGroup'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, 'Telegram sendMediaGroup', true) as TelegramResponse<TelegramMessage[]>;
+      if (!response.ok || !Array.isArray(response.result) || !response.result.length) throw schemaError('Telegram sendMediaGroup', true);
+      const ids = response.result.map(message => message.message_id);
+      return { id: String(ids[0]), messageIds: ids, chatId };
     }
     const text = `${htmlEscape(part.text)}${link}`; if (text.length > MAX_TEXT) throw new Error('Telegram message requires core text splitter before publish');
     const markup = part.buttons?.length ? { reply_markup: { inline_keyboard: [part.buttons.map(b => ({ text: b.text, callback_data: b.data }))] } } : {};

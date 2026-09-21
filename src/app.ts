@@ -72,6 +72,9 @@ export function createRuntime(config = loadConfig()): Runtime {
   const serial = new SerialWork();
   const notifications = telegram ? new TelegramNotifications({ config, engine, telegram, store }) : undefined;
   const timers: NodeJS.Timeout[] = [];
+  // Aborted on stop() so an in-flight collection scroll ends promptly instead of running out its
+  // whole page budget (× reload + sleeps) while shutdown waits on it.
+  const shutdown = new AbortController();
   let stopped = false;
   let started = false;
   let cycle: Promise<void> | undefined;
@@ -84,8 +87,8 @@ export function createRuntime(config = loadConfig()): Runtime {
     if (cycle) return cycle;
     cycle = serial.run(async () => {
       if (stopped) return;
-      await collectCycle(engine, collectors);
-      if (publish) { engine.sealReady(); await worker.run(); }
+      await collectCycle(engine, collectors, undefined, shutdown.signal);
+      if (publish && !stopped) { engine.sealReady(); await worker.run(); }
     }).catch(error => { store.event('error', `Service cycle failed: ${safeError(error)}`); })
       .finally(async () => { try { await notifications?.flush(); } finally { cycle = undefined; } });
     return cycle;
@@ -168,6 +171,7 @@ export function createRuntime(config = loadConfig()): Runtime {
     stop: () => {
       if (stopping) return stopping;
       stopped = true;
+      shutdown.abort();
       for (const timer of timers) clearInterval(timer);
       worker.stop();
       stopping = (async () => {

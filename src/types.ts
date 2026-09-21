@@ -44,6 +44,15 @@ export interface SourceSnapshot {
   posts: SourcePost[];
   fetchedAt: string;
   complete: boolean;
+  /**
+   * How far back the scan actually reached, as an ISO time (the oldest non-pinned post rendered).
+   * Set only when `complete` is false because the page budget ran out BEFORE covering the whole
+   * gap — the posts still parsed cleanly, the scan just did not scroll far enough. The engine then
+   * advances the checkpoint to this point so the next scan resumes here instead of re-scrolling the
+   * same range forever (the doom loop that otherwise blocks the queue). Left undefined for a
+   * structural failure (nothing rendered, schema broken), where the checkpoint must NOT advance.
+   */
+  watermark?: string;
   warnings: string[];
 }
 
@@ -113,7 +122,7 @@ export interface Collector {
    * snapshot is only `complete` when the whole gap since the last scan was covered. When unset
    * (first scan), the bounded page budget is the natural limit and the snapshot is a clean baseline.
    */
-  collect(since?: string): Promise<SourceSnapshot>;
+  collect(since?: string, signal?: AbortSignal): Promise<SourceSnapshot>;
   close?(): Promise<void>;
 }
 

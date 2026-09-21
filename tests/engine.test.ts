@@ -102,11 +102,43 @@ test('the first snapshot becomes a baseline and never backfills', () => {
   assert.equal(store.jobs(100).length, 0);
 });
 
-test('an incomplete snapshot is rejected without advancing the checkpoint', () => {
+test('an incomplete snapshot with no watermark is rejected without advancing the checkpoint', () => {
   const { store, engine } = setup();
   const incomplete: SourceSnapshot = { ...snapshot([post({ id: '5', createdAt: at(10) })], at(20)), complete: false };
   assert.throws(() => engine.ingest(incomplete, at(20)), /Incomplete/);
   assert.equal(store.getPost('x', '5'), undefined);
+});
+
+test('a budget-limited snapshot carrying a watermark is ingested and advances the checkpoint', () => {
+  // The doom-loop case: the scan ran out of scroll budget (complete:false) but parsed cleanly and
+  // reports how far back it reached (watermark). It must ingest what it saw and move `fresh:x`
+  // forward to the watermark — never throw, which would pin the checkpoint and re-scroll forever.
+  const { store, engine } = setup();
+  const priorFresh = store.setting<string | undefined>('fresh:x', undefined);
+  const limited: SourceSnapshot = {
+    ...snapshot([post({ id: '5', createdAt: at(10) })], at(60)),
+    complete: false, watermark: at(15),
+  };
+  assert.doesNotThrow(() => engine.ingest(limited, at(60)));
+  // The parsed post landed instead of being discarded.
+  assert.ok(store.getPost('x', '5'));
+  // The checkpoint advanced to the watermark (the oldest post reached), strictly forward of before.
+  const advanced = store.setting<string | undefined>('fresh:x', undefined);
+  assert.equal(advanced, at(15));
+  assert.ok(priorFresh === undefined || advanced! > priorFresh);
+});
+
+test('a budget-limited watermark never drags the checkpoint backwards', () => {
+  // Guard the "always forward" invariant: if a partial scan somehow reports a watermark older than
+  // the current checkpoint, the checkpoint must stay put rather than rewind and re-publish old work.
+  const { store, engine } = setup();
+  store.setSetting('fresh:x', at(100));
+  const limited: SourceSnapshot = {
+    ...snapshot([post({ id: '9', createdAt: at(50) })], at(120)),
+    complete: false, watermark: at(30),
+  };
+  assert.doesNotThrow(() => engine.ingest(limited, at(120)));
+  assert.equal(store.setting<string | undefined>('fresh:x', undefined), at(100));
 });
 
 test('a destination without its own source observation is refused at configuration time', () => {

@@ -58,6 +58,27 @@ function validMediaUrl(value: string | undefined): string | undefined {
   try { const url = new URL(value); if (url.protocol !== 'https:' || !allowedHosts.has(url.hostname.toLowerCase())) return; return url.href; } catch { return; }
 }
 
+/**
+ * The <img> in a timeline card points at a downscaled render — pbs.twimg.com serves a size via
+ * the `name` query param (name=small / 360x360 / medium), which is why synced photos looked
+ * blurry. Rewrite a photo URL to request the original pixels (name=orig); the media pipeline
+ * downsizes afterwards to fit each destination, so we start from the sharpest source available.
+ * Only pbs.twimg.com photo URLs are rewritten; anything else is returned unchanged.
+ */
+export function fullSizeImageUrl(value: string | undefined): string | undefined {
+  const valid = validMediaUrl(value);
+  if (!valid) return valid;
+  try {
+    const url = new URL(valid);
+    const host = url.hostname.toLowerCase();
+    if (host !== 'pbs.twimg.com' && !host.endsWith('.pbs.twimg.com')) return valid;
+    if (!/^\/media\//.test(url.pathname)) return valid;
+    // Keep the encoded format (jpg/png/webp) if present; only force the size to the original.
+    url.searchParams.set('name', 'orig');
+    return url.href;
+  } catch { return valid; }
+}
+
 export function parseTweetFacts(input: {
   id: string; url?: string; authorId: string; createdAt?: string; text?: string; labels?: string[];
   statusLinks?: string[]; replyingTo?: string; attachments?: Attachment[]; repost?: boolean; quoteUrl?: string;
@@ -118,22 +139,26 @@ export class XCollector implements Collector {
     return this.page;
   }
 
-  async collect(since?: string): Promise<SourceSnapshot> {
+  async collect(since?: string, signal?: AbortSignal): Promise<SourceSnapshot> {
     try {
-      return await this.attempt(since);
+      return await this.attempt(since, signal);
     } catch (error) {
       const message = (error as { message?: string })?.message || '';
+      // A deliberate shutdown abort is not a browser crash — do not relaunch, just surface it so
+      // the cycle ends promptly and the checkpoint is left untouched.
+      if (signal?.aborted && /aborted/i.test(message)) throw error;
       if (!/Target page, context or browser has been closed|Browser has been closed|Target closed/i.test(message)) throw error;
       // The long-lived browser died mid-scan (crash or OOM kill). Reset and retry once with a
       // fresh context so one crash costs a relaunch, not a permanently failing collector.
       await this.close().catch(() => undefined);
-      const snapshot = await this.attempt(since);
+      const snapshot = await this.attempt(since, signal);
       snapshot.warnings.push('X browser context was closed mid-scan and had to be relaunched (Chromium crash or OOM kill?)');
       return snapshot;
     }
   }
 
-  private async attempt(since?: string): Promise<SourceSnapshot> {
+  private async attempt(since?: string, signal?: AbortSignal): Promise<SourceSnapshot> {
+    if (signal?.aborted) throw new Error('X collection aborted before start');
     const fetchedAt = new Date().toISOString();
     const page = await this.browserPage();
     // Read the main profile timeline, NOT /with_replies. Verified against the live account: the
@@ -157,6 +182,7 @@ export class XCollector implements Collector {
     // So wait until the article count has plateaued (or ~15s cap) before trusting the render.
     let settled = 0; let lastCount = -1;
     for (let i = 0; i < 30; i++) {
+      if (signal?.aborted) break;
       const count = await page.locator('article[data-testid="tweet"]').count().catch(() => 0);
       if (count === lastCount) settled++; else { settled = 0; lastCount = count; }
       if (lastCount >= 1 && settled >= 3) break;
@@ -226,7 +252,8 @@ export class XCollector implements Collector {
         const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]').first().getAttribute('href').catch(() => null);
         const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
         const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
-        const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: image.url, alt: image.alt }));
+        // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
+        const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
         if (hasVideo) media.push({ kind: 'video', alt: '' });
         // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
         // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
@@ -253,6 +280,10 @@ export class XCollector implements Collector {
       previousCount = seen.size;
       if (since && oldest && oldest <= since && stableRounds >= 1) { reachedWatermark = true; break; }
       if (stableRounds >= 2) break;
+      // A shutdown can arrive mid-scroll; stop paging so the cycle ends and the process can exit.
+      // What was already parsed is returned as a budget-limited snapshot (checkpoint advances to
+      // the oldest post reached), so an abort costs nothing beyond a shorter scan.
+      if (signal?.aborted) break;
       await page.mouse.wheel(0, 1800);
       await page.waitForTimeout(800);
     }
@@ -264,12 +295,20 @@ export class XCollector implements Collector {
         ? 'X page rendered tweets but none were parseable (tweet layout may have changed); no checkpoint advanced'
         : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
     }
-    // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
-    const warnings = reachedWatermark ? [] : [oldest
-      ? 'X backlog since the last scan exceeds the scroll budget; raise X_MAX_PAGES or scan more often'
-      : 'X timeline exposed no dated, non-pinned post (render incomplete or layout changed)'];
     const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
-    return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: reachedWatermark, warnings };
+    if (reachedWatermark) return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: true, warnings: [] };
+    // Budget exhausted before reaching the watermark. The posts parsed fine — we just did not
+    // scroll back far enough. Report `oldest` as the watermark so the engine advances the
+    // checkpoint to there (breaking the re-scroll loop) instead of pinning it and failing forever.
+    // Posts older than `oldest` this round are skipped; raising X_MAX_PAGES or scanning more often
+    // is the real remedy for a persistent backlog.
+    return {
+      platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: false,
+      watermark: oldest,
+      warnings: [oldest
+        ? `X backlog exceeded the scroll budget; advanced the checkpoint to ${oldest} and skipped anything older this round (raise X_MAX_PAGES or scan more often)`
+        : 'X timeline exposed no dated, non-pinned post (render incomplete or layout changed)'],
+    };
   }
   async close(): Promise<void> { await this.context?.close(); this.context = undefined; this.page = undefined; }
 }

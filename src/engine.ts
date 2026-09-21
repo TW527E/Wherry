@@ -20,7 +20,7 @@ export const sourcePostSchema = z.object({
 });
 export const snapshotSchema = z.object({
   platform: z.enum(['x', 'bluesky', 'sharkey']), accountId: z.string().min(1), posts: z.array(sourcePostSchema).max(1000),
-  fetchedAt: z.string().datetime(), complete: z.boolean(), warnings: z.array(z.string()),
+  fetchedAt: z.string().datetime(), complete: z.boolean(), watermark: z.string().datetime().optional(), warnings: z.array(z.string()),
 });
 
 export function unsupportedReason(post: SourcePost): string | undefined {
@@ -80,7 +80,13 @@ export class Engine {
 
   ingest(value: unknown, now = new Date().toISOString()): { added: number; baseline: boolean } {
     const snapshot = snapshotSchema.parse(value) as SourceSnapshot;
-    if (!snapshot.complete) throw new Error(`Incomplete ${snapshot.platform} snapshot; checkpoint unchanged${snapshot.warnings.length ? ` (${snapshot.warnings.join('; ')})` : ''}`);
+    // A snapshot that neither completed nor tells us how far it safely reached is a structural
+    // failure (nothing rendered, schema broken): refuse it so the checkpoint does not advance.
+    // But a snapshot that ran out of scroll budget yet parsed cleanly carries a `watermark` — the
+    // oldest post it did reach — and IS ingested, advancing the checkpoint only to that point.
+    // Otherwise the checkpoint stays pinned to an old time the budget can never reach, and every
+    // scan re-scrolls the same range forever, blocking the queue and starving shutdown.
+    if (!snapshot.complete && !snapshot.watermark) throw new Error(`Incomplete ${snapshot.platform} snapshot; checkpoint unchanged${snapshot.warnings.length ? ` (${snapshot.warnings.join('; ')})` : ''}`);
     if (Date.parse(snapshot.fetchedAt) > Date.parse(now) + 60_000) throw new Error('Snapshot clock is in the future');
     // A repost legitimately carries the original author's id, not the account's, so it is exempt
     // from the identity guard; every original post must still belong to the collected account.
@@ -109,7 +115,15 @@ export class Engine {
         added++;
       }
       if (!baselineAt) this.store.setSetting(`baseline:${snapshot.platform}`, snapshot.fetchedAt);
-      this.store.setSetting(`fresh:${snapshot.platform}`, snapshot.fetchedAt);
+      // A complete scan covered the whole gap up to fetchedAt, so the checkpoint moves there. A
+      // budget-limited scan only reached `watermark` (the oldest post it rendered), so the
+      // checkpoint moves there instead — never past unseen posts — and always strictly forward of
+      // the previous watermark, which is what breaks the re-scroll loop. Guard against going
+      // backwards if a partial scan somehow reached older than the last checkpoint.
+      const priorFresh = this.store.setting<string | undefined>(`fresh:${snapshot.platform}`, undefined);
+      const advanceTo = snapshot.complete ? snapshot.fetchedAt
+        : [snapshot.watermark!, priorFresh].filter((v): v is string => Boolean(v)).sort().at(-1)!;
+      this.store.setSetting(`fresh:${snapshot.platform}`, advanceTo);
       // Newest collected post vs. baseline: if newest <= baseline, the scrape isn't seeing anything
       // newer than the watermark (either nothing new was posted, or the collector missed it).
       const newest = sorted.length ? sorted[sorted.length - 1]!.createdAt : '(none)';
@@ -298,10 +312,16 @@ export class Engine {
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
       const key = createHash('sha256').update(post.id).digest('hex').slice(0, 16);
       if (job.destination === 'telegram') {
-        // Telegram counts the rendered HTML, not the raw text, so the escaped balloon must fit the limit.
+        // A tweet's images belong to ONE post, so send them as a single album (sendMediaGroup)
+        // with the whole caption on the first photo — not one message per image, which stranded
+        // every image after the first with an empty caption and a repeated footer link. Telegram
+        // counts rendered HTML and caps an album caption at 1024, a text message at 4096, so the
+        // caption chunk fits the album and any overflow continues as plain follow-up messages.
         const chunks = splitHtml(text, images.length ? 1024 : 4096, sourceUrl ? 120 : 0);
-        for (let i = 0; i < Math.max(chunks.length, images.length, 1); i++) {
-          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i] || '', images: images[i] ? [images[i]!] : [], sourceUrl });
+        const caption = chunks[0] ?? '';
+        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, sourceUrl });
+        for (let i = 1; i < chunks.length; i++) {
+          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl });
         }
       } else {
         const chunks = splitText(text, job.destination === 'bluesky' ? { graphemes: 300, utf8Bytes: 3000 } : { utf16: 3000 });
@@ -436,14 +456,16 @@ export function splitHtml(text: string, escapedLimit: number, reserve = 0): stri
   throw new Error('Text cannot be split to fit the Telegram HTML limit without changing content');
 }
 
-export async function collectCycle(engine: Engine, collectors: Collector[], now?: string): Promise<void> {
+export async function collectCycle(engine: Engine, collectors: Collector[], now?: string, signal?: AbortSignal): Promise<void> {
   const sorted = [...collectors].sort((a, b) => Number(a.platform === 'x') - Number(b.platform === 'x'));
   for (const collector of sorted) {
+    // A shutdown between collectors ends the cycle rather than starting the next (heavy) scan.
+    if (signal?.aborted) break;
     // Pass the last successful fetch watermark so the collector pages back only as far as needed
     // and can tell whether it closed the whole gap since the previous scan.
     const since = engine.store.setting<string | undefined>(`fresh:${collector.platform}`, undefined);
     try {
-      engine.ingest(await collector.collect(since), now);
+      engine.ingest(await collector.collect(since, signal), now);
       if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'authenticated');
     } catch (error) {
       if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'error');

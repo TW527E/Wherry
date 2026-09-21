@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { isPublicAddress, SafeHttp, validatePublicUrl, HttpError } from '../src/security/http.js';
 import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape } from '../src/text.js';
 import { blueskyRecordKey } from '../src/platforms/bluesky.js';
+import { fullSizeImageUrl } from '../src/platforms/x.js';
+import { TelegramClient } from '../src/platforms/telegram.js';
+import type { HttpOptions, HttpResponse, PreparedImage, Transport } from '../src/types.js';
 
 test('blueskyRecordKey produces a valid, deterministic TID', () => {
   // app.bsky.feed.post requires a TID rkey (13-char base32-sortable, top bit clear).
@@ -51,6 +54,54 @@ test('fixupx rewriting only touches genuine X status links and drops tracking pa
   assert.equal(fixupUrl('https://x.com.evil.example/alice/status/1'), undefined);
   assert.equal(fixupUrl('https://example.com/alice/status/1'), undefined);
   assert.equal(fixupUrl('javascript:alert(1)'), undefined);
+});
+
+test('X photo URLs are upgraded to original resolution, other URLs untouched', () => {
+  // The blurry-thumbnail bug: the timeline <img> src carries a downscaled size in name=.
+  assert.equal(fullSizeImageUrl('https://pbs.twimg.com/media/ABC123?format=jpg&name=small'),
+    'https://pbs.twimg.com/media/ABC123?format=jpg&name=orig');
+  assert.equal(fullSizeImageUrl('https://pbs.twimg.com/media/ABC123?format=png&name=360x360'),
+    'https://pbs.twimg.com/media/ABC123?format=png&name=orig');
+  // A media URL with no size param still gets name=orig added.
+  assert.equal(fullSizeImageUrl('https://pbs.twimg.com/media/ABC123.jpg'),
+    'https://pbs.twimg.com/media/ABC123.jpg?name=orig');
+  // Non-media pbs paths (profile/emoji) and non-pbs hosts are left alone.
+  assert.equal(fullSizeImageUrl('https://pbs.twimg.com/profile_images/1/avatar.jpg'),
+    'https://pbs.twimg.com/profile_images/1/avatar.jpg');
+  // Non-public / disallowed hosts are still rejected exactly like validMediaUrl.
+  assert.equal(fullSizeImageUrl('http://pbs.twimg.com/media/ABC?name=small'), undefined);
+  assert.equal(fullSizeImageUrl('https://evil.example/media/ABC?name=small'), undefined);
+  assert.equal(fullSizeImageUrl(undefined), undefined);
+});
+
+test('several images from one post go out as a single Telegram album with the caption on the first', async () => {
+  const captured: Array<{ url: string; body: string }> = [];
+  const transport: Transport = {
+    async request(url: string, options?: HttpOptions): Promise<HttpResponse> {
+      // sendMediaGroup uses multipart; capture enough to assert the media[] JSON shape.
+      const body = options?.body instanceof Uint8Array ? new TextDecoder().decode(options.body) : String(options?.body ?? '');
+      captured.push({ url, body });
+      const result = [{ message_id: 41 }, { message_id: 42 }, { message_id: 43 }];
+      return { status: 200, headers: {}, body: new TextEncoder().encode(JSON.stringify({ ok: true, result })) };
+    },
+    async json<T>() { throw new Error('unused') as T; },
+  };
+  const client = new TelegramClient(
+    { enabled: true, token: '123:abc', ownerId: '1', privateChatId: '1', opsChatId: '', publicChatId: '555', pollCommands: false },
+    transport,
+  );
+  const image = (n: number): PreparedImage => ({ bytes: new Uint8Array([n]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: String(n) });
+  const ref = await client.publish(
+    { key: 'k:0', sourcePostId: '9', text: '我的內文', images: [image(1), image(2), image(3)], sourceUrl: 'https://fixupx.com/owner/status/9' },
+    { audience: 'public', idempotencyKey: 'k:0' },
+  );
+  assert.equal(captured.length, 1, 'three images are one album call, not three messages');
+  assert.match(captured[0]!.url, /sendMediaGroup$/);
+  assert.match(captured[0]!.body, /我的內文/, 'the tweet text is not lost');
+  assert.match(captured[0]!.body, /原文連結/, 'the source link rides on the album caption');
+  assert.match(captured[0]!.body, /attach:\/\/photo0/);
+  assert.match(captured[0]!.body, /attach:\/\/photo2/);
+  assert.deepEqual(ref.messageIds, [41, 42, 43], 'every album message id is recorded for threading');
 });
 
 test('link cleaning rewrites X URLs but preserves other links and punctuation', () => {
