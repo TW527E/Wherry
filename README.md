@@ -202,7 +202,14 @@ SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取�
 
 ## 部署（Oracle ARM64 / Debian）
 
-兩種常駐方式：Docker，或 Linux systemd system service。systemd 的完整安裝、更新、session 匯入與故障排除見 [`deploy/README.md`](deploy/README.md)，unit 檔在 [`deploy/crosspost-bridge.service`](deploy/crosspost-bridge.service)。收到 SIGTERM 後程式會停止新輪詢、等現有工作與瀏覽器收尾、釋放資料目錄鎖再退出。
+兩種常駐方式：Docker，或 Linux systemd system service。systemd 有一支部署腳本 `deploy/install.sh`（`install`／`update`／`status`／`uninstall`，支援 `--dry-run` 先看再做），會建立服務帳號與目錄、安裝並建置程式、產生 unit、啟用啟動，更新前先備份資料目錄；完整說明見 [`deploy/README.md`](deploy/README.md)，unit 檔在 [`deploy/crosspost-bridge.service`](deploy/crosspost-bridge.service)。
+
+```bash
+sudo bash deploy/install.sh install --dry-run   # 先看它會做什麼
+sudo bash deploy/install.sh install
+```
+
+收到 SIGTERM 後程式會停止新輪詢、等現有工作與瀏覽器收尾、釋放資料目錄鎖再退出。
 
 Docker：
 

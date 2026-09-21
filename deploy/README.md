@@ -1,6 +1,32 @@
 # Linux systemd 部署
 
-這個目錄提供 **system service**（不是 `systemd --user`）的 unit。它不會在 macOS 或目前工作站自動安裝、建立帳號、啟動服務，也不會覆寫既有 `.env`、SQLite、X profile 或 session。以下命令請在你的 Debian/Ubuntu/Oracle Linux 主機上，由你確認路徑與秘密後手動執行。
+這個目錄提供 **system service**（不是 `systemd --user`）的 unit 與一支自動化部署腳本。它們不會在 macOS 或目前工作站自動安裝、建立帳號、啟動服務，也不會覆寫既有 `.env`、SQLite、X profile 或 session。以下命令請在你的 Debian/Ubuntu/Oracle Linux 主機上，由你確認路徑與秘密後執行。
+
+## 快速路徑：`install.sh`
+
+`deploy/install.sh` 把下面「首次安裝／更新／移除」的步驟自動化，而且可以先用 `--dry-run` 檢視它打算做什麼：
+
+```bash
+sudo bash deploy/install.sh install --dry-run   # 只印出計畫，不改動系統
+sudo bash deploy/install.sh install             # 建立帳號、目錄、unit，建置並啟動
+sudo bash deploy/install.sh update              # 先備份資料目錄，再更新並重啟
+sudo bash deploy/install.sh status              # 狀態與日誌（唯讀，不需要 root）
+sudo bash deploy/install.sh uninstall --purge-data --yes
+```
+
+它的安全設計：
+
+- **`--dry-run` 先看再做**：任何命令都先印出即將執行的動作，不觸碰系統。
+- **絕不覆蓋既有環境檔**：只有在 `/etc/crosspost-bridge/crosspost-bridge.env` 不存在時才從 `.env.example` 建立，並把 `DATA_DIR` 改寫成絕對路徑（範本裡的 `DATA_DIR=./data` 是相對路徑，在 `ProtectSystem=strict` 之下服務寫不進 SQLite）。既有檔案只會被檢查權限，內容不會被讀出或顯示。
+- **秘密不外洩**：腳本只讀 `DATA_DIR` 這類非秘密鍵做一致性檢查，token／session 一律不印。
+- **預設不刪資料**：`uninstall` 預設保留環境檔與資料目錄；要刪除必須明示 `--purge-config`／`--purge-data`，且需要互動確認或 `--yes`。
+- **更新前先備份**：`update` 先停止服務，把整個資料目錄（含 SQLite 的 `-wal`／`-shm`）tar 到 `/var/backups/crosspost-bridge/`，再同步程式碼與重建。
+- **避開以 root 跑 npm**：預設會警告 `npm ci` 會以 root 執行套件安裝腳本；可加 `--build-user <非root帳號>` 改用該帳號建置，完成後安裝目錄會鎖成 `root:root` 並移除群組寫入權。`--prune-dev` 可進一步移除 devDependencies。
+- **路徑先驗證**：拒絕相對路徑、含空白或換行的路徑，以及位於家目錄底下的資料目錄（unit 有 `ProtectHome=true`，會寫不進去）。
+
+常用選項：`--prefix`、`--data-dir`、`--env-file`、`--service`、`--user`、`--group`、`--build-user`、`--prune-dev`、`--no-start`、`--no-build`。完整清單：`bash deploy/install.sh --help`。
+
+腳本只負責程式與服務的部署；**匯入 X 登入仍是手動步驟**（見下方「X session 安裝」），`install` 結束時會把接下來該做什麼印在最後。以下各節是同樣步驟的手動版本，也是腳本實際執行的內容。
 
 ## 目錄與權限
 
