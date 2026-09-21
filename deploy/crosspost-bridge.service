@@ -1,0 +1,38 @@
+[Unit]
+Description=Crosspost Bridge scheduler and worker
+Documentation=https://github.com/TW527E/Twitter-Sharkey-Bluesky
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=crosspost
+Group=crosspost
+WorkingDirectory=/opt/Twitter-Sharkey-Bluesky
+Environment=NODE_BIN=/usr/bin/node
+EnvironmentFile=/etc/crosspost-bridge/crosspost-bridge.env
+ExecStart=${NODE_BIN} /opt/Twitter-Sharkey-Bluesky/dist/cli.js serve
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+UMask=0077
+
+# Outbound HTTPS is required for the configured APIs, media, Telegram and X's
+# read-only browser. Do not add PrivateNetwork=true here.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/crosspost-bridge
+
+[Install]
+WantedBy=multi-user.target

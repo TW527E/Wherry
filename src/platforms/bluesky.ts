@@ -411,6 +411,7 @@ export class BlueskyClient implements Publisher, Collector {
   }
 
   async collect(since?: string): Promise<SourceSnapshot> {
+    const fetchedAt = this.now().toISOString();
     const warnings: string[] = [];
     let complete = true;
     let accountId = this.session?.did ?? this.config.identifier;
@@ -435,8 +436,11 @@ export class BlueskyClient implements Publisher, Collector {
           // A post we cannot fully parse is not a reason to reject the whole window: the engine
           // holds any post with metadataComplete:false downstream. Record it and move on.
           if (!parsed.valid) warnings.push('a Bluesky post had incomplete metadata (held individually)');
+          if (!parsed.post) complete = false;
           if (parsed.post) {
-            if (parsed.post.createdAt && (!oldest || parsed.post.createdAt < oldest)) oldest = parsed.post.createdAt;
+            const reason = object(object(entry)?.reason);
+            const orderedAt = reason?.$type === 'app.bsky.feed.defs#reasonRepost' && typeof reason.indexedAt === 'string' ? reason.indexedAt : parsed.post.createdAt;
+            if (reason?.$type !== 'app.bsky.feed.defs#reasonPin' && (!oldest || orderedAt < oldest)) oldest = orderedAt;
             const previous = seen.get(parsed.post.id);
             if (!previous || (previous.repost && !parsed.post.repost)) seen.set(parsed.post.id, parsed.post);
           }
@@ -453,7 +457,7 @@ export class BlueskyClient implements Publisher, Collector {
     // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
     if (complete && !reachedWatermark) { complete = false; warnings.push('Bluesky backlog since the last scan exceeds the page budget; scan more often'); }
     if (!complete && !warnings.length) warnings.push('Some Bluesky posts have incomplete relation, media or moderation metadata');
-    return { platform: this.platform, accountId, posts: [...seen.values()], fetchedAt: this.now().toISOString(), complete, warnings };
+    return { platform: this.platform, accountId, posts: [...seen.values()], fetchedAt, complete, warnings };
   }
 
   async close(): Promise<void> { this.session = undefined; this.identity = undefined; }

@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Batch, Classification, Destination, EventRecord, Job, JobState, RemoteRef, SourcePlatform, SourcePost, StoredPost } from './types.js';
+import type { Batch, Classification, Destination, EventRecord, Job, JobState, Reminder, ReminderState, RemoteRef, SourcePlatform, SourcePost, StoredPost } from './types.js';
 
 type Row = Record<string, unknown>;
 const decode = <T>(value: unknown): T => JSON.parse(String(value)) as T;
@@ -16,10 +16,10 @@ const schema = [
   'CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, aggregate_id TEXT NOT NULL, destination TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, due_at TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, UNIQUE(kind,aggregate_id,destination))',
   'CREATE TABLE IF NOT EXISTS steps (job_id TEXT NOT NULL REFERENCES jobs(id), step_key TEXT NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL, result TEXT, started_at TEXT NOT NULL, PRIMARY KEY(job_id,step_key))',
   'CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, entity_id TEXT)',
+  'CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS command_receipts (update_id INTEGER PRIMARY KEY, at TEXT NOT NULL)',
-  // One row per interactive "post this to X" reminder message the bot sent. Keyed by the Telegram
-  // message_id so a later button tap or link reply can find the batch/mirror it belongs to.
-  "CREATE TABLE IF NOT EXISTS reminders (message_id INTEGER PRIMARY KEY, chat_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, mirror_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', x_url TEXT, at TEXT NOT NULL)",
+  'CREATE TABLE IF NOT EXISTS manual_x_links (mirror_id TEXT NOT NULL REFERENCES mirrors(id), x_id TEXT NOT NULL, PRIMARY KEY(mirror_id,x_id))',
+  "CREATE TABLE IF NOT EXISTS reminders (message_id INTEGER NOT NULL, chat_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, mirror_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', x_url TEXT, at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, synced_revision INTEGER NOT NULL DEFAULT 0, edit_after TEXT, PRIMARY KEY(chat_id,message_id))",
 ] as const;
 
 export class Store {
@@ -28,7 +28,33 @@ export class Store {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     for (const statement of schema) this.db.prepare(statement).run();
+    if (!this.db.prepare('PRAGMA table_info(mirrors)').all().some(row => row.name === 'matched_x_id')) {
+      this.db.prepare('ALTER TABLE mirrors ADD COLUMN matched_x_id TEXT').run();
+    }
+    if (!this.db.prepare('PRAGMA table_info(reminders)').all().some(row => row.name === 'revision')) {
+      this.transaction(() => {
+        this.db.prepare('ALTER TABLE reminders RENAME TO reminders_legacy').run();
+        this.db.prepare("CREATE TABLE reminders (message_id INTEGER NOT NULL, chat_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, mirror_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', x_url TEXT, at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, synced_revision INTEGER NOT NULL DEFAULT 0, edit_after TEXT, PRIMARY KEY(chat_id,message_id))").run();
+        this.db.prepare("INSERT INTO reminders(message_id,chat_id,aggregate_id,mirror_id,state,x_url,at,revision) SELECT message_id,chat_id,aggregate_id,mirror_id,state,x_url,at,CASE WHEN state='offered' THEN 0 ELSE 1 END FROM reminders_legacy").run();
+        this.db.prepare('DROP TABLE reminders_legacy').run();
+      });
+    }
+    this.db.prepare('INSERT OR IGNORE INTO manual_x_links SELECT id,matched_x_id FROM mirrors WHERE matched_x_id IS NOT NULL').run();
     if (path !== ':memory:') chmodSync(path, 0o600);
+  }
+  acquireRuntimeLock(): () => void {
+    const token = randomUUID();
+    this.transaction(() => {
+      const previous = this.db.prepare('SELECT pid FROM runtime_lock WHERE id=1').get();
+      if (previous) {
+        let alive = true;
+        try { process.kill(Number(previous.pid), 0); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') alive = false; }
+        if (alive) throw new Error('DATA_DIR is already in use; stop the service before running another CLI command');
+      }
+      this.db.prepare('INSERT INTO runtime_lock VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid,token=excluded.token').run(process.pid, token);
+    });
+    return () => { this.db.prepare('DELETE FROM runtime_lock WHERE id=1 AND token=?').run(token); };
   }
   close(): void { this.db.close(); }
   transaction<T>(fn: () => T): T {
@@ -99,19 +125,37 @@ export class Store {
     const threshold = new Date(Date.parse(now) - 7 * 86400_000).toISOString();
     return this.db.prepare('SELECT * FROM mirrors WHERE expires_at >= ?').all(threshold).map(r => ({ id: String(r.id), post: decode<SourcePost>(r.payload), expired: String(r.expires_at) < now, state: String(r.state) }));
   }
-  matchMirror(id: string, xId: string): void { this.db.prepare("UPDATE mirrors SET state='matched',matched_x_id=? WHERE id=?").run(xId, id); }
-  /** True when some mirror was manually registered to this X post id — a deterministic anti-echo hit. */
-  mirrorMatchesXId(xId: string): boolean { return Boolean(this.db.prepare('SELECT 1 FROM mirrors WHERE matched_x_id=? LIMIT 1').get(xId)); }
-  /** Record the interactive reminder message so a later button tap / link reply can be resolved. */
+  matchMirror(id: string, xId: string): void {
+    if (!this.db.prepare('SELECT 1 FROM mirrors WHERE id=?').get(id)) throw new Error('Mirror not found');
+    this.db.prepare('INSERT OR IGNORE INTO manual_x_links(mirror_id,x_id) VALUES(?,?)').run(id, xId);
+    this.db.prepare("UPDATE mirrors SET state='matched',matched_x_id=? WHERE id=?").run(xId, id);
+  }
+  mirrorMatchesXId(xId: string): boolean { return Boolean(this.db.prepare('SELECT 1 FROM manual_x_links WHERE x_id=? LIMIT 1').get(xId)); }
   armReminder(messageId: number, chatId: string, aggregateId: string, mirrorId: string, now: string): void {
-    this.db.prepare("INSERT INTO reminders(message_id,chat_id,aggregate_id,mirror_id,state,at) VALUES(?,?,?,?,'offered',?) ON CONFLICT(message_id) DO NOTHING").run(messageId, chatId, aggregateId, mirrorId, now);
+    this.db.prepare("INSERT OR IGNORE INTO reminders(message_id,chat_id,aggregate_id,mirror_id,state,at) VALUES(?,?,?,?,'offered',?)").run(messageId, chatId, aggregateId, mirrorId, now);
   }
-  getReminder(messageId: number): { messageId: number; chatId: string; aggregateId: string; mirrorId: string; state: string; xUrl?: string } | undefined {
-    const row = this.db.prepare('SELECT * FROM reminders WHERE message_id=?').get(messageId);
-    return row ? { messageId: Number(row.message_id), chatId: String(row.chat_id), aggregateId: String(row.aggregate_id), mirrorId: String(row.mirror_id), state: String(row.state), xUrl: row.x_url ? String(row.x_url) : undefined } : undefined;
+  private reminderRow(row: Row): Reminder {
+    return { messageId: Number(row.message_id), chatId: String(row.chat_id), aggregateId: String(row.aggregate_id), mirrorId: String(row.mirror_id), state: row.state as ReminderState,
+      xUrl: row.x_url ? String(row.x_url) : undefined, revision: Number(row.revision), syncedRevision: Number(row.synced_revision), editAfter: row.edit_after ? String(row.edit_after) : undefined };
   }
-  setReminderState(messageId: number, state: string, xUrl?: string): void {
-    this.db.prepare('UPDATE reminders SET state=?,x_url=COALESCE(?,x_url) WHERE message_id=?').run(state, xUrl || null, messageId);
+  getReminder(messageId: number, chatId: string): Reminder | undefined {
+    const row = this.db.prepare('SELECT * FROM reminders WHERE message_id=? AND chat_id=?').get(messageId, chatId);
+    return row ? this.reminderRow(row) : undefined;
+  }
+  remindersNeedingEdit(now: string): Reminder[] {
+    return this.db.prepare('SELECT * FROM reminders WHERE revision>synced_revision AND (edit_after IS NULL OR edit_after<=?) ORDER BY at LIMIT 20').all(now).map(row => this.reminderRow(row));
+  }
+  pendingReminders(chatId: string): Reminder[] {
+    return this.db.prepare("SELECT * FROM reminders WHERE chat_id=? AND state IN ('offered','awaiting_link') ORDER BY at LIMIT 20").all(chatId).map(row => this.reminderRow(row));
+  }
+  setReminderState(messageId: number, chatId: string, state: ReminderState, xUrl?: string): void {
+    this.db.prepare('UPDATE reminders SET state=?,x_url=COALESCE(?,x_url),revision=revision+1,edit_after=NULL WHERE message_id=? AND chat_id=?').run(state, xUrl || null, messageId, chatId);
+  }
+  reminderEdited(reminder: Reminder): void {
+    this.db.prepare('UPDATE reminders SET synced_revision=MAX(synced_revision,?),edit_after=NULL WHERE message_id=? AND chat_id=?').run(reminder.revision, reminder.messageId, reminder.chatId);
+  }
+  deferReminderEdit(reminder: Reminder, after: string): void {
+    this.db.prepare('UPDATE reminders SET edit_after=? WHERE message_id=? AND chat_id=? AND revision=?').run(after, reminder.messageId, reminder.chatId, reminder.revision);
   }
   enqueue(kind: Job['kind'], aggregateId: string, destination: Destination, now: string, dueAt = now): string {
     const existing = this.db.prepare('SELECT id FROM jobs WHERE kind=? AND aggregate_id=? AND destination=?').get(kind, aggregateId, destination);
@@ -125,6 +169,8 @@ export class Store {
       state: row.state as JobState, attempts: Number(row.attempts), dueAt: String(row.due_at), error: row.error ? String(row.error) : undefined };
   }
   getJob(id: string): Job | undefined { const row = this.db.prepare('SELECT * FROM jobs WHERE id=?').get(id); return row ? this.jobRow(row) : undefined; }
+  jobsForAggregate(id: string): Job[] { return this.db.prepare('SELECT * FROM jobs WHERE aggregate_id=?').all(id).map(r => this.jobRow(r)); }
+  hasDeliveryEvidence(jobId: string): boolean { return Boolean(this.db.prepare("SELECT 1 FROM steps WHERE job_id=? AND state IN ('started','succeeded') LIMIT 1").get(jobId)); }
   jobs(limit = 100): Job[] { return this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit).map(r => this.jobRow(r)); }
   dueJobs(now: string): Job[] { return this.db.prepare("SELECT * FROM jobs WHERE state='pending' AND due_at<=? ORDER BY due_at,created_at LIMIT 20").all(now).map(r => this.jobRow(r)); }
   claimJob(id: string): boolean { return Number(this.db.prepare("UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=? AND state='pending'").run(id).changes) === 1; }

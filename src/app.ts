@@ -6,7 +6,9 @@ import { Store } from './store.js';
 import { Engine, Worker, collectCycle, safeError } from './engine.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
-import { TelegramClient, type TelegramAudience, type TelegramCallbackQuery, type TelegramUpdateMessage } from './platforms/telegram.js';
+import { TelegramClient, type TelegramUpdateMessage } from './platforms/telegram.js';
+import { extractXStatus, handleCallback, handleReminderReply, TelegramNotifications } from './telegram-notifications.js';
+import { SerialWork } from './lifecycle.js';
 import { XCollector, installSession } from './platforms/x.js';
 import { parseSessionFile, MAX_SESSION_BYTES } from './platforms/session.js';
 import type { Collector, Destination, Publisher, RemoteRef } from './types.js';
@@ -28,13 +30,14 @@ export interface Runtime {
   collectors: Collector[];
   publishers: Map<Destination, Publisher>;
   telegram?: TelegramClient;
+  start(): void;
   stop(): Promise<void>;
   once(): Promise<void>;
+  scan(): Promise<void>;
 }
 
 export function createRuntime(config = loadConfig()): Runtime {
   const store = new Store(config.databasePath);
-  store.recoverInterrupted();
   const transport = new SafeHttp();
   const collectors: Collector[] = [];
   const publishers = new Map<Destination, Publisher>();
@@ -63,92 +66,119 @@ export function createRuntime(config = loadConfig()): Runtime {
   }
   const engine = new Engine(store, config, transport);
   const worker = new Worker(engine, publishers);
-  let timer: NodeJS.Timeout | undefined;
-  let commandTimer: NodeJS.Timeout | undefined;
+  let releaseLock: () => void;
+  try { releaseLock = store.acquireRuntimeLock(); } catch (error) { store.close(); throw error; }
+  store.recoverInterrupted();
+  const serial = new SerialWork();
+  const notifications = telegram ? new TelegramNotifications({ config, engine, telegram, store }) : undefined;
+  const timers: NodeJS.Timeout[] = [];
   let stopped = false;
-  let running = false;
-  let updateOffset = store.setting<number>('telegram:update_offset', 0);
-  // On first run, start the error forwarder at the current tail so a fresh deploy does not replay
-  // the whole error history into the chat; only errors from here on are forwarded.
-  if (store.setting<number>('telegram:error_offset', -1) < 0) store.setSetting('telegram:error_offset', store.maxEventId());
+  let started = false;
+  let cycle: Promise<void> | undefined;
+  let commands: Promise<void> | undefined;
+  let stopping: Promise<void> | undefined;
+  let menu: Promise<void> | undefined;
 
-  /**
-   * Forward newly recorded error events to Telegram (ops channel, falling back to private) so a
-   * failure is visible without opening the web UI. Best-effort and idempotent: the offset only
-   * advances past an event once it is sent, and send failures are swallowed so we never log an
-   * error about failing to send an error (which would loop forever).
-   */
-  const notifyCycle = async (): Promise<void> => {
-    if (!telegram || stopped) return;
-    const audience: TelegramAudience = config.telegram.opsChatId ? 'ops' : 'private';
-    if (audience === 'private' && !config.telegram.privateChatId) return;
-    let offset = store.setting<number>('telegram:error_offset', 0);
-    for (const event of store.errorEventsAfter(offset)) {
-      try { await telegram.sendPlain(`⚠️ 錯誤\n${event.at}\n${event.message}${event.entityId ? `\n（${event.entityId}）` : ''}`, audience); }
-      catch { break; }
-      offset = event.id; store.setSetting('telegram:error_offset', offset);
+  const runCycle = (publish: boolean): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    if (cycle) return cycle;
+    cycle = serial.run(async () => {
+      if (stopped) return;
+      await collectCycle(engine, collectors);
+      if (publish) { engine.sealReady(); await worker.run(); }
+    }).catch(error => { store.event('error', `Service cycle failed: ${safeError(error)}`); })
+      .finally(async () => { try { await notifications?.flush(); } finally { cycle = undefined; } });
+    return cycle;
+  };
+  const once = (): Promise<void> => runCycle(true);
+  const commandCycle = (): Promise<void> => {
+    if (!live || !telegram || !config.telegram.pollCommands || stopped) return Promise.resolve();
+    if (commands) return commands;
+    commands = (async () => {
+      const updates = await telegram.getUpdates(store.setting<number>('telegram:update_offset', 0) || undefined);
+      for (const update of updates) {
+        if (stopped) break;
+        try {
+          if (update.callback_query) {
+            await serial.run(() => handleCallback(update.callback_query!, { config, engine, telegram, store }));
+          } else {
+            const message = update.message;
+            if (!message || message.chat.type !== 'private' || String(message.chat.id) !== config.telegram.privateChatId || String(message.from?.id ?? '') !== config.telegram.ownerId) continue;
+            const text = (message.text || '').trim();
+            const caption = (message.caption || '').trim();
+            const command = text.split(/\s+/u)[0]?.split('@')[0]?.toLowerCase();
+            const sessionCaption = caption.split(/\s+/u)[0]?.split('@')[0]?.toLowerCase() === '/session';
+            if (message.document) {
+              const armed = store.setting<number>('telegram:session_until', 0) > Date.now();
+              store.setSetting('telegram:session_until', 0);
+              if (sessionCaption || armed) {
+                await serial.run(async () => {
+                  for (const collector of collectors) if (collector.platform === 'x') await collector.close?.();
+                  await handleSessionUpload(message, { config, telegram, store });
+                });
+              } else await telegram.sendPlain('檔案未安裝。請先 /session 或在檔案說明填 /session；若是登入憑證，請自行刪除未處理的檔案訊息。', 'private');
+              continue;
+            }
+            store.setSetting('telegram:session_until', 0);
+            if (command === '/session') {
+              store.setSetting('telegram:session_until', Date.now() + 5 * 60_000);
+              await telegram.sendPlain('請於五分鐘內在下一則訊息上傳 x-session.json。安裝後會嘗試刪除檔案訊息；傳送 /help 可取消。', 'private');
+              continue;
+            }
+            if (command === '/sync') {
+              await once();
+              await telegram.sendPlain('已完成一次收集與佇列檢查；結果請看 /status。X 發文仍需手動。', 'private');
+              continue;
+            }
+            await serial.run(async () => {
+              if (await handleReminderReply(message, { config, engine, telegram, store })) return;
+              await handleCommand(text, { engine, telegram, store });
+            });
+          }
+        } catch (error) {
+          store.event('error', `Telegram update handling failed: ${safeError(error)}`);
+          await telegram.sendPlain(`操作未完成：${safeError(error)}。請重試指令或查看 /status。`, 'private').catch(() => undefined);
+        } finally {
+          store.setSetting('telegram:update_offset', update.update_id + 1);
+        }
+        await notifications?.flush();
+      }
+    })().catch(error => { store.event('error', `Telegram command polling failed: ${safeError(error)}`); })
+      .finally(async () => { try { await notifications?.flush(); } finally { commands = undefined; } });
+    return commands;
+  };
+  const start = (): void => {
+    if (started || stopped) return;
+    started = true;
+    const every = (ms: number, task: () => Promise<void>): void => {
+      const timer = setInterval(() => { void task().catch(error => { store.event('error', `Background task failed: ${safeError(error)}`); }); }, ms);
+      timer.unref(); timers.push(timer);
+    };
+    every(config.pollSeconds * 1000, once);
+    if (live && telegram) every(15_000, () => notifications!.flush());
+    if (live && telegram && config.telegram.pollCommands) {
+      menu = telegram.setMyCommands(TELEGRAM_COMMANDS.map(c => ({ command: c.command, description: c.description })))
+        .catch(error => { store.event('error', `Telegram setMyCommands failed: ${safeError(error)}`); });
+      every(5000, commandCycle);
     }
   };
-
-  const once = async (): Promise<void> => {
-    if (running || stopped) return;
-    running = true;
-    try {
-      await collectCycle(engine, collectors);
-      engine.sealReady();
-      await worker.run();
-    } finally { running = false; }
-    await notifyCycle();
-  };
-  const commandCycle = async (): Promise<void> => {
-    if (!telegram || !config.telegram.pollCommands || stopped) return;
-    try {
-      const updates = await telegram.getUpdates(updateOffset || undefined);
-      for (const update of updates) {
-        updateOffset = Math.max(updateOffset, update.update_id + 1); store.setSetting('telegram:update_offset', updateOffset);
-        if (!store.commandOnce(update.update_id, new Date().toISOString())) continue;
-        if (update.callback_query) { await handleCallback(update.callback_query, { config, telegram, store }); continue; }
-        const message = update.message; if (!message || String(message.chat.id) !== config.telegram.privateChatId || String(message.from?.id || '') !== config.telegram.ownerId) continue;
-        const text = (message.text || '').trim();
-        const caption = (message.caption || '').trim();
-        const isSessionCmd = (s: string): boolean => s.split(/\s+/u)[0]?.split('@')[0]?.toLowerCase() === '/session';
-        // A reply to a reminder that is waiting for the X link registers that link for anti-echo.
-        if (message.reply_to_message && await handleReminderReply(message, { config, engine, telegram, store })) continue;
-        if (message.document) {
-          // Never auto-install an uploaded file. Only process it when explicitly gated by /session:
-          // the file's caption is /session, or /session was armed by a prior message.
-          const armed = store.setting<boolean>('telegram:session_armed', false);
-          if (isSessionCmd(caption) || armed) { store.setSetting('telegram:session_armed', false); await handleSessionUpload(message, { config, telegram, store }); }
-          else await telegram.sendPlain('收到檔案，但基於安全我不會自動安裝。請改用 /session：可直接在檔案說明（caption）打 /session，或先傳 /session 再上傳。', 'private').catch(() => undefined);
-          continue;
-        }
-        if (isSessionCmd(text)) {
-          store.setSetting('telegram:session_armed', true);
-          await telegram.sendPlain('好的，請把 x-session.json 檔案傳過來（下一則訊息）。安裝成功後我會刪除該檔案訊息並回報結果。取消請打 /help。', 'private').catch(() => undefined);
-          continue;
-        }
-        await handleCommand(text, { engine, telegram, store });
-      }
-    } catch (error) { store.event('error', `Telegram command polling failed: ${safeError(error)}`); }
-  };
-  timer = setInterval(() => void once(), config.pollSeconds * 1000); timer.unref();
-  let notifyTimer: NodeJS.Timeout | undefined;
-  if (telegram) {
-    // Forward errors to chat as a safety net on its own cadence, even between full poll cycles and
-    // even when command polling is off.
-    notifyTimer = setInterval(() => void notifyCycle(), 15000); notifyTimer.unref();
-  }
-  if (live && telegram && config.telegram.pollCommands) {
-    // Register the "/" menu so Telegram shows command autocomplete. Best-effort: a failure here
-    // must not stop command polling from starting.
-    void telegram.setMyCommands(TELEGRAM_COMMANDS.map(c => ({ command: c.command, description: c.description })))
-      .catch(error => store.event('error', `Telegram setMyCommands failed: ${safeError(error)}`));
-    commandTimer = setInterval(() => void commandCycle(), 5000); commandTimer.unref();
-  }
   return {
-    config, store, engine, worker, collectors, publishers, telegram,
-    stop: async () => { stopped = true; if (timer) clearInterval(timer); if (commandTimer) clearInterval(commandTimer); if (notifyTimer) clearInterval(notifyTimer); for (const collector of collectors) await collector.close?.(); store.close(); },
-    once,
+    config, store, engine, worker, collectors, publishers, telegram, start, once,
+    scan: () => runCycle(false),
+    stop: () => {
+      if (stopping) return stopping;
+      stopped = true;
+      for (const timer of timers) clearInterval(timer);
+      worker.stop();
+      stopping = (async () => {
+        await Promise.allSettled([cycle, commands, menu]);
+        await serial.drain();
+        await notifications?.flush();
+        try { for (const collector of collectors) await collector.close?.(); }
+        finally { releaseLock(); store.close(); }
+      })();
+      return stopping;
+    },
   };
 }
 
@@ -162,8 +192,9 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
   { command: 'pending', description: '列出等待你處理的批次與其 ID' },
   { command: 'approve', args: '<batchId>', description: '批准一個被保留的批次，發布到下游' },
   { command: 'skip', args: '<batchId>', description: '略過（不同步）某個批次' },
-  { command: 'mirror', args: '<batchId>', description: '標記為你手動鏡像，之後不再同步' },
+  { command: 'mirror', args: '<id> [X_URL]', description: '標記為你手動鏡像，之後不再同步' },
   { command: 'retry', args: '<jobId>', description: '重試一個明確失敗的工作' },
+  { command: 'resync', args: '<jobId>', description: 'retry 別名：重試明確失敗的工作' },
   { command: 'session', description: '更新 X 登入：接著上傳 x-session.json（或在檔案說明打 /session）' },
 ];
 
@@ -180,90 +211,30 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
   if (!command.startsWith('/')) return;
   try {
     if (command === '/help' || command === '/start') await context.telegram.sendPlain(helpText(), 'private');
-    else if (command === '/status') await context.telegram.sendPlain(JSON.stringify({ jobs: context.store.jobs(20), events: context.store.events(10) }, null, 2).slice(0, 3900), 'private');
-    else if (command === '/sync') { await context.engine.sealReady(); await context.telegram.sendPlain('已要求立即檢查；X 發文仍需手動。', 'private'); }
+    else if (command === '/status') await context.telegram.sendPlain(JSON.stringify({ mode: context.engine.config.mode, xSession: context.store.setting('x:session_state', context.engine.config.x.enabled ? 'unknown' : 'disabled'), jobs: context.store.jobs(20), events: context.store.events(10) }, null, 2).slice(0, 3900), 'private');
     else if (command === '/pending') {
       const held = context.store.batches(50).filter(b => ['review', 'open'].includes(b.state));
-      const body = held.length ? held.map(b => `• ${b.id}\n  狀態：${b.state}（${b.reason}）`).join('\n') : '目前沒有等待處理的批次。';
+      const reminders = context.store.pendingReminders(context.engine.config.telegram.privateChatId);
+      const body = [...held.map(b => `• ${b.id}\n  狀態：${b.state}（${b.reason}）`), ...reminders.map(r => `• ${r.aggregateId}\n  X 提醒：${r.state}（請操作原提醒或 /mirror <id> <X_URL>）`)].join('\n') || '目前沒有等待處理的批次或提醒。';
       await context.telegram.sendPlain(`待處理批次（${held.length}）\n${body}`, 'private');
     }
     else if (command === '/skip' && id) { context.engine.action('skip', id); await context.telegram.sendPlain(`已跳過 ${id}`, 'private'); }
-    else if (command === '/mirror' && id) { context.engine.action('mirror', id); await context.telegram.sendPlain(`已標記鏡像 ${id}，不會同步。${extra || ''}`, 'private'); }
-    else if (command === '/approve' && id) { context.engine.action('approve', id); await context.telegram.sendPlain(`已批准 ${id} 發布到下游。`, 'private'); }
-    else if (command === '/retry' && id) { context.engine.action('retry', id); await context.telegram.sendPlain(`已排入重試 ${id}`, 'private'); }
-    else if (['/skip', '/mirror', '/approve', '/retry'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
-    else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
-  } catch (error) { await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
-}
-
-interface ReminderContext { config: AppConfig; telegram: TelegramClient; store: Store }
-
-/** Extract an X/Twitter status URL and its numeric post id from free text (a reply message). */
-function extractXStatus(text: string): { url: string; id: string } | undefined {
-  const match = text.match(/https?:\/\/(?:www\.)?(?:x|twitter)\.com\/[A-Za-z0-9_]+\/status\/(\d+)/i);
-  return match ? { url: match[0], id: match[1]! } : undefined;
-}
-
-/**
- * A button on the interactive "post to X" reminder was tapped. Only the owner's private chat is
- * honoured. "要發" arms the message to wait for the X link; "不發" closes it. Either way the message
- * is edited in place so the buttons disappear and the choice is reflected.
- */
-async function handleCallback(query: TelegramCallbackQuery, context: ReminderContext): Promise<void> {
-  const { config, telegram, store } = context;
-  const chatId = query.message?.chat.id;
-  if (String(query.from.id) !== config.telegram.ownerId || String(chatId ?? '') !== config.telegram.privateChatId || !query.message) {
-    await telegram.answerCallbackQuery(query.id); return;
-  }
-  const messageId = query.message.message_id;
-  const reminder = store.getReminder(messageId);
-  try {
-    if (!reminder) { await telegram.answerCallbackQuery(query.id, '這則提醒已失效'); return; }
-    if (reminder.state !== 'offered') { await telegram.answerCallbackQuery(query.id, '這則提醒已處理過了'); return; }
-    if (query.data === 'rem:y') {
-      store.setReminderState(messageId, 'awaiting_link');
-      await telegram.answerCallbackQuery(query.id, '好的，請回覆 X 連結');
-      await telegram.editMessageText(config.telegram.privateChatId, messageId, '✅ 你選擇了「要發」。\n發到 X 後，請「回覆這則訊息」並貼上該推文網址，我就會登記，之後不會再把它同步回來。');
-    } else if (query.data === 'rem:n') {
-      store.setReminderState(messageId, 'declined');
-      await telegram.answerCallbackQuery(query.id, '好的，不發');
-      await telegram.editMessageText(config.telegram.privateChatId, messageId, '🚫 你選擇了「不發」。這則內容不會發到 X，我也不會再提醒。');
-    } else {
-      await telegram.answerCallbackQuery(query.id);
+    else if (command === '/mirror' && id) {
+      if (extra) {
+        const link = extractXStatus(extra, context.engine.config.x.handle);
+        if (!link) throw new Error('請提供一個完整、屬於自己的 X 推文網址');
+        const result = context.engine.registerManualMirror(id, link.id);
+        for (const reminder of context.store.pendingReminders(context.engine.config.telegram.privateChatId)) {
+          if (reminder.aggregateId === id) context.store.setReminderState(reminder.messageId, reminder.chatId, 'linked', link.url);
+        }
+        await context.telegram.sendPlain(`已登記 ${link.url}。${result.alreadyDelivered ? '⚠️ 已有發布紀錄，請檢查遠端貼文。' : '已阻止後續反向同步。'}`, 'private');
+      } else { context.engine.action('mirror', id); await context.telegram.sendPlain(`已標記鏡像 ${id}，不會同步。`, 'private'); }
     }
-  } catch (error) {
-    store.event('error', `Telegram reminder callback failed: ${safeError(error)}`, reminder?.aggregateId);
-    await telegram.answerCallbackQuery(query.id).catch(() => undefined);
-  }
-}
-
-/**
- * The owner replied to a reminder message. If that reminder is waiting for the X link, parse the
- * link, register it against the anti-echo mirror, and close the reminder. Returns true when the
- * reply was consumed as a link registration (so the caller skips normal command handling).
- */
-async function handleReminderReply(message: TelegramUpdateMessage, context: ReminderContext & { engine: Engine }): Promise<boolean> {
-  const { config, telegram, store } = context;
-  const target = message.reply_to_message?.message_id;
-  if (target === undefined) return false;
-  const reminder = store.getReminder(target);
-  if (!reminder || reminder.state !== 'awaiting_link') return false;
-  const found = extractXStatus(message.text || '');
-  if (!found) {
-    await telegram.sendPlain('沒看到有效的 X 推文網址。請回覆這則提醒並貼上像 https://x.com/帳號/status/數字 的連結。', 'private').catch(() => undefined);
-    return true;
-  }
-  try {
-    store.matchMirror(reminder.mirrorId, found.id);
-    store.setReminderState(target, 'linked', found.url);
-    store.event('info', `Manual X mirror registered for ${reminder.aggregateId}: ${found.id}`, reminder.aggregateId);
-    await telegram.editMessageText(config.telegram.privateChatId, target, `🔗 已登記你的 X 推文：${found.url}\n之後我不會再把這則內容同步回來。`);
-    await telegram.sendPlain('已登記，謝謝！這則內容之後不會再被同步。', 'private').catch(() => undefined);
-  } catch (error) {
-    store.event('error', `Manual X mirror registration failed: ${safeError(error)}`, reminder.aggregateId);
-    await telegram.sendPlain(`登記失敗：${safeError(error)}`, 'private').catch(() => undefined);
-  }
-  return true;
+    else if (command === '/approve' && id) { context.engine.action('approve', id); await context.telegram.sendPlain(`已批准 ${id} 發布到下游。`, 'private'); }
+    else if (['/retry', '/resync'].includes(command) && id) { context.engine.action('retry', id); await context.telegram.sendPlain(`已排入重試 ${id}`, 'private'); }
+    else if (['/skip', '/mirror', '/approve', '/retry', '/resync'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
+    else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
+  } catch (error) { context.store.event('error', `Telegram command failed: ${safeError(error)}`); await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
 }
 
 /**
@@ -290,7 +261,9 @@ async function handleSessionUpload(
     catch (error) { context.store.event('error', `Could not delete uploaded session message: ${safeError(error)}`); }
     const note = deleted ? '已刪除你上傳的檔案訊息。' : '⚠️ 無法自動刪除該檔案訊息，請你手動刪除，以免憑證留在對話中。';
     const file = parseSessionFile(bytes);
+    if (file.handle && file.handle.toLowerCase() !== context.config.x.handle.toLowerCase()) throw new Error('Session belongs to a different configured X handle');
     const result = await installSession(context.config.x, file);
+    context.store.setSetting('x:session_state', result.authenticated ? 'authenticated' : 'error');
     context.store.event('info', `X session uploaded via Telegram for @${file.handle || context.config.x.handle}; authenticated=${result.authenticated}; messageDeleted=${deleted}`);
     if (result.authenticated) await context.telegram.sendPlain(`✅ X session 已安裝並驗證成功，之後的檢查就能讀到你的推文了。${note}`, 'private');
     else await context.telegram.sendPlain(`⚠️ session 已安裝，但驗證時仍看到登入/驗證畫面（cookie 可能過期或被要求重新驗證，請在本機重新 login 後再匯出）。${note}`, 'private');

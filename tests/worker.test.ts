@@ -162,7 +162,7 @@ test('a reminder delivery carries the interactive buttons and arms a reminder re
   const worker = new Worker(engine, new Map<Destination, Publisher>([['telegram', publisher]]));
   await worker.run(at(20));
   assert.deepEqual(noticeButtons, ['rem:y', 'rem:n'], 'the notice offers 要發 / 不發');
-  const reminder = store.getReminder(777);
+  const reminder = store.getReminder(777, '999');
   assert.ok(reminder, 'the reminder message is recorded for later button/link handling');
   assert.equal(reminder?.state, 'offered');
   assert.equal(reminder?.mirrorId, `mirror:${reminderJob.aggregateId}`);

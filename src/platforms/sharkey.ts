@@ -231,6 +231,7 @@ export class SharkeyClient implements Publisher, Collector {
   }
 
   async collect(since?: string): Promise<SourceSnapshot> {
+    const fetchedAt = this.now().toISOString();
     let accountId = this.config.userId || this.config.username;
     let complete = true;
     const warnings: string[] = [];
@@ -255,6 +256,7 @@ export class SharkeyClient implements Publisher, Collector {
           // A note we cannot fully parse is held individually by the engine (metadataComplete:false);
           // record it as a warning rather than rejecting the whole window.
           if (!parsed.valid && parsed.reason) warnings.push(`note incomplete: ${parsed.reason}${parsed.post ? ` (id ${parsed.post.id})` : ''}`);
+          if (!parsed.post) complete = false;
           if (parsed.post) {
             if (parsed.post.createdAt && (!oldest || parsed.post.createdAt < oldest)) oldest = parsed.post.createdAt;
             if (!posts.has(parsed.post.id)) { posts.set(parsed.post.id, parsed.post); progress++; }
@@ -273,7 +275,7 @@ export class SharkeyClient implements Publisher, Collector {
     // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
     if (complete && !reachedWatermark) { complete = false; warnings.push('Sharkey backlog since the last scan exceeds the page budget; scan more often'); }
     if (!complete && !warnings.length) warnings.push('Some Sharkey notes have incomplete relation, visibility or media metadata');
-    return { platform: this.platform, accountId, posts: [...posts.values()], fetchedAt: this.now().toISOString(), complete, warnings: [...new Set(warnings)] };
+    return { platform: this.platform, accountId, posts: [...posts.values()], fetchedAt, complete, warnings: [...new Set(warnings)] };
   }
 }
 

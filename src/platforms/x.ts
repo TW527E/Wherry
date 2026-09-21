@@ -4,7 +4,7 @@ import type { Attachment, Collector, SourcePost, SourceSnapshot, Transport } fro
 import { resolveBrowserPlan, verifyBrowserPlan, type BrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
 
-function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters<typeof chromium.launchPersistentContext>[1] {
+export function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters<typeof chromium.launchPersistentContext>[1] {
   const plan = resolveBrowserPlan({ choice: config.browser, executablePath: config.executablePath });
   verifyBrowserPlan(plan);
   // X and Google refuse logins from browsers that advertise automation. Playwright adds
@@ -64,18 +64,20 @@ export function parseTweetFacts(input: {
 }, ownerHandle: string): TweetFacts {
   const ownUrl = input.url;
   const parentLink = (input.statusLinks || []).map(value => {
-    try { const url = new URL(value, 'https://x.com'); const match = url.pathname.match(statusPath); return match && match[1] !== input.id ? { url: url.href, id: match[1] } : undefined; } catch { return undefined; }
+    try { const url = new URL(value, 'https://x.com'); const match = url.pathname.match(statusPath); return match && match[1] !== input.id && value !== input.quoteUrl ? { url: url.href, id: match[1] } : undefined; } catch { return undefined; }
   }).find(Boolean);
   const replying = input.replyingTo?.match(/@([A-Za-z0-9_]{1,15})/);
-  const relationKnown = Boolean(input.replyingTo !== undefined || (input.statusLinks && input.statusLinks.length > 0));
   const isReply = Boolean(replying || parentLink);
+  // A post with no reply markers is a known root even when the DOM did not expose its own status link.
+  // A reply is only trustworthy when the parent status link was actually parsed.
+  const relationKnown = !isReply || Boolean(parentLink);
   return {
     id: input.id,
     url: ownUrl,
     authorId: input.authorId || ownerHandle,
     createdAt: input.createdAt,
     text: input.text || '',
-    replyToId: isReply ? parentLink?.id ?? null : null,
+    replyToId: isReply ? parentLink?.id : null,
     replyToAuthorId: isReply ? replying?.[1] ?? null : null,
     relationKnown,
     repost: input.repost ?? false,
@@ -101,15 +103,7 @@ export class XCollector implements Collector {
     // Resolve once per collector lifetime so `doctor` and the collector agree on the browser.
     this.plan = resolveBrowserPlan({ choice: this.config.browser, executablePath: this.config.executablePath });
     verifyBrowserPlan(this.plan);
-    const launchOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
-      headless: this.config.headless,
-      serviceWorkers: 'block',
-      bypassCSP: false,
-      javaScriptEnabled: true,
-      viewport: { width: 1280, height: 900 },
-    };
-    if (this.plan.executablePath) launchOptions.executablePath = this.plan.executablePath;
-    else if (this.plan.channel) launchOptions.channel = this.plan.channel;
+    const launchOptions = launchOptionsFor(this.config, this.config.headless);
     this.context = await chromium.launchPersistentContext(this.config.profileDir, launchOptions);
     this.page = this.context.pages()[0] || await this.context.newPage();
     await this.page.route('**/*', async route => {
@@ -122,6 +116,7 @@ export class XCollector implements Collector {
   }
 
   async collect(since?: string): Promise<SourceSnapshot> {
+    const fetchedAt = new Date().toISOString();
     const page = await this.browserPage();
     // Read the main profile timeline, NOT /with_replies. Verified against the live account: the
     // main timeline reliably renders the newest top-level tweets (today's posts appeared at once),
@@ -154,7 +149,10 @@ export class XCollector implements Collector {
       const articles = await page.locator('article[data-testid="tweet"]').all();
       for (const article of articles) {
         const links = await article.locator('a[href*="/status/"]').evaluateAll(nodes => nodes.map(node => (node as HTMLAnchorElement).href));
-        const own = links.map(value => { try { return new URL(value).pathname.match(statusPath)?.[1]; } catch { return; } }).find(Boolean);
+        const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
+        const ownPath = permalink ? new URL(permalink, 'https://x.com').pathname : '';
+        const own = ownPath.match(statusPath)?.[1];
+        const authorId = ownPath.split('/')[1] || '';
         if (!own || seen.has(own)) continue;
         seen.add(own);
         const time = await article.locator('time').getAttribute('datetime').catch(() => null);
@@ -204,18 +202,18 @@ export class XCollector implements Collector {
         if (cardHref && !/^https?:\/\//.test(cardHref.match(statusPath)?.[0] || '') && !text.includes(cardHref)) {
           try {
             const cardId = new URL(cardHref).pathname.match(statusPath)?.[1];
-            if (!cardId || cardId === own) { const stripped = cardHref.split('?')[0]; if (stripped && !text.includes(stripped)) bodyText = text ? `${text}\n${stripped}` : stripped; }
+            if (!cardId || cardId === own) { const stripped = cardHref; if (stripped && !text.includes(stripped)) bodyText = text ? `${text}\n${stripped}` : stripped; }
           } catch { /* ignore malformed card href */ }
         }
-        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId: this.config.handle, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
-        if (parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
+        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote }, this.config.handle);
+        if (!/pinned|置頂/i.test(articleText) && parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
       }
       // Once the oldest tweet seen is at/older than the last fetch, the gap since then is covered.
       if (since && oldest && oldest <= since) { reachedWatermark = true; break; }
       if (seen.size === previousCount) stableRounds++; else stableRounds = 0;
       previousCount = seen.size;
-      if (stableRounds >= 1) { reachedWatermark = true; break; } // reached the end of the timeline
+      if (stableRounds >= 2) break;
       await page.mouse.wheel(0, 1800);
       await page.waitForTimeout(800);
     }
@@ -230,7 +228,7 @@ export class XCollector implements Collector {
     // Budget exhausted before reaching the watermark = a real backlog gap: hold and tell the operator.
     const warnings = reachedWatermark ? [] : ['X backlog since the last scan exceeds the scroll budget; raise X_MAX_PAGES or scan more often'];
     const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
-    return { platform: 'x', accountId: this.config.handle, posts, fetchedAt: new Date().toISOString(), complete: reachedWatermark, warnings };
+    return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: reachedWatermark, warnings };
   }
   async close(): Promise<void> { await this.context?.close(); this.context = undefined; this.page = undefined; }
 }
@@ -258,7 +256,7 @@ export async function loginInteractive(
     await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
     const title = await page.title().catch(() => '');
     const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
-    const authenticated = !/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${body}`);
+    const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
     return { authenticated };
   } finally {
     await context.close();
@@ -305,7 +303,7 @@ export async function installSession(config: AppConfig['x'], file: SessionFile):
     await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
     const title = await page.title().catch(() => '');
     const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
-    const authenticated = !/log in|sign in|challenge|unusual activity|suspended/i.test(`${title}\n${body}`);
+    const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
     return { authenticated };
   } finally {
     await context.close();

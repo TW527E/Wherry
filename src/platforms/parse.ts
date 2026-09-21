@@ -92,7 +92,8 @@ function errorCode(payload: unknown): string | undefined {
 function safeDetail(payload: unknown): string | undefined {
   const data = object(payload);
   const raw = typeof data?.message === 'string' ? data.message
-    : typeof object(data?.error)?.message === 'string' ? (object(data?.error)!.message as string) : undefined;
+    : typeof object(data?.error)?.message === 'string' ? (object(data?.error)!.message as string)
+    : typeof data?.description === 'string' ? data.description : undefined;
   if (!raw) return;
   const cleaned = raw
     .replace(/https?:\/\/\S+/gi, '<url>')

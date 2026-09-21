@@ -166,6 +166,20 @@ export interface Batch {
   reason: string;
 }
 
+export type ReminderState = 'offered' | 'awaiting_link' | 'declined' | 'linked';
+
+export interface Reminder {
+  messageId: number;
+  chatId: string;
+  aggregateId: string;
+  mirrorId: string;
+  state: ReminderState;
+  xUrl?: string;
+  revision: number;
+  syncedRevision: number;
+  editAfter?: string;
+}
+
 export interface EventRecord {
   at: string;
   level: 'info' | 'warn' | 'error';

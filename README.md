@@ -13,8 +13,9 @@ X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動�
 - 讀取你自己 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道。
 - 在 Bluesky／dvd.chat 同步完成後，多發一則回覆串文，附上該串文最頂端主推文的 `fixupx.com` 連結。
 - Telegram 對外頻道的每則訊息底部附 `原文連結`。
-- 偵測你在 Bluesky／dvd.chat 發的原生貼文，用 Telegram 私聊送兩則訊息：一則提醒你要手動發到 X，一則附完整內容與媒體供你轉發。
-- 認出你手動貼到 X 的鏡像內容，**不再**回同步到其他平台。
+- 偵測你在 Bluesky／dvd.chat 發的原生貼文，用 Telegram 私聊送一則**互動式提醒**：內含「1️⃣ 要發 / 2️⃣ 不發」按鈕。按「要發」後回覆該訊息貼上 X 連結，工具即登記為鏡像；按「不發」則不同步。訊息會就地更新狀態。
+- 認出你手動貼到 X 的鏡像內容（含互動提醒或 `/mirror` 登記的連結），**不再**回同步到其他平台。
+- 把系統錯誤事件自動轉發到 Telegram（有設 `TELEGRAM_OPS_CHAT_ID` 就送 ops 頻道，否則送私聊），秘密會先遮蔽。
 - 提供 CLI 與網頁介面，以及排程發布（排程只發布到下游並提醒你發 X）。
 
 **不會做**
@@ -49,6 +50,8 @@ npm run cli -- serve      # 啟動排程、worker 與網頁介面
 
 預設 `APP_MODE=preview`：**讀取、分類、組批次照常執行**（讀 X 是唯讀的、任何模式都安全），只有最後「發布」那步換成 stub 不對外送出。所以 preview 下你按「立刻檢查」就能看到工具偵測到你的新推文、預計會發什麼。確認行為正確後再改成 `live` 才會真的發到下游。
 
+注意：Telegram 的對外發文、互動提醒與錯誤轉發**只在 `live` 模式送出**；preview 不會對外送任何 Telegram 訊息。指令輪詢（`/status`、`/sync` 等）與 session 上傳為 owner-only 的唯讀／管理操作，需 `TELEGRAM_POLL_COMMANDS=true` 並在 `live` 下才會啟動。
+
 網頁介面預設只在 `127.0.0.1:3000`。若綁到其他位址，`WEB_TOKEN` 必須至少 32 字元，且所有寫入請求都要帶 `Authorization: Bearer <token>`。
 
 ### 用 Docker
@@ -72,7 +75,14 @@ docker compose logs -f
 | `X_PROFILE_DIR` | 你手動登入一次後保留的瀏覽器 profile 目錄（請保持私密） |
 | `BLUESKY_*` | 官方 API，請用 **app password**，不要用主密碼 |
 | `SHARKEY_*` | dvd.chat API token，權限只需 `write:drive`、`write:notes` |
-| `TELEGRAM_*` | bot token 與三個 chat id（一律用數字 ID，不是 @username） |
+| `TELEGRAM_TOKEN` | bot token（BotFather 取得） |
+| `TELEGRAM_PUBLIC_CHAT_ID` | 對外同步的頻道（一律用數字 ID，不是 @username） |
+| `TELEGRAM_PRIVATE_CHAT_ID` | 你的私聊：互動提醒、session 上傳、指令回覆 |
+| `TELEGRAM_OPS_CHAT_ID` | 錯誤轉發目標；留空則錯誤送私聊 |
+| `TELEGRAM_OWNER_ID` | 唯一可下指令、按提醒按鈕、上傳 session 的使用者 ID |
+| `TELEGRAM_POLL_COMMANDS` | `true` 才輪詢並處理指令與互動按鈕（僅 `live`） |
+
+完整 40 個設定鍵（用途＋取得方式）見 [`docs/configuration.md`](docs/configuration.md)。
 
 **設定會強制檢查**：若 `DESTINATIONS` 含 `bluesky`，就必須同時 `BLUESKY_ENABLED=true`，`sharkey` 同理。原因是工具必須觀察那個帳號才能排除「手動鏡像」，否則防回音會失去依據。這是刻意的設計，不是可以繞過的選項。
 
@@ -96,9 +106,24 @@ npm run cli -- export-session           # 匯出 X 登入到 X_SESSION_FILE
 npm run cli -- import-session           # 在伺服器安裝 X_SESSION_FILE 的登入
 ```
 
-Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true`，且只接受 `TELEGRAM_OWNER_ID`）：
-`/status`、`/sync`、`/skip <id>`、`/mirror <id>`、`/approve <id>`、`/retry <job>`、`/help`。
-另外，**直接把 `x-session.json` 檔案傳到私人聊天即可更新 X 登入**（見下方部署段的方式 A）。
+Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受 `TELEGRAM_OWNER_ID`）：
+
+| 指令 | 作用 |
+|---|---|
+| `/status` | 目前模式、X session 狀態、任務與近期事件 |
+| `/sync` | 立即檢查一次（X 發文仍需手動） |
+| `/pending` | 列出等待處理的批次與 X 提醒 |
+| `/approve <batchId>` | 放行被保留的批次 |
+| `/skip <batchId>` | 不同步某批次 |
+| `/mirror <id>` | 標記為手動鏡像，不再同步 |
+| `/mirror <id> <X_URL>` | 登記你手動發的 X 連結（設定防回音來源） |
+| `/retry <jobId>`、`/resync <jobId>` | 重試明確失敗的工作 |
+| `/session` | 更新 X 登入：接著上傳 `x-session.json` |
+| `/help` | 顯示所有指令 |
+
+互動提醒：偵測到 B/D 原生貼文時，私聊會收到帶「1️⃣ 要發 / 2️⃣ 不發」按鈕的訊息。按「要發」後**回覆該訊息貼上 X 連結**即完成鏡像登記；按「不發」則取消同步。訊息會就地更新狀態。
+
+另外，**直接把 `x-session.json` 檔案傳到私人聊天即可更新 X 登入**（見下方部署段的方式 A，或先打 `/session`）。
 
 ---
 
@@ -128,6 +153,7 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true`，且只接受 `TELEGR
 
 當 X 出現新批次時：
 
+- 你已透過互動提醒或 `/mirror <id> <X_URL>` **明確登記過該 X 貼文 ID** → 直接判定為鏡像，忽略且不通知（確定性比對，最可靠）。
 - 文字正規化後完全相同、媒體指紋相容，且**只有唯一符合**的候選 → 判定為鏡像，不同步。
 - 只有部分相似、媒體不一致、媒體沒有雜湊、或有多個候選 → 標記 `mirror_review`，**暫停並通知你**，不會自動發布。
 - 完全沒有證據 → 視為新的 X 原生內容，正常同步。
@@ -175,6 +201,10 @@ SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取�
 ---
 
 ## 部署（Oracle ARM64 / Debian）
+
+兩種常駐方式：Docker，或 Linux systemd system service。systemd 的完整安裝、更新、session 匯入與故障排除見 [`deploy/README.md`](deploy/README.md)，unit 檔在 [`deploy/crosspost-bridge.service`](deploy/crosspost-bridge.service)。收到 SIGTERM 後程式會停止新輪詢、等現有工作與瀏覽器收尾、釋放資料目錄鎖再退出。
+
+Docker：
 
 ```bash
 sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2
@@ -232,7 +262,7 @@ X_BROWSER=chrome npm run cli -- doctor   # 顯示實際偵測到的瀏覽器
 - **X 讀取的選擇器可能隨 X 前端改版失效。** 解析失敗時會保留檢查點並回報錯誤，不會誤判成「沒有新內容」。
 - **Telegram 頻道內的回覆呈現**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際外觀需在你的頻道上驗證一次。
 - **dvd.chat 的實際可用上傳上限**由實例與角色政策決定，程式不寫死數字，以伺服器回應為準。
-- 影片、GIF、投票、純音訊、Quote 原生互動屬第二階段。
+- 影片、GIF、投票、純音訊、Quote 原生互動屬第二階段。`VIDEO_ENABLED`／`FFMPEG_PATH`／`FFPROBE_PATH` 與轉碼規劃已存在，但**尚未接進發布流程**；含影片的內容目前仍被保留、不會自動發布。
 - 第一版尚未實作：Web UI 上的排程表單與批次編輯（CLI 已可用）。
 
 ---

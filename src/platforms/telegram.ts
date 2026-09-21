@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config.js';
 import type { PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
-import { htmlEscape } from '../text.js';
+import { htmlEscape, splitText } from '../text.js';
+import { PlatformError, requestJson, schemaError } from './parse.js';
 
 export type TelegramAudience = 'private' | 'ops' | 'public';
 interface TelegramResponse<T> { ok: boolean; result?: T; description?: string; parameters?: { retry_after?: number } }
@@ -25,8 +26,8 @@ export class TelegramClient implements Publisher {
   }
   private endpoint(method: string): string { return `https://api.telegram.org/bot${this.config.token}/${method}`; }
   private async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
-    const response = await this.transport.json<TelegramResponse<T>>(this.endpoint(method), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), maxBytes: 2_000_000 });
-    if (!response.ok || !response.result) { const error = new Error(response.description || `Telegram ${method} failed`) as Error & { retryAfter?: number; status?: number }; error.retryAfter = response.parameters?.retry_after; throw error; }
+    const response = await requestJson(this.transport, this.endpoint(method), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), maxBytes: 2_000_000 }, `Telegram ${method}`, true) as TelegramResponse<T>;
+    if (response.ok !== true || response.result === undefined) throw schemaError(`Telegram ${method}`, true);
     return response.result;
   }
   private footer(url: string): string { return `\n\n<a href="${htmlEscape(url)}">原文連結</a>`; }
@@ -38,8 +39,8 @@ export class TelegramClient implements Publisher {
     if (part.images.length === 1) {
       const image = part.images[0]!; const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
       const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) }, { name: `crosspost.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, type: image.mimeType, bytes: image.bytes, field: 'photo' });
-      const response = await this.transport.json<TelegramResponse<TelegramMessage>>(this.endpoint('sendPhoto'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 });
-      if (!response.ok || !response.result) throw new Error(response.description || 'Telegram sendPhoto failed');
+      const response = await requestJson(this.transport, this.endpoint('sendPhoto'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, 'Telegram sendPhoto', true) as TelegramResponse<TelegramMessage>;
+      if (!response.ok || !response.result) throw schemaError('Telegram sendPhoto', true);
       return { id: String(response.result.message_id), messageIds: [response.result.message_id], chatId };
     }
     const text = `${htmlEscape(part.text)}${link}`; if (text.length > MAX_TEXT) throw new Error('Telegram message requires core text splitter before publish');
@@ -48,12 +49,19 @@ export class TelegramClient implements Publisher {
     return { id: String(result.message_id), messageIds: [result.message_id], chatId };
   }
   async sendPlain(text: string, audience: TelegramAudience = 'ops'): Promise<RemoteRef> {
-    const chatId = this.chat(audience); const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: htmlEscape(text), parse_mode: 'HTML' });
-    return { id: String(result.message_id), messageIds: [result.message_id], chatId };
+    const chatId = this.chat(audience); const messageIds: number[] = [];
+    for (const chunk of splitText(text, { utf16: MAX_TEXT })) {
+      const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: chunk, link_preview_options: { is_disabled: true } });
+      messageIds.push(result.message_id);
+    }
+    return { id: String(messageIds[0]), messageIds, chatId };
   }
-  /** Replace a message's text (and clear its buttons). Used to update the reminder after a tap. */
   async editMessageText(chatId: string, messageId: number, text: string): Promise<void> {
-    await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text: htmlEscape(text), parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+    try {
+      await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: [] } });
+    } catch (error) {
+      if (!(error instanceof PlatformError && error.status === 400 && /message is not modified/i.test(error.message))) throw error;
+    }
   }
   /** Acknowledge a button tap so Telegram stops the client-side spinner; text is an optional toast. */
   async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {

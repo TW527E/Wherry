@@ -15,7 +15,7 @@ Usage:
   crosspost-bridge serve                 Run the scheduler, worker and Web UI
   crosspost-bridge once                  Run one collect + seal + publish cycle
   crosspost-bridge status                Print jobs, batches and recent events
-  crosspost-bridge scan                  Collect sources only (no publishing unless live)
+  crosspost-bridge scan                  Collect sources only (never publishes)
   crosspost-bridge publish <batchId>     Enqueue downstream publication for a sealed batch
   crosspost-bridge schedule <iso> <text> Create a local scheduled post (no X write)
   crosspost-bridge action <verb> <id>    skip | approve | mirror | retry
@@ -40,6 +40,8 @@ async function main(): Promise<number> {
         runtime.store.event('info', `Service started in ${config.mode} mode on ${config.host}:${config.port}`);
         console.log(`crosspost-bridge listening on http://${config.host}:${config.port} (mode=${config.mode})`);
         if (config.mode !== 'live') console.log('preview mode: no remote publication is performed');
+        runtime.start();
+        void runtime.once();
         await new Promise<void>(resolve => {
           const shutdown = (): void => resolve();
           process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
@@ -48,7 +50,7 @@ async function main(): Promise<number> {
         return 0;
       }
       case 'once': await runtime.once(); printStatus(runtime); return 0;
-      case 'scan': await runtime.once(); printStatus(runtime); return 0;
+      case 'scan': await runtime.scan(); printStatus(runtime); return 0;
       case 'status': printStatus(runtime); return 0;
       case 'publish': {
         const batchId = argv[1];
@@ -95,7 +97,7 @@ async function main(): Promise<number> {
         // Destination is the env-configured, resolved path (X_SESSION_FILE); never a raw argv path.
         const target = config.x.sessionFile;
         const file = await exportSession(config.x);
-        await writeFile(target, JSON.stringify(file), 'utf8');
+        await writeFile(target, JSON.stringify(file), { encoding: 'utf8', mode: 0o600 });
         await chmod(target, 0o600).catch(() => {});
         console.log(`已匯出 X session 到 ${target}（權限 600）。這是帳號登入憑證，請妥善保管、勿加入版控。`);
         console.log('用法：把這個檔案傳給 Telegram 機器人的「私人聊天」，或用 import-session 在伺服器安裝。');
@@ -131,7 +133,7 @@ async function main(): Promise<number> {
       default: console.log(usage); return 1;
     }
   } finally {
-    if (command !== 'serve') await runtime.stop();
+    await runtime.stop();
   }
 }
 

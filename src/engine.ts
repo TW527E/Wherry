@@ -224,6 +224,33 @@ export class Engine {
     return id;
   }
 
+  registerManualMirror(aggregateId: string, xId: string, now = new Date().toISOString()): { alreadyDelivered: boolean } {
+    if (!/^[1-9]\d{0,24}$/.test(xId)) throw new Error('Invalid X post ID');
+    const source = this.store.postByKey(aggregateId);
+    if (!source || source.post.platform === 'x') throw new Error('Native reminder source not found');
+    const existing = this.store.getPost('x', xId);
+    if (existing && existing.post.replyToId !== null) throw new Error('Please register the X thread root, not a reply');
+    const batchId = existing?.batchId ?? `x:${xId}`;
+    const jobs = this.store.jobsForAggregate(batchId);
+    const alreadyDelivered = jobs.some(job => ['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id));
+    this.store.transaction(() => {
+      this.store.addMirror(source.post, now);
+      this.store.matchMirror(`mirror:${aggregateId}`, xId);
+      if (this.store.getBatch(batchId)) {
+        this.store.updateBatch(batchId, 'mirror', 'manual_mirror_registered');
+        for (const member of this.store.batchPosts(batchId)) this.store.updatePost(member.key, 'manual_mirror', 'manual_mirror_registered');
+      }
+      for (const job of jobs) {
+        if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'manual_mirror_registered');
+      }
+      if (existing) this.store.updatePost(existing.key, 'manual_mirror', 'manual_mirror_registered');
+      this.store.event(alreadyDelivered ? 'error' : 'info', alreadyDelivered
+        ? 'Manual mirror registered after delivery started; inspect remote posts, no automatic deletion was attempted'
+        : 'Manual X mirror registered; pending echo deliveries cancelled', aggregateId);
+    });
+    return { alreadyDelivered };
+  }
+
   action(action: 'skip' | 'mirror' | 'approve' | 'retry', id: string, now = new Date().toISOString()): void {
     // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
     // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
@@ -236,9 +263,10 @@ export class Engine {
     }
     const batch = this.store.getBatch(id);
     if (!batch) throw new Error('Batch not found');
-    const jobs = this.store.jobs(10000).filter(j => j.aggregateId === id);
-    if (jobs.some(j => ['running', 'succeeded', 'unknown'].includes(j.state))) throw new Error('Already delivered/in-flight batch cannot be rewritten; inspect remote posts first');
+    const jobs = this.store.jobsForAggregate(id);
+    if (jobs.some(j => ['running', 'succeeded', 'unknown'].includes(j.state) || this.store.hasDeliveryEvidence(j.id))) throw new Error('Already delivered/in-flight batch cannot be rewritten; inspect remote posts first');
     if (action === 'approve') {
+      if (!['open', 'review', 'sealed'].includes(batch.state)) throw new Error('Only open/review/sealed batches can be approved');
       const members = this.store.batchPosts(id);
       if (members.some(m => unsupportedReason(m.post))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
       if (members.some(m => !m.post.relationKnown)) throw new Error('Unknown reply relationship cannot be force-published');
@@ -291,14 +319,28 @@ export class Engine {
 }
 
 export class Worker {
+  private stopping = false;
+  private active?: Promise<number>;
   constructor(readonly engine: Engine, readonly publishers: Map<Destination, Publisher>) {}
-  async run(now = new Date().toISOString()): Promise<number> {
+  stop(): void { this.stopping = true; }
+  run(now = new Date().toISOString()): Promise<number> {
+    if (this.stopping) return Promise.resolve(0);
+    if (this.active) return this.active;
+    this.active = this.deliver(now).finally(() => { this.active = undefined; });
+    return this.active;
+  }
+  private async deliver(now: string): Promise<number> {
     const { store } = this.engine;
     // Which publishers exist is decided when the runtime is built: preview mode wires stub
     // publishers, live mode wires real clients. The worker itself never invents a remote call.
     if (store.setting('paused', false)) return 0;
     let count = 0;
     for (const job of store.dueJobs(now)) {
+      if (this.stopping) break;
+      if (job.kind === 'publish' && this.engine.config.mode === 'live' && store.db.prepare("SELECT 1 FROM steps WHERE job_id=? AND result LIKE '%preview:%' LIMIT 1").get(job.id)) {
+        store.updateJob(job.id, 'review', 'Preview receipts cannot be used for live replies; use a separate live DATA_DIR');
+        continue;
+      }
       const publisher = this.publishers.get(job.destination);
       if (!publisher) {
         store.updateJob(job.id, 'failed', `No ${job.destination} publisher is configured for this destination`);
@@ -311,11 +353,26 @@ export class Worker {
       try {
         const parts = await this.engine.parts(job);
         let root: RemoteRef | undefined, parent: RemoteRef | undefined;
+        let interrupted = false;
         for (const part of parts) {
+          if (this.stopping) { store.updateJob(job.id, 'pending', undefined, now); interrupted = true; break; }
+          if (job.kind === 'publish' && store.getBatch(job.aggregateId)?.state !== 'sealed') {
+            store.updateJob(job.id, 'cancelled', 'Batch no longer approved for publication'); interrupted = true; break;
+          }
+          if (job.kind === 'reminder') {
+            const notice = store.getStep(job.id, 'notice')?.result;
+            if (notice?.chatId && notice.messageIds?.[0] && store.getReminder(notice.messageIds[0], notice.chatId)?.state === 'declined') {
+              store.updateJob(job.id, 'cancelled', 'Owner declined X reminder'); interrupted = true; break;
+            }
+          }
           activeKey = part.key;
           const prior = store.getStep(job.id, part.key);
           if (prior?.state === 'succeeded' && prior.result) {
-            if (part.key !== 'notice') { parent = prior.result; root ??= prior.result; }
+            if (part.key === 'notice' && prior.result.chatId && prior.result.messageIds?.[0]) {
+              store.armReminder(prior.result.messageIds[0], prior.result.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
+            } else {
+              parent = prior.result; root ??= prior.result;
+            }
             continue;
           }
           if (prior?.state === 'started') throw Object.assign(new Error('Uncertain previous remote delivery; reconciliation required'), { uncertain: true });
@@ -325,14 +382,15 @@ export class Worker {
             parent: part.key === 'notice' ? undefined : parent,
             audience: job.kind === 'reminder' ? 'private' : 'public', idempotencyKey: `${job.id}:${part.key}`,
           });
-          store.finishStep(job.id, part.key, ref);
-          // The interactive reminder notice carries buttons; record its message so a later button
-          // tap / link reply can be resolved back to this batch and its anti-echo mirror.
-          if (part.key === 'notice' && job.kind === 'reminder' && ref.chatId && ref.messageIds?.[0]) {
-            store.armReminder(ref.messageIds[0], ref.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
-          }
+          store.transaction(() => {
+            store.finishStep(job.id, part.key, ref);
+            if (part.key === 'notice' && job.kind === 'reminder' && ref.chatId && ref.messageIds?.[0]) {
+              store.armReminder(ref.messageIds[0], ref.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
+            }
+          });
           if (part.key !== 'notice') { parent = ref; root ??= ref; }
         }
+        if (interrupted) continue;
         store.updateJob(job.id, 'succeeded');
         store.event('info', `${job.destination}: delivered ${parts.length} parts`, job.id);
         count++;
@@ -378,14 +436,18 @@ export function splitHtml(text: string, escapedLimit: number, reserve = 0): stri
   throw new Error('Text cannot be split to fit the Telegram HTML limit without changing content');
 }
 
-export async function collectCycle(engine: Engine, collectors: Collector[], now = new Date().toISOString()): Promise<void> {
+export async function collectCycle(engine: Engine, collectors: Collector[], now?: string): Promise<void> {
   const sorted = [...collectors].sort((a, b) => Number(a.platform === 'x') - Number(b.platform === 'x'));
   for (const collector of sorted) {
     // Pass the last successful fetch watermark so the collector pages back only as far as needed
     // and can tell whether it closed the whole gap since the previous scan.
     const since = engine.store.setting<string | undefined>(`fresh:${collector.platform}`, undefined);
-    try { engine.ingest(await collector.collect(since), now); }
-    catch (error) { engine.store.event('error', `${collector.platform} collection failed: ${safeError(error)}`); }
+    try {
+      engine.ingest(await collector.collect(since), now);
+      if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'authenticated');
+    } catch (error) {
+      if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'error');
+      engine.store.event('error', `${collector.platform} collection failed: ${safeError(error)}`);
+    }
   }
-  engine.sealReady(now);
 }

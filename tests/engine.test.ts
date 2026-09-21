@@ -298,7 +298,7 @@ test('the owner can hold or retry, and already delivered batches are protected',
   assert.equal(store.getBatch('x:901')?.state, 'review');
   engine.action('skip', 'x:901');
   assert.equal(store.getBatch('x:901')?.state, 'ignored');
-  assert.throws(() => engine.action('approve', 'x:901'), /Unsupported|not supported|cannot/i);
+  assert.throws(() => engine.action('approve', 'x:901'), /Unsupported|not supported|cannot|Only open/i);
 
   // Simulate a completed delivery, then confirm the batch can no longer be rewritten.
   const delivered = store.jobs(100).find(j => j.aggregateId === 'x:900' && j.destination === 'bluesky')!;
