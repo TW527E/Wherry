@@ -216,6 +216,7 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
   { command: 'mirror', args: '<id> [X_URL]', description: '標記為你手動鏡像，之後不再同步' },
   { command: 'retry', args: '<jobId>', description: '重試一個明確失敗的工作' },
   { command: 'resync', args: '<jobId>', description: 'retry 別名：重試明確失敗的工作' },
+  { command: 'reconcile', args: '<jobId>', description: '對帳後重試 unknown 工作（先自行確認遠端沒有重複貼文）' },
   { command: 'session', description: '更新 X 登入：接著上傳 x-session.json（或在檔案說明打 /session）' },
 ];
 
@@ -253,7 +254,8 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
     }
     else if (command === '/approve' && id) { context.engine.action('approve', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已批准 ${id}，正在背景發布到下游；狀態請看 /status。`, 'private'); }
     else if (['/retry', '/resync'].includes(command) && id) { context.engine.action('retry', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已排入重試 ${id}（背景執行）`, 'private'); }
-    else if (['/skip', '/mirror', '/approve', '/retry', '/resync'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
+    else if (command === '/reconcile' && id) { context.engine.action('reconcile', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已對帳並排入重新發送 ${id}（背景執行）。若剛才你在該平台看到已發出的貼文，請改用 /mirror 或 /skip，避免重複。`, 'private'); }
+    else if (['/skip', '/mirror', '/approve', '/retry', '/resync', '/reconcile'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
     else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
   } catch (error) { context.store.event('error', `Telegram command failed: ${safeError(error)}`); await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
 }
@@ -339,7 +341,7 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
   app.post('/api/scan', async () => { await runtime.once(); return { ok: true }; });
-  app.post<{ Body: { action: 'skip' | 'mirror' | 'approve' | 'retry'; id: string } }>('/api/action', async (request, reply) => {
+  app.post<{ Body: { action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile'; id: string } }>('/api/action', async (request, reply) => {
     try { runtime.engine.action(request.body.action, request.body.id); return { ok: true }; }
     catch (error) { return reply.code(400).send({ error: safeError(error) }); }
   });
@@ -396,12 +398,12 @@ tok.addEventListener('change',()=>localStorage.setItem('webToken',tok.value));
 function headers(){const h={'content-type':'application/json'};const t=localStorage.getItem('webToken');if(t)h.authorization='Bearer '+t;return h}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
-async function act(verb,id,btn){if(btn)btn.disabled=true;try{const r=await fetch('/api/action',{method:'POST',headers:headers(),body:JSON.stringify({action:verb,id})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);toast('已'+({skip:'略過',mirror:'標記鏡像',approve:'批准',retry:'重試'}[verb]||verb));await load()}catch(e){toast('失敗：'+e.message);if(btn)btn.disabled=false}}
+async function act(verb,id,btn){if(btn)btn.disabled=true;try{const r=await fetch('/api/action',{method:'POST',headers:headers(),body:JSON.stringify({action:verb,id})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);toast('已'+({skip:'略過',mirror:'標記鏡像',approve:'批准',retry:'重試',reconcile:'重新發送'}[verb]||verb));await load()}catch(e){toast('失敗：'+e.message);if(btn)btn.disabled=false}}
 async function scan(btn){if(btn)btn.disabled=true;try{const r=await fetch('/api/scan',{method:'POST',headers:headers(),body:'{}'});if(!r.ok)throw new Error(r.status);toast('已檢查');await load()}catch(e){toast('失敗：'+e.message)}finally{if(btn)btn.disabled=false}}
 async function schedule(btn){const text=$('#s-text').value.trim();if(!text){toast('請輸入內容');return}const due=$('#s-due').value;const dueAt=due?new Date(due).toISOString():new Date().toISOString();btn.disabled=true;try{const r=await fetch('/api/schedule',{method:'POST',headers:headers(),body:JSON.stringify({text,dueAt})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);toast('已排程 '+(j.id||''));$('#s-text').value='';await load()}catch(e){toast('失敗：'+e.message)}finally{btn.disabled=false}}
 function batchCard(b){const acts=(b.state==='review'||b.state==='open')?'<button class="ok" onclick="act(\\'approve\\',\\''+b.id+'\\',this)">批准發布</button> <button class="ghost" onclick="act(\\'skip\\',\\''+b.id+'\\',this)">略過</button> <button class="warn" onclick="act(\\'mirror\\',\\''+b.id+'\\',this)">標記為我手動鏡像</button>':'<span class="meta">此批次已處理，無可用操作</span>';
 return '<div class="batch"><div class="row"><span class="state '+esc(b.state)+'">'+esc(b.state)+'</span><b>'+esc(b.id)+'</b></div><div class="meta">原因：'+esc(b.reason)+' · root '+esc(b.rootId)+' · '+esc(b.rootCreatedAt)+'</div><div class="row" style="margin-top:.5rem">'+acts+'</div></div>'}
-function jobCard(j){const canRetry=(j.state==='failed'||j.state==='review');return '<div class="job"><div class="row"><span class="state '+esc(j.state)+'">'+esc(j.state)+'</span><b>'+esc(j.destination)+'</b><span class="meta">'+esc(j.aggregateId)+'</span></div>'+(j.error?'<div class="meta">錯誤：'+esc(j.error)+'</div>':'')+(canRetry?'<div class="row" style="margin-top:.5rem"><button class="ghost" onclick="act(\\'retry\\',\\''+j.id+'\\',this)">重試</button></div>':'')+'</div>'}
+function jobCard(j){const canRetry=(j.state==='failed'||j.state==='review');const canReconcile=(j.state==='unknown');return '<div class="job"><div class="row"><span class="state '+esc(j.state)+'">'+esc(j.state)+'</span><b>'+esc(j.destination)+'</b><span class="meta">'+esc(j.aggregateId)+'</span></div>'+(j.error?'<div class="meta">錯誤：'+esc(j.error)+'</div>':'')+(canRetry?'<div class="row" style="margin-top:.5rem"><button class="ghost" onclick="act(\\'retry\\',\\''+j.id+'\\',this)">重試</button></div>':'')+(canReconcile?'<div class="row" style="margin-top:.5rem"><button class="warn" onclick="if(confirm(\\'請先到該平台確認這則沒有成功發出（沒有重複貼文），再繼續。確定重新發送未確認的部分？\\'))act(\\'reconcile\\',\\''+j.id+'\\',this)">已確認遠端、重新發送</button></div>':'')+'</div>'}
 async function load(){try{const s=await fetch('/api/status').then(r=>r.json());
 const mode=$('#mode');mode.textContent='模式：'+s.mode;mode.className='pill '+(s.mode==='live'?'live':'preview');
 $('#xsess').textContent='X session：'+(s.xSession||'unknown');

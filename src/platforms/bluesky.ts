@@ -354,7 +354,10 @@ export class BlueskyClient implements Publisher, Collector {
     catch (error) {
       const info = object(error);
       if (info?.uncertain !== false || info.status !== 401 || !['ExpiredToken', 'InvalidToken'].includes(String(info.code))) throw error;
-      const refreshed = this.session?.accessJwt !== session.accessJwt ? this.session! : await this.refreshSession();
+      // Another task may have already rotated the token; reuse it. But close() can null the session
+      // concurrently, so only reuse a session that actually exists — otherwise refresh (which re-logs in).
+      const current = this.session;
+      const refreshed = current && current.accessJwt !== session.accessJwt ? current : await this.refreshSession();
       return request(refreshed);
     }
   }
@@ -378,10 +381,14 @@ export class BlueskyClient implements Publisher, Collector {
     const session = await this.login();
     const images: JsonObject[] = [];
     for (const image of part.images) {
+      // A blob upload is a PRE-publish step: the post record is only created afterwards, and it carries
+      // a deterministic rkey so the create itself is idempotent. An uncertain blob upload leaves at most
+      // an unreferenced blob, never a visible duplicate, so it is a plain transient error safe to retry —
+      // not an uncertain mutation. (mutation=false on both the request and the schema check.)
       const result = object(await this.authenticated('com.atproto.repo.uploadBlob',
-        { method: 'POST', headers: { 'content-type': image.mimeType }, body: image.bytes }, 'Bluesky image upload', true));
+        { method: 'POST', headers: { 'content-type': image.mimeType }, body: image.bytes }, 'Bluesky image upload', false));
       const uploaded = blob(result?.blob);
-      if (!uploaded || uploaded.mimeType !== image.mimeType || uploaded.size !== image.bytes.length) throw schemaError('Bluesky image upload', true);
+      if (!uploaded || uploaded.mimeType !== image.mimeType || uploaded.size !== image.bytes.length) throw schemaError('Bluesky image upload', false);
       images.push({ alt: image.alt, image: uploaded, aspectRatio: { width: image.width, height: image.height } });
     }
     const facets = blueskyLinkFacets(text);

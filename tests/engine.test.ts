@@ -306,6 +306,39 @@ test('Bluesky targets and footers are assembled with the X root link only', asyn
   assert.equal(parts.at(-1)?.text, '🔗 X 原推文：https://fixupx.com/owner/status/800');
 });
 
+test('Sharkey appends the MFM signature to each note body and adds no reply footer', async () => {
+  const { store, engine } = setup(['sharkey']);
+  engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  assert.equal(engine.sealReady(at(900)), 1);
+  const job = store.jobs(100).find(j => j.destination === 'sharkey')!;
+  const parts = await engine.parts(job);
+  // No separate footer part — the attribution lives inline at the bottom of the note.
+  assert.ok(parts.every(p => p.isFooter !== true), 'Sharkey uses an inline signature, not a reply footer');
+  const last = parts.at(-1)!;
+  assert.match(last.text, /^post 800\n\n<center><small>\$\[sparkle \$\[blur 這是從 X 來的推文，/);
+  assert.ok(last.text.includes('[點擊此處](https://fixupx.com/owner/status/800)前往原文'), 'the {url} placeholder resolves to this note source link');
+  assert.ok(last.text.includes('前往項目倉庫]]</small></center>'));
+});
+
+test('an empty SHARKEY_SIGNATURE disables the inline attribution', async () => {
+  const config = loadConfig({
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')),
+    DESTINATIONS: 'sharkey', SHARKEY_ENABLED: 'true', SHARKEY_SIGNATURE: '', X_ENABLED: 'true', X_HANDLE: 'owner',
+  });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, config, transport);
+  engine.ingest(snapshot([], at(-1000)), at(-1000));
+  engine.ingest(snapshot([], at(0), 'sharkey', 'sharkey-account'), at(0));
+  engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  assert.equal(engine.sealReady(at(900)), 1);
+  const job = store.jobs(100).find(j => j.destination === 'sharkey')!;
+  const parts = await engine.parts(job);
+  assert.ok(parts.every(p => p.isFooter !== true));
+  assert.equal(parts.at(-1)?.text, 'post 800', 'no signature is appended when it is cleared');
+});
+
 test('a local schedule publishes downstream and reminds the owner but never writes to X', async () => {
   const { store, engine } = setup(['bluesky', 'telegram']);
   const id = engine.schedule({ text: 'scheduled body', dueAt: at(3600) }, at(0));

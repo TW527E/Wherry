@@ -4,6 +4,13 @@ import { BROWSER_CHOICES } from './platforms/browser.js';
 import type { Destination } from './types.js';
 
 const bool = (value: string | undefined, fallback: boolean): boolean => value === undefined ? fallback : value === 'true';
+
+// Attribution appended to the bottom of every Sharkey note synced from X. Sharkey renders MFM, so
+// this is MFM/Markdown, not plain text. `{url}` is replaced with the note's own X source link; a
+// second link points at the project repo. Override with SHARKEY_SIGNATURE — set it to an empty
+// string to publish Sharkey notes with no attribution at all (like clearing an email signature).
+export const DEFAULT_SHARKEY_SIGNATURE =
+  '<center><small>$[sparkle $[blur 這是從 X 來的推文，[點擊此處]({url})前往原文，[點擊此處](https://github.com/TW527E/Twitter-Sharkey-Bluesky)前往項目倉庫]]</small></center>';
 const integer = (value: string | undefined, fallback: number, min: number, max: number): number => {
   const n = value === undefined ? fallback : Number(value);
   return z.number().int().min(min).max(max).parse(n);
@@ -27,7 +34,7 @@ export interface AppConfig {
   x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string; sandbox: boolean };
   media: { video: boolean; ffmpegPath: string; ffprobePath: string };
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
-  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string };
+  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
 }
 
@@ -76,6 +83,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sharkey: {
       enabled: bool(env.SHARKEY_ENABLED, false), baseUrl: env.SHARKEY_URL || 'https://dvd.chat',
       token: env.SHARKEY_TOKEN || '', userId: env.SHARKEY_USER_ID || '', username: env.SHARKEY_USERNAME || '',
+      // `??` not `||`: an explicit empty string disables the signature, while leaving it unset keeps the default.
+      signature: env.SHARKEY_SIGNATURE ?? DEFAULT_SHARKEY_SIGNATURE,
     },
     telegram: {
       enabled: bool(env.TELEGRAM_ENABLED, false), token: env.TELEGRAM_BOT_TOKEN || '',

@@ -104,8 +104,9 @@ export class TelegramNotifications {
       }
     }
     if (store.setting<string>('telegram:error_retry_at', '') > now) return;
-    const audience = config.telegram.opsChatId ? 'ops' : 'private';
-    if (audience === 'private' && !config.telegram.privateChatId) return;
+    // Error/failure notices always go to the owner's private chat with the bot, never the ops group.
+    const audience = 'private';
+    if (!config.telegram.privateChatId) return;
     const errors = store.errorEventsAfter(store.setting<number>('telegram:error_offset', 0), 5);
     if (!errors.length) return;
     const secrets = [config.telegram.token, config.bluesky.appPassword, config.sharkey.token, config.webToken].filter(Boolean);

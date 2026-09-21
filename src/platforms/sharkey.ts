@@ -214,9 +214,16 @@ export class SharkeyClient implements Publisher, Collector {
       const form = multipart({ i: this.config.token, comment: image.alt, isSensitive: String(sensitive), force: 'true' }, [
         { field: 'file', filename: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, mimeType: image.mimeType, bytes: image.bytes },
       ]);
+      // Uploading a drive file is a PRE-publish step, not the publish itself: the note is only created
+      // after every image succeeds. A failed/uncertain upload therefore cannot leave a visible duplicate
+      // (worst case an orphaned, unreferenced file), so it is NOT treated as an uncertain mutation —
+      // a timeout/5xx here is a plain transient error the worker may safely retry. Only notes/create below
+      // stays a true mutation. (mutation=false on both the request and the schema check.)
       const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,
-        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey image upload', true));
-      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true) || (file.comment !== undefined && file.comment !== image.alt)) throw schemaError('Sharkey image upload', true);
+        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey image upload', false));
+      // Misskey/Sharkey stores an empty comment as null and echoes it back as null, so treat null and
+      // '' as the same "no alt" value; only a genuine mismatch of non-empty text is a real error.
+      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true) || (file.comment !== undefined && (file.comment ?? '') !== image.alt)) throw schemaError('Sharkey image upload', false);
       fileIds.push(file.id);
     }
     // Sharkey does not promise a notes/create idempotency nonce. Never automatically replay an uncertain mutation.

@@ -230,6 +230,9 @@ export class Store {
   }
   finishStep(jobId: string, key: string, ref: RemoteRef): void { this.db.prepare("UPDATE steps SET state='succeeded',result=? WHERE job_id=? AND step_key=?").run(JSON.stringify(ref), jobId, key); }
   rejectStep(jobId: string, key: string): void { this.db.prepare("UPDATE steps SET state='rejected' WHERE job_id=? AND step_key=?").run(jobId, key); }
+  /** Reconciliation: discard the uncertain (started-but-unconfirmed) steps of a job so a retry re-runs
+   * them from scratch. Succeeded steps keep their receipts, so only the unconfirmed parts are redone. */
+  discardStartedSteps(jobId: string): number { return Number(this.db.prepare("UPDATE steps SET state='rejected' WHERE job_id=? AND state='started'").run(jobId).changes); }
   outbound(platform: SourcePlatform, id: string, text: string): 'known' | 'possible' | undefined {
     const rows = this.db.prepare('SELECT s.state,s.content,s.result FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.destination=?').all(platform);
     for (const row of rows) {

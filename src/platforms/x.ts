@@ -314,10 +314,12 @@ export class XCollector implements Collector {
         // A card link that is not a quoted tweet and not already in the text is the tweet's only URL;
         // append it so it survives the sync. (Quote cards are handled via quoteUrl, not here.)
         let bodyText = text;
-        if (cardHref && !/^https?:\/\//.test(cardHref.match(statusPath)?.[0] || '') && !text.includes(cardHref)) {
+        if (cardHref && !text.includes(cardHref)) {
           try {
+            // Skip the card only if it points at THIS tweet (a self sub-page); any other card is an
+            // external link worth keeping. A quoted tweet is a different id and handled via quoteUrl.
             const cardId = new URL(cardHref).pathname.match(statusPath)?.[1];
-            if (!cardId || cardId === own) { const stripped = cardHref; if (stripped && !text.includes(stripped)) bodyText = text ? `${text}\n${stripped}` : stripped; }
+            if (!cardId || cardId === own) bodyText = text ? `${text}\n${cardHref}` : cardHref;
           } catch { /* ignore malformed card href */ }
         }
         // Expand any t.co short link the DOM left in the text to its real destination before the
@@ -389,8 +391,8 @@ export async function loginInteractive(
     // Verify the session actually reads the target profile without hitting a login wall.
     const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
     await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-    const title = await page.title().catch(() => '');
-    const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+    // Authentication is decided solely by the presence of the logged-in account switcher; if the
+    // profile loaded behind a login/verification wall this control never appears.
     const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
     return { authenticated };
   } finally {
@@ -436,8 +438,8 @@ export async function installSession(config: AppConfig['x'], file: SessionFile):
       await route.continue();
     });
     await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-    const title = await page.title().catch(() => '');
-    const body = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+    // Authentication is decided solely by the presence of the logged-in account switcher; if the
+    // profile loaded behind a login/verification wall this control never appears.
     const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
     return { authenticated };
   } finally {

@@ -265,15 +265,29 @@ export class Engine {
     return { alreadyDelivered };
   }
 
-  action(action: 'skip' | 'mirror' | 'approve' | 'retry', id: string, now = new Date().toISOString()): void {
+  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile', id: string, now = new Date().toISOString()): void {
     // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
     // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
-    if (!['skip', 'mirror', 'approve', 'retry'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry');
+    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile');
     if (typeof id !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(id)) throw new Error('id must be a plain identifier');
     if (action === 'retry') {
       const job = this.store.getJob(id);
       if (!job || !['failed', 'review'].includes(job.state)) throw new Error('Only explicitly failed/review jobs can retry; unknown deliveries require reconciliation');
       this.store.updateJob(id, 'pending', undefined, now); return;
+    }
+    if (action === 'reconcile') {
+      // The owner has inspected the remote and confirmed the uncertain delivery left no usable post.
+      // Discard only the unconfirmed (started) steps — succeeded parts keep their receipts and are not
+      // resent — then re-queue so the worker re-runs just the unconfirmed parts. This is the deliberate
+      // manual escape hatch for `unknown` jobs, which are never auto-retried to avoid duplicate posts.
+      const job = this.store.getJob(id);
+      if (!job || job.state !== 'unknown') throw new Error('Only unknown deliveries can be reconciled; use retry for failed jobs');
+      this.store.transaction(() => {
+        this.store.discardStartedSteps(id);
+        this.store.updateJob(id, 'pending', undefined, now);
+        this.store.event('warn', 'Owner reconciled an unknown delivery; unconfirmed parts will be re-sent', id);
+      });
+      return;
     }
     const batch = this.store.getBatch(id);
     if (!batch) throw new Error('Batch not found');
@@ -378,11 +392,21 @@ export class Engine {
           output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl });
         }
       } else {
-        const chunks = splitText(text, job.destination === 'bluesky' ? { graphemes: 300, utf8Bytes: 3000 } : { utf16: 3000 });
-        chunks.forEach((chunk, index) => output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: chunk, images: index === 0 ? images : [], sourceUrl }));
+        // Sharkey renders MFM, so instead of a trailing reply carrying the X link (Bluesky's footer),
+        // an X-sourced note gets the configured attribution appended to its own body — a blank line then
+        // the signature, with `{url}` resolved to this post's source link. An empty signature disables it.
+        const signature = job.destination === 'sharkey' && sourceUrl && this.config.sharkey.signature
+          ? this.config.sharkey.signature.replaceAll('{url}', sourceUrl) : '';
+        // Reserve room for the signature (plus the blank line) inside the note limit so the last chunk still fits.
+        const utf16 = signature ? Math.max(1, 3000 - signature.length - 2) : 3000;
+        const chunks = splitText(text, job.destination === 'bluesky' ? { graphemes: 300, utf8Bytes: 3000 } : { utf16 });
+        chunks.forEach((chunk, index) => {
+          const body = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
+          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], sourceUrl });
+        });
       }
     }
-    if (batch?.platform === 'x' && job.destination !== 'telegram') {
+    if (batch?.platform === 'x' && job.destination !== 'telegram' && job.destination !== 'sharkey') {
       const root = members[0]!;
       const url = fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`);
       if (!url) throw new Error('X root URL invalid');

@@ -63,13 +63,6 @@ export function splitText(input: string, limits: TextLimits): string[] {
   return chunks;
 }
 
-export function buildLinkFacets(text: string): Array<{ index: { byteStart: number; byteEnd: number }; features: Array<{ $type: 'app.bsky.richtext.facet#link'; uri: string }> }> {
-  return Array.from(text.matchAll(urlPattern), match => ({
-    index: { byteStart: Buffer.byteLength(text.slice(0, match.index)), byteEnd: Buffer.byteLength(text.slice(0, match.index + match[0].length)) },
-    features: [{ $type: 'app.bsky.richtext.facet#link' as const, uri: match[0] }],
-  }));
-}
-
 export function htmlEscape(text: string): string {
   return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 }
