@@ -30,6 +30,12 @@ export const snapshotSchema = z.object({
 // downstream cannot block X→downstream publishing indefinitely. Never applied to X itself.
 const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
 
+// A text-only mirror match is only conclusive when the text is distinctive. A short generic phrase that
+// happens to equal a recent downstream post ("早安") is far more likely to be a coincidence than a
+// manual copy, and a wrong automatic match silently drops a post the owner meant to sync — so a shorter
+// match is routed to review, where the owner confirms or rejects it, instead of being auto-suppressed.
+const MIRROR_MATCH_MIN_TEXT_LENGTH = 20;
+
 // X's own post limit, measured the way X measures it: every URL counts as 23 characters (the t.co
 // length) and CJK counts double. The collector expands t.co links to their real destinations before a
 // post reaches the engine, so counting raw characters would flag a normal tweet as over-limit purely
@@ -114,7 +120,11 @@ export function decideMirror(posts: SourcePost[], candidates: ReturnType<Store['
     const expected = normalizeText(candidate.post.text);
     const textEqual = expected === text || expected === spaced;
     const mediaMatch = compatibleMedia(candidate.post.attachments, media);
-    const evidence = Boolean(expected) || (media.length > 0 && mediaMatch === 'same');
+    // Text alone is only evidence when it is distinctive; a media fingerprint is evidence on its own.
+    // A short text match leaves `evidence` false, which drops it into the `possible` check below and so
+    // reaches the owner as a review notice rather than being suppressed without a word.
+    const evidence = (Boolean(expected) && expected.length >= MIRROR_MATCH_MIN_TEXT_LENGTH)
+      || (media.length > 0 && mediaMatch === 'same');
     if (textEqual && mediaMatch === 'same' && evidence && !candidate.expired) { exact.push(candidate.id); continue; }
     const sameMediaHash = media.some(a => a.sha256 && candidate.post.attachments.some(b => b.sha256 === a.sha256));
     const shorter = Math.min(expected.length, spaced.length), longer = Math.max(expected.length, spaced.length);
@@ -203,8 +213,10 @@ export class Engine {
     const key = Store.postKey(post.platform, post.id);
     this.store.addPost(post, unsupported ? 'unsupported' : 'ready', unsupported || 'manual_x_reminder', now);
     this.store.addMirror(post, now);
-    if (!unsupported) this.store.enqueue('reminder', key, 'telegram', now);
-    else this.store.event('warn', `Native post held: ${unsupported}`, key);
+    if (unsupported) { this.store.event('warn', `Native post held: ${unsupported}`, key); return; }
+    // The reminder is only a notification; the post itself is already recorded as ready for a manual X
+    // post, so with no carrier for the notice there is nothing worth queueing.
+    if (this.canNotifyOwner()) this.store.enqueue('reminder', key, 'telegram', now);
   }
 
   private ingestX(post: SourcePost, now: string): void {
@@ -252,13 +264,26 @@ export class Engine {
   }
 
   /**
+   * Whether a reminder/ops notice actually has a carrier. Those jobs exist only to notify the owner
+   * over Telegram, so this mirrors what createRuntime wires: in live mode a real client (enabled with a
+   * token), in preview mode the stub publisher for any configured destination. Without a carrier the
+   * job could only ever fail, leaving a failed job and an error event behind for every native post —
+   * noise with nothing the owner could act on — so it is never enqueued.
+   */
+  private canNotifyOwner(): boolean {
+    return this.config.mode === 'live'
+      ? this.config.telegram.enabled && Boolean(this.config.telegram.token)
+      : this.config.destinations.includes('telegram');
+  }
+
+  /**
    * Announce a batch the engine parked in `review` on purpose, as one interactive Telegram notice.
    * `sealReady` only walks `open` batches, so a batch that went to `review` at ingest time would
    * otherwise never be reported: the owner would have to stumble on it in /pending or the Web UI while
    * the content silently never synced. `hasReviewNotice` keeps a batch from being announced twice.
    */
   private notifyHeldBatch(batchId: string, now: string): void {
-    if (!this.config.telegram.enabled || this.store.hasReviewNotice(batchId)) return;
+    if (!this.canNotifyOwner() || this.store.hasReviewNotice(batchId)) return;
     this.store.enqueue('ops', batchId, 'telegram', now);
   }
 
@@ -300,7 +325,7 @@ export class Engine {
           // An ambiguous (review) batch is a decision only the owner can make: surface it as one
           // interactive Telegram notice. hasReviewNotice guards against re-notifying the same batch
           // across cycles, and the ops job is enqueued only when Telegram is configured to deliver it.
-          if (mirror.state === 'review' && this.config.telegram.enabled && !this.store.hasReviewNotice(batch.id)) {
+          if (mirror.state === 'review' && this.canNotifyOwner() && !this.store.hasReviewNotice(batch.id)) {
             this.store.enqueue('ops', batch.id, 'telegram', now);
           }
         } else {
@@ -327,7 +352,9 @@ export class Engine {
       this.store.addPost(post, 'ready', 'local_scheduled', now, id);
       this.store.addMirror(post, now);
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now, due);
-      this.store.enqueue('reminder', id, 'telegram', now, due);
+      // Same as a native post: the reminder exists only to notify, so it is queued only when it can reach
+      // the owner. The scheduled post still publishes to every enabled destination either way.
+      if (this.canNotifyOwner()) this.store.enqueue('reminder', id, 'telegram', now, due);
     });
     return id;
   }

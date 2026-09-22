@@ -224,18 +224,26 @@ test('thread closure waits for a fresh scan of every downstream platform', () =>
   assert.equal(engine.sealReady(at(900)), 1);
 });
 
-test('media-only and ambiguous mirrors are held, unique matches are marked as mirror', () => {
+test('media-only and ambiguous mirrors are held, unique distinctive matches are marked as mirror', () => {
   const candidates = [{
     id: 'mirror:bluesky:at://1', state: 'pending', expired: false,
-    post: post({ id: 'at://1', platform: 'bluesky', createdAt: at(0), text: 'hello world' }),
+    post: post({ id: 'at://1', platform: 'bluesky', createdAt: at(0), text: 'a distinctive sentence that is long enough' }),
   }];
-  const exact = decideMirror([post({ id: '500', createdAt: at(10), text: 'hello world' })], candidates);
+  const exact = decideMirror([post({ id: '500', createdAt: at(10), text: 'a distinctive sentence that is long enough' })], candidates);
   assert.equal(exact.state, 'match');
+
+  // Identical, but too short to be conclusive: a coincidental collision ("早安") must not silently
+  // suppress a post the owner meant to sync, so it reaches the owner as a review notice instead.
+  const shortCandidates = [{
+    id: 'mirror:bluesky:at://3', state: 'pending', expired: false,
+    post: post({ id: 'at://3', platform: 'bluesky', createdAt: at(0), text: '早安' }),
+  }];
+  assert.equal(decideMirror([post({ id: '504', createdAt: at(10), text: '早安' })], shortCandidates).state, 'review');
 
   const noEvidence = decideMirror([post({ id: '501', createdAt: at(10), text: 'totally unrelated' })], candidates);
   assert.equal(noEvidence.state, 'none');
 
-  const partial = decideMirror([post({ id: '502', createdAt: at(10), text: 'hello world, edited a bit' })], candidates);
+  const partial = decideMirror([post({ id: '502', createdAt: at(10), text: 'a distinctive sentence that is long enough, edited a bit' })], candidates);
   assert.equal(partial.state, 'review');
 
   const mediaOnly = decideMirror([post({ id: '503', createdAt: at(10), text: '',
@@ -249,11 +257,14 @@ test('media-only and ambiguous mirrors are held, unique matches are marked as mi
 
 test('a batch matching a pending mirror is suppressed and never publishes', () => {
   const { store, engine } = setup();
-  const native = post({ id: 'at://did:plc:x/1', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'cross post me' });
+  // The text must be distinctive: a short identical string is deliberately routed to review instead
+  // (see the decideMirror cases), so an auto-suppressed mirror is a long, unmistakable one.
+  const body = 'cross post me, this is a long enough sentence';
+  const native = post({ id: 'at://did:plc:x/1', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: body });
   engine.ingest(snapshot([native], at(10), 'bluesky', 'bluesky-account'), at(10));
   assert.equal(store.jobs(100).filter(j => j.kind === 'reminder').length, 1, 'a native root produces a manual X reminder');
 
-  engine.ingest(snapshot([post({ id: '600', createdAt: at(10), text: 'cross post me' })], at(650)), at(650));
+  engine.ingest(snapshot([post({ id: '600', createdAt: at(10), text: body })], at(650)), at(650));
   for (const source of ['bluesky', 'sharkey'] as const) engine.ingest(snapshot([], at(700), source, `${source}-account`), at(700));
   engine.sealReady(at(900));
   assert.equal(store.getBatch('x:600')?.state, 'mirror');
@@ -531,6 +542,62 @@ test('a hard content hold is announced but offers no publish button', async () =
   assert.match(notice.text, /無法自動同步/);
   // Even if the verb is called directly, a poll cannot be force-published.
   assert.throws(() => engine.action('approve', 'x:990'), /cannot be force-published/i);
+});
+
+test('a short coincidental text match asks the owner instead of silently swallowing the post', async () => {
+  const config = loadConfig({
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')),
+    DESTINATIONS: 'bluesky,telegram',
+    BLUESKY_ENABLED: 'true', TELEGRAM_ENABLED: 'true', TELEGRAM_BOT_TOKEN: 't', TELEGRAM_OWNER_ID: '1',
+    X_ENABLED: 'true', X_HANDLE: 'owner',
+  });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, config, transport);
+  engine.ingest(snapshot([], at(-1000)), at(-1000));
+  engine.ingest(snapshot([], at(0), 'bluesky', 'bluesky-account'), at(0));
+
+  // A downstream post leaves a pending candidate. The owner then posts a brand-new tweet that happens
+  // to read exactly the same: within the candidate's 72h window an identical short string used to be
+  // treated as a manual mirror, closing the batch in silence and dropping the new post.
+  const native = post({ id: 'at://did:plc:x/88', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: '早安' });
+  engine.ingest(snapshot([native], at(10), 'bluesky', 'bluesky-account'), at(10));
+  engine.ingest(snapshot([post({ id: '999', createdAt: at(10), text: '早安' })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'bluesky', 'bluesky-account'), at(700));
+
+  assert.equal(engine.sealReady(at(900)), 0);
+  assert.equal(store.getBatch('x:999')?.state, 'review', 'a short coincidental match is not auto-suppressed');
+  assert.equal(store.getPost('x', '999')?.reason, 'possible_manual_mirror');
+  const ops = store.jobs(100).filter(j => j.kind === 'ops');
+  assert.equal(ops.length, 1, 'the owner is asked rather than left in the dark');
+  assert.match((await engine.parts(ops[0]!))[0]!.text, /需要你決定/);
+});
+
+test('a reminder is not queued when Telegram has no way to deliver it', () => {
+  // Live mode with Telegram off: createRuntime wires no Telegram publisher, so the job could only fail.
+  const liveOff = loadConfig({
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')),
+    APP_MODE: 'live', DESTINATIONS: 'bluesky', BLUESKY_ENABLED: 'true', X_ENABLED: 'true', X_HANDLE: 'owner',
+  });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, liveOff, transport);
+  engine.ingest(snapshot([], at(-1000)), at(-1000));
+  engine.ingest(snapshot([], at(0), 'bluesky', 'bluesky-account'), at(0));
+  const native = post({ id: 'at://did:plc:x/77', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'native post body' });
+  engine.ingest(snapshot([native], at(10), 'bluesky', 'bluesky-account'), at(10));
+  assert.equal(store.getPost('bluesky', 'at://did:plc:x/77')?.classification, 'ready', 'the post is still recorded for a manual X post');
+  assert.equal(store.jobs(100).filter(j => j.kind === 'reminder').length, 0, 'no undeliverable reminder is queued');
+  assert.equal(store.events(20).filter(e => e.level === 'error').length, 0, 'and nothing is left to fail later');
+
+  // A scheduled post behaves the same way: it publishes, but no reminder is queued.
+  const id = engine.schedule({ text: 'scheduled body', dueAt: at(3600) }, at(0));
+  assert.equal(store.jobs(100).filter(j => j.kind === 'reminder').length, 0);
+  assert.deepEqual(store.jobs(100).filter(j => j.kind === 'publish' && j.aggregateId === id).map(j => j.destination), ['bluesky']);
+
+  // Preview mode with telegram among the destinations still queues it: the stub publisher delivers it.
+  const { store: previewStore, engine: previewEngine } = setup(['bluesky', 'telegram']);
+  const previewNative = post({ id: 'at://did:plc:x/78', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'native post body' });
+  previewEngine.ingest(snapshot([previewNative], at(10), 'bluesky', 'bluesky-account'), at(10));
+  assert.equal(previewStore.jobs(100).filter(j => j.kind === 'reminder').length, 1);
 });
 
 test('a repeatedly failing downstream collector degrades seal freshness instead of blocking forever', () => {
