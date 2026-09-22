@@ -147,6 +147,16 @@ test('a destination without its own source observation is refused at configurati
   assert.doesNotThrow(() => loadConfig({ DESTINATIONS: 'telegram' }));
 });
 
+test('an unsafe SHARKEY_UPLOAD_NAME template is rejected at configuration time', () => {
+  const sharkey = { DESTINATIONS: 'sharkey', SHARKEY_ENABLED: 'true', SHARKEY_URL: 'https://sharkey.example', SHARKEY_USERNAME: 'owner' };
+  // A template with a path separator or spaces cannot yield a safe drive filename.
+  assert.throws(() => loadConfig({ ...sharkey, SHARKEY_UPLOAD_NAME: 'a/b-{index}.{ext}' }), /SHARKEY_UPLOAD_NAME/);
+  assert.throws(() => loadConfig({ ...sharkey, SHARKEY_UPLOAD_NAME: 'my file {index}.{ext}' }), /SHARKEY_UPLOAD_NAME/);
+  // The default template and a plain custom one both resolve to safe names.
+  assert.equal(loadConfig({ ...sharkey }).sharkey.uploadName, 'Wherry_{timestamp}-{index}.{ext}');
+  assert.doesNotThrow(() => loadConfig({ ...sharkey, SHARKEY_UPLOAD_NAME: 'photo-{index}.{ext}' }));
+});
+
 test('a root opens a collecting batch and nothing publishes before it settles', () => {
   const { store, engine } = setup();
   engine.ingest(snapshot([post({ id: '100', createdAt: at(10) })], at(20)), at(20));

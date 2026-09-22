@@ -10,7 +10,7 @@ const bool = (value: string | undefined, fallback: boolean): boolean => value ==
 // second link points at the project repo. Override with SHARKEY_SIGNATURE — set it to an empty
 // string to publish Sharkey notes with no attribution at all (like clearing an email signature).
 export const DEFAULT_SHARKEY_SIGNATURE =
-  '<center><small>$[sparkle $[blur 這是從 X 來的推文，[點擊此處]({url})前往原文，[點擊此處](https://github.com/TW527E/Twitter-Sharkey-Bluesky)前往項目倉庫]]</small></center>';
+  '<center><small>$[sparkle $[blur 這是從 X 來的推文，[點擊此處]({url})前往原文，[點擊此處](https://github.com/TW527E/Wherry)前往項目倉庫]]</small></center>';
 const integer = (value: string | undefined, fallback: number, min: number, max: number): number => {
   const n = value === undefined ? fallback : Number(value);
   return z.number().int().min(min).max(max).parse(n);
@@ -34,7 +34,7 @@ export interface AppConfig {
   x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string; sandbox: boolean };
   media: { video: boolean; ffmpegPath: string; ffprobePath: string };
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
-  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string; driveFolder: string };
+  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string; driveFolder: string; uploadName: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
 }
 
@@ -89,6 +89,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // (or all-whitespace) uploads to the drive root, while leaving it unset keeps the default folder.
       // The folder is looked up by name at the drive root and created on first use (needs read+write:drive).
       driveFolder: (env.SHARKEY_DRIVE_FOLDER ?? 'Wherry').trim(),
+      // Filename template for uploaded Drive files. Placeholders: {timestamp} (compact UTC, e.g.
+      // 20260921T153000Z), {index} (0-based position within the note) and {ext} (png/jpg/mp4).
+      // Only letters, digits, `_`, `.` and `-` are allowed once the placeholders are filled.
+      uploadName: (env.SHARKEY_UPLOAD_NAME ?? 'Wherry_{timestamp}-{index}.{ext}').trim(),
     },
     telegram: {
       enabled: bool(env.TELEGRAM_ENABLED, false), token: env.TELEGRAM_BOT_TOKEN || '',
@@ -105,6 +109,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   for (const destination of config.destinations) {
     if (destination === 'bluesky' && !config.bluesky.enabled) throw new Error('DESTINATIONS includes bluesky, so BLUESKY_ENABLED must also be true (mirror detection requires observing that account)');
     if (destination === 'sharkey' && !config.sharkey.enabled) throw new Error('DESTINATIONS includes sharkey, so SHARKEY_ENABLED must also be true (mirror detection requires observing that account)');
+  }
+  // The template must yield a filesystem-safe name. Fill the placeholders with representative values
+  // and check the result up front, so a bad SHARKEY_UPLOAD_NAME fails at startup, not mid-publish.
+  if (config.sharkey.enabled) {
+    const sample = config.sharkey.uploadName.replace('{timestamp}', '20260921T153000Z').replace('{index}', '0').replace('{ext}', 'jpg');
+    if (!sample || !/^[A-Za-z0-9_.-]+$/.test(sample)) {
+      throw new Error('SHARKEY_UPLOAD_NAME must resolve to a name using only letters, digits, _, . and - (allowed placeholders: {timestamp}, {index}, {ext})');
+    }
   }
   if (config.x.enabled && !/^[A-Za-z0-9_]{1,15}$/.test(config.x.handle)) throw new Error('Set a valid X_HANDLE before enabling X');
   if (!(BROWSER_CHOICES as readonly string[]).includes(config.x.browser)) {

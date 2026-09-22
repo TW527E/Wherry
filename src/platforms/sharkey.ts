@@ -168,6 +168,18 @@ export class SharkeyClient implements Publisher, Collector {
   }
 
   /**
+   * Build the Drive filename from the configured template. A per-publish timestamp keeps every file
+   * in one note grouped, while {index} keeps them distinct. The result is validated at config load,
+   * and multipart() re-checks it, so an unsafe name can never reach the wire.
+   */
+  private uploadFilename(index: number, ext: string, stamp: string): string {
+    return this.config.uploadName
+      .replaceAll('{timestamp}', stamp)
+      .replaceAll('{index}', String(index))
+      .replaceAll('{ext}', ext);
+  }
+
+  /**
    * Resolve the configured Drive folder to an id, uploading media into it instead of the root.
    * The folder is matched by exact name among the account's top-level folders and created on first
    * use if absent (needs read:drive + write:drive). An empty configured name resolves to null =
@@ -248,10 +260,12 @@ export class SharkeyClient implements Publisher, Collector {
     const fileIds: string[] = [];
     const sensitive = part.cw !== undefined && part.cw.length > 0;
     const folderId = (part.images.length || part.video) ? await this.resolveFolder() : null;
+    const uploadStamp = this.now().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
     for (let index = 0; index < part.images.length; index++) {
       const image = part.images[index]!;
+      const filename = this.uploadFilename(index, image.mimeType === 'image/png' ? 'png' : 'jpg', uploadStamp);
       const form = multipart({ i: this.config.token, comment: image.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
-        { field: 'file', filename: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, mimeType: image.mimeType, bytes: image.bytes },
+        { field: 'file', filename, mimeType: image.mimeType, bytes: image.bytes },
       ]);
       // Uploading a drive file is a PRE-publish step, not the publish itself: the note is only created
       // after every image succeeds. A failed/uncertain upload therefore cannot leave a visible duplicate
@@ -271,8 +285,9 @@ export class SharkeyClient implements Publisher, Collector {
       // Same pre-publish drive upload as images: a failed/uncertain upload can only leave an orphaned
       // file, never a visible duplicate, so it is a plain transient (mutation=false), not an uncertain mutation.
       const bytes = await readFile(part.video.path);
+      const filename = this.uploadFilename(0, 'mp4', uploadStamp);
       const form = multipart({ i: this.config.token, comment: part.video.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
-        { field: 'file', filename: 'crosspost.mp4', mimeType: part.video.mimeType, bytes },
+        { field: 'file', filename, mimeType: part.video.mimeType, bytes },
       ]);
       const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,
         { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey video upload', false));

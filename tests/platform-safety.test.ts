@@ -127,9 +127,9 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
   };
   const config = {
     enabled: true, baseUrl: 'https://sharkey.example', token: 'tok', userId: 'user1', username: 'owner',
-    signature: '', driveFolder: 'Wherry',
+    signature: '', driveFolder: 'Wherry', uploadName: 'Wherry_{timestamp}-{index}.{ext}',
   };
-  const client = new SharkeyClient(config, transport);
+  const client = new SharkeyClient(config, transport, { now: () => new Date('2026-09-21T15:30:00.000Z') });
   const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
   const ref = await client.publish(
     { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9' },
@@ -139,6 +139,7 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
   const upload = calls.find(c => c.method === 'drive/files/create');
   assert.ok(upload, 'the image is uploaded to the drive');
   assert.match(upload!.body, /name="folderId"\r\n\r\nfolder1/, 'the upload carries the resolved folder id');
+  assert.match(upload!.body, /filename="Wherry_20260921T153000Z-0\.jpg"/, 'the filename follows the configured template');
 
   // A second publish on the same client reuses the cached folder id — no second find/create.
   await client.publish(
@@ -170,7 +171,7 @@ test('an empty SHARKEY_DRIVE_FOLDER uploads to the drive root with no folder loo
   };
   const config = {
     enabled: true, baseUrl: 'https://sharkey.example', token: 'tok', userId: 'user1', username: 'owner',
-    signature: '', driveFolder: '',
+    signature: '', driveFolder: '', uploadName: 'Wherry_{timestamp}-{index}.{ext}',
   };
   const client = new SharkeyClient(config, transport);
   const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
