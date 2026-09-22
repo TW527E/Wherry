@@ -18,7 +18,7 @@ Usage:
   crosspost-bridge scan                  Collect sources only (never publishes)
   crosspost-bridge publish <batchId>     Enqueue downstream publication for a sealed batch
   crosspost-bridge schedule <iso> <text> Create a local scheduled post (no X write)
-  crosspost-bridge action <verb> <id>    skip | approve | mirror | retry
+  crosspost-bridge action <verb> <id>    skip | approve | mirror | retry | reconcile
   crosspost-bridge doctor                Validate configuration and report capabilities
   crosspost-bridge login                 Open a visible browser to log into X once (saves the session)
   crosspost-bridge export-session        Export the X login to X_SESSION_FILE (default: data/x-session.json)
@@ -41,7 +41,10 @@ async function main(): Promise<number> {
         console.log(`crosspost-bridge listening on http://${config.host}:${config.port} (mode=${config.mode})`);
         if (config.mode !== 'live') console.log('preview mode: no remote publication is performed');
         runtime.start();
-        void runtime.once();
+        // Kick one cycle at startup without blocking the serve loop. runCycle already swallows its own
+        // errors into an event, but attach a catch here too so this fire-and-forget can never surface as
+        // an unhandledRejection if that internal guard ever changes.
+        void runtime.once().catch(error => runtime.store.event('error', `Startup cycle failed: ${safeError(error)}`));
         await new Promise<void>(resolve => {
           const shutdown = (): void => resolve();
           process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
@@ -72,9 +75,9 @@ async function main(): Promise<number> {
         return 0;
       }
       case 'action': {
-        const verb = argv[1] as 'skip' | 'mirror' | 'approve' | 'retry' | undefined;
+        const verb = argv[1] as 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | undefined;
         const id = argv[2];
-        if (!verb || !id || !['skip', 'mirror', 'approve', 'retry'].includes(verb)) throw new Error('action requires one of skip|mirror|approve|retry and an id');
+        if (!verb || !id || !['skip', 'mirror', 'approve', 'retry', 'reconcile'].includes(verb)) throw new Error('action requires one of skip|mirror|approve|retry|reconcile and an id');
         runtime.engine.action(verb, id);
         console.log(`applied ${verb} to ${id}`);
         return 0;

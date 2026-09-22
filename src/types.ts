@@ -87,6 +87,12 @@ export interface PublishPart {
   text: string;
   cw?: string;
   images: PreparedImage[];
+  /**
+   * A single transcoded video, mutually exclusive with images (X and Bluesky both forbid mixing).
+   * Only ever set on the first part, and only when VIDEO_ENABLED and a downloadable source exists —
+   * X's HLS/blob video has no direct URL, so those posts are held rather than reaching here.
+   */
+  video?: PreparedVideo;
   sourceUrl?: string;
   isFooter?: boolean;
   /** Inline keyboard, one row of buttons, attached only by Telegram (e.g. the interactive reminder). */

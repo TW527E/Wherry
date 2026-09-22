@@ -7,7 +7,7 @@ import { Engine, Worker, collectCycle, safeError } from './engine.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
 import { TelegramClient, type TelegramUpdateMessage } from './platforms/telegram.js';
-import { extractXStatus, handleCallback, handleReminderReply, TelegramNotifications } from './telegram-notifications.js';
+import { extractXStatus, handleCallback, handleReminderReply, handleReviewReply, TelegramNotifications } from './telegram-notifications.js';
 import { SerialWork } from './lifecycle.js';
 import { XCollector, installSession } from './platforms/x.js';
 import { parseSessionFile, MAX_SESSION_BYTES } from './platforms/session.js';
@@ -75,7 +75,7 @@ export function createRuntime(config = loadConfig()): Runtime {
   // safety rests on SQLite transactions + atomic claimJob + batch-state checks, not on ordering.
   const heavy = new SerialWork();
   const control = new SerialWork();
-  const notifications = telegram ? new TelegramNotifications({ config, engine, telegram, store }) : undefined;
+  const notifications = telegram ? new TelegramNotifications({ config, engine, telegram, store, worker }) : undefined;
   const timers: NodeJS.Timeout[] = [];
   // Aborted on stop() so an in-flight collection scroll ends promptly instead of running out its
   // whole page budget (× reload + sleeps) while shutdown waits on it.
@@ -108,7 +108,7 @@ export function createRuntime(config = loadConfig()): Runtime {
         if (stopped) break;
         try {
           if (update.callback_query) {
-            await control.run(() => handleCallback(update.callback_query!, { config, engine, telegram, store }));
+            await control.run(() => handleCallback(update.callback_query!, { config, engine, telegram, store, worker }));
           } else {
             const message = update.message;
             if (!message || message.chat.type !== 'private' || String(message.chat.id) !== config.telegram.privateChatId || String(message.from?.id ?? '') !== config.telegram.ownerId) continue;
@@ -142,7 +142,8 @@ export function createRuntime(config = loadConfig()): Runtime {
               continue;
             }
             await control.run(async () => {
-              if (await handleReminderReply(message, { config, engine, telegram, store })) return;
+              if (await handleReviewReply(message, { config, engine, telegram, store, worker })) return;
+              if (await handleReminderReply(message, { config, engine, telegram, store, worker })) return;
               await handleCommand(text, { engine, telegram, store, worker });
             });
           }

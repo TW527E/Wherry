@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
-import type { Attachment, Collector, HttpOptions, PublishContext, Publisher, PublishPart, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import type { Attachment, Collector, HttpOptions, PreparedVideo, PublishContext, Publisher, PublishPart, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import {
   PlatformError, canonicalJson, httpsBase, isoDate, jsonBody, nonempty, object, own,
   positiveInteger, requestJson, schemaError, uncertainError, validateImage, warning, webUrl,
@@ -22,7 +23,13 @@ interface PostUri { did: string; key: string }
 interface ParsedPost { post?: SourcePost; valid: boolean }
 
 const collection = 'app.bsky.feed.post';
+// Bluesky routes video through a separate async service (never inline uploadBlob): a scoped service
+// auth token, an upload that returns a job, then polling until the blob is ready. Fixed public host,
+// so the SSRF-guarded transport still governs the request.
+const videoServiceDid = 'did:web:video.bsky.app';
+const videoServiceUrl = 'https://video.bsky.app';
 const segmenter = new Intl.Segmenter('und', { granularity: 'grapheme' });
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 const didValid = (value: unknown): value is string => typeof value === 'string' &&
   (/^did:plc:[a-z2-7]{24}$/.test(value) || /^did:web:[^\s/?#]+$/.test(value));
 /** Non-narrowing form for values already known to be strings. */
@@ -362,12 +369,59 @@ export class BlueskyClient implements Publisher, Collector {
     }
   }
 
+  /**
+   * Upload a video through Bluesky's async video service and return its blob. Flow: mint a service
+   * auth token scoped to the video service, POST the bytes (which starts a processing job), then poll
+   * the job until the blob is ready. Pre-publish like uploadBlob — an uncertain failure can only
+   * orphan a job/blob, never create a visible post — so it stays a plain transient (mutation=false),
+   * leaving the record create afterwards as the one idempotent mutation.
+   *
+   * This path only runs against the live video service (video.bsky.app); there is no offline fixture,
+   * so it needs real-account verification.
+   */
+  private async uploadVideoBlob(video: PreparedVideo, did: string): Promise<JsonObject> {
+    const exp = Math.floor(this.now().getTime() / 1000) + 30 * 60;
+    const auth = object(await this.authenticated(
+      `com.atproto.server.getServiceAuth?${new URLSearchParams({ aud: videoServiceDid, lxm: 'app.bsky.video.uploadVideo', exp: String(exp) })}`,
+      { method: 'GET', maxBytes: 64_000 }, 'Bluesky video service auth', false));
+    if (!nonempty(auth?.token)) throw schemaError('Bluesky video service auth', false);
+    const serviceToken = auth.token as string;
+    const bytes = await readFile(video.path);
+    const uploadUrl = `${videoServiceUrl}/xrpc/app.bsky.video.uploadVideo?${new URLSearchParams({ did, name: `${video.sha256}.mp4` })}`;
+    const started = object(await requestJson(this.transport, uploadUrl,
+      { method: 'POST', headers: { authorization: `Bearer ${serviceToken}`, 'content-type': video.mimeType }, body: bytes, maxBytes: 64_000 },
+      'Bluesky video upload', false));
+    const startStatus = object(started?.jobStatus) ?? started;
+    const readyNow = blob(startStatus?.blob);
+    if (readyNow) return readyNow;
+    const jobId = nonempty(startStatus?.jobId) ? startStatus.jobId as string : undefined;
+    if (!jobId) throw schemaError('Bluesky video upload', false);
+    // Poll the job until the blob is ready. Bounded (~3 min) so a stuck job fails as a retryable
+    // transient rather than hanging the worker step.
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await sleep(3000);
+      const result = object(await requestJson(this.transport,
+        `${videoServiceUrl}/xrpc/app.bsky.video.getJobStatus?${new URLSearchParams({ jobId })}`,
+        { method: 'GET', headers: { authorization: `Bearer ${serviceToken}` }, maxBytes: 64_000 }, 'Bluesky video job status', false));
+      const status = object(result?.jobStatus);
+      const state = String(status?.state ?? '');
+      if (state === 'JOB_STATE_COMPLETED') {
+        const ready = blob(status?.blob);
+        if (!ready) throw schemaError('Bluesky video job status', false);
+        return ready;
+      }
+      if (state === 'JOB_STATE_FAILED') throw new PlatformError(`Bluesky video processing failed: ${String(status?.error ?? status?.message ?? 'unknown')}`, { code: 'VideoProcessingFailed' });
+    }
+    throw new PlatformError('Bluesky video processing did not finish in time; retry later', { code: 'VideoTimedOut', status: 504 });
+  }
+
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     const key = blueskyRecordKey(context.idempotencyKey);
+    if (part.video && part.images.length) throw new PlatformError('A Bluesky post cannot carry both a video and images', { code: 'MixedMedia' });
     if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Bluesky accepts at most four images per part', { code: 'TooManyImages' });
     for (const image of part.images) validateImage(image, 2_000_000);
     const text = part.cw ? `CW: ${part.cw}\n\n${part.text}` : part.text;
-    if (typeof text !== 'string' || (!text.trim() && !part.images.length)) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
+    if (typeof text !== 'string' || (!text.trim() && !part.images.length && !part.video)) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
     if (Buffer.byteLength(text) > 3000 || Array.from(segmenter.segment(text)).length > 300) throw new PlatformError('Split Bluesky parts before publishing (300 graphemes / 3000 UTF-8 bytes)', { code: 'TextTooLong' });
     let reply: { root: StrongRef; parent: StrongRef } | undefined;
     if (context.parent) {
@@ -391,10 +445,14 @@ export class BlueskyClient implements Publisher, Collector {
       if (!uploaded || uploaded.mimeType !== image.mimeType || uploaded.size !== image.bytes.length) throw schemaError('Bluesky image upload', false);
       images.push({ alt: image.alt, image: uploaded, aspectRatio: { width: image.width, height: image.height } });
     }
+    const videoBlob = part.video ? await this.uploadVideoBlob(part.video, session.did) : undefined;
     const facets = blueskyLinkFacets(text);
+    const embed = videoBlob
+      ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: part.video!.width, height: part.video!.height }, ...(part.video!.alt ? { alt: part.video!.alt } : {}) }
+      : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;
     const record: JsonObject = { $type: collection, text, createdAt: this.now().toISOString(),
       ...(facets.length ? { facets } : {}), ...(reply ? { reply } : {}),
-      ...(images.length ? { embed: { $type: 'app.bsky.embed.images', images } } : {}) };
+      ...(embed ? { embed } : {}) };
     const expectedUri = `at://${session.did}/${collection}/${key}`;
     try {
       const result = object(await this.authenticated('com.atproto.repo.createRecord',

@@ -4,6 +4,7 @@ import type { AppConfig } from './config.js';
 import { Store } from './store.js';
 import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
 import { prepareImages } from './media.js';
+import { prepareVideo } from './video.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from './types.js';
 
 const attachmentSchema = z.object({
@@ -23,13 +24,28 @@ export const snapshotSchema = z.object({
   fetchedAt: z.string().datetime(), complete: z.boolean(), watermark: z.string().datetime().optional(), warnings: z.array(z.string()),
 });
 
-export function unsupportedReason(post: SourcePost): string | undefined {
+// After this many consecutive failed collections, a downstream mirror source's seal-freshness gate is
+// downgraded from "seen within sourceFreshnessSeconds" to "ever seen", so a temporarily unreachable
+// downstream cannot block X→downstream publishing indefinitely. Never applied to X itself.
+const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
+
+export function unsupportedReason(post: SourcePost, videoEnabled = false): string | undefined {
   if (!post.metadataComplete) return 'incomplete_metadata';
   if (post.visibility !== 'public') return 'non_public_content';
   if (post.sensitive || post.cw) return 'sensitive_content_requires_manual_review';
   if (post.poll) return 'poll_not_supported';
   if (post.attachments.length > 4) return 'more_than_four_images';
-  if (post.attachments.some(a => a.kind !== 'image' || a.animated)) return 'only_static_images_in_phase_one';
+  const video = post.attachments.find(a => a.kind === 'video');
+  if (video) {
+    // A single video only, never mixed with images, and only when the operator opted in. An X video is
+    // an HLS stream behind a blob: URL with no direct download, so the collector records it with neither
+    // url nor path; such a post is held with a clear reason instead of being force-published text-only.
+    if (!videoEnabled) return 'video_sync_disabled';
+    if (post.attachments.length > 1) return 'video_must_be_the_only_attachment';
+    if (!video.url && !video.path) return 'x_video_has_no_downloadable_source';
+  } else if (post.attachments.some(a => a.kind !== 'image' || a.animated)) {
+    return 'only_static_images_or_video';
+  }
   if (post.platform === 'x' && graphemes(post.text).length > 280) return 'long_x_post_requires_manual_review';
   if (!post.text.trim() && !post.attachments.length) return 'empty_content';
   return undefined;
@@ -144,7 +160,7 @@ export class Engine {
     if (post.replyToId !== null || post.repost || post.quoteUrl || post.visibility !== 'public') {
       this.store.addPost(post, 'ignored', 'ignored_native_non_root_or_private', now); return;
     }
-    const unsupported = unsupportedReason(post);
+    const unsupported = unsupportedReason(post, this.config.media.video);
     const key = Store.postKey(post.platform, post.id);
     this.store.addPost(post, unsupported ? 'unsupported' : 'ready', unsupported || 'manual_x_reminder', now);
     this.store.addMirror(post, now);
@@ -160,7 +176,7 @@ export class Engine {
     if (this.store.mirrorMatchesXId(post.id)) { this.store.addPost(post, 'ignored', 'manual_mirror_registered', now); return; }
     if (post.replyToId === null) {
       const id = `x:${post.id}`;
-      const unsupported = unsupportedReason(post);
+      const unsupported = unsupportedReason(post, this.config.media.video);
       this.store.addBatch({ id, platform: 'x', rootId: post.id, rootCreatedAt: post.createdAt,
         cutoffAt: new Date(Date.parse(post.createdAt) + this.config.threadWindowSeconds * 1000).toISOString(),
         settleAt: new Date(Math.max(Date.parse(post.createdAt) + this.config.threadWindowSeconds * 1000, Date.parse(now)) + this.config.settleSeconds * 1000).toISOString(),
@@ -183,7 +199,7 @@ export class Engine {
       this.store.addPost(post, 'mirror_review', 'branch_in_thread', now, batch.id);
       this.store.updateBatch(batch.id, 'review', 'thread_is_not_linear'); return;
     }
-    const unsupported = unsupportedReason(post);
+    const unsupported = unsupportedReason(post, this.config.media.video);
     this.store.addPost(post, unsupported ? 'unsupported' : 'collecting', unsupported || 'initial_self_thread', now, batch.id);
     if (unsupported) this.store.updateBatch(batch.id, 'review', unsupported);
   }
@@ -196,11 +212,25 @@ export class Engine {
       const sources: Array<'x' | 'bluesky' | 'sharkey'> = batch.platform === 'x' ? ['x'] : [];
       if (this.config.destinations.includes('bluesky')) sources.push('bluesky');
       if (this.config.destinations.includes('sharkey')) sources.push('sharkey');
-      if (sources.some(source => {
+      const degradedStale: string[] = [];
+      const blocked = sources.some(source => {
         const fresh = this.store.setting<string>(`fresh:${source}`, '');
-        return !fresh || Date.parse(now) - Date.parse(fresh) > this.config.sourceFreshnessSeconds * 1000
-          || (source === 'x' && fresh < batch.cutoffAt);
-      })) continue;
+        if (!fresh) return true;                                    // never observed at all — always blocks
+        const stale = Date.parse(now) - Date.parse(fresh) > this.config.sourceFreshnessSeconds * 1000;
+        // X freshness is never relaxed: without a current scan of the source itself we cannot know the
+        // thread, so a stale or pre-cutoff X watermark always blocks.
+        if (source === 'x') return stale || fresh < batch.cutoffAt;
+        if (!stale) return false;
+        // A downstream that has repeatedly failed to collect has its freshness downgraded from "seen
+        // recently" to "ever seen": a temporarily unreachable mirror source (e.g. a Cloudflare 522 on
+        // Sharkey, which is both a destination and a collected source) must not block X→downstream sync
+        // forever. Anti-echo still runs against the last observed mirror data; the counter resets to 0
+        // on the next successful collect, restoring the strict freshness gate.
+        if (this.store.setting<number>(`collect_failures:${source}`, 0) >= DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES) { degradedStale.push(source); return false; }
+        return true;
+      });
+      if (blocked) continue;
+      if (degradedStale.length) this.store.event('warn', `Sealing ${batch.id} with stale downstream mirror data (${degradedStale.join(', ')} unreachable); manual-mirror detection may be incomplete`, batch.id);
       const posts = this.store.batchPosts(batch.id).map(p => p.post);
       const mirror = batch.platform === 'x' ? decideMirror(posts, this.store.mirrors(now)) : { state: 'none', reason: 'local_schedule' } as MirrorDecision;
       this.store.transaction(() => {
@@ -209,6 +239,12 @@ export class Engine {
           for (const post of posts) this.store.updatePost(Store.postKey(post.platform, post.id), mirror.state === 'match' ? 'manual_mirror' : 'mirror_review', mirror.reason);
           if (mirror.mirrorId) this.store.matchMirror(mirror.mirrorId, batch.rootId);
           this.store.event('warn', `X batch held: ${mirror.reason}`, batch.id);
+          // An ambiguous (review) batch is a decision only the owner can make: surface it as one
+          // interactive Telegram notice. hasReviewNotice guards against re-notifying the same batch
+          // across cycles, and the ops job is enqueued only when Telegram is configured to deliver it.
+          if (mirror.state === 'review' && this.config.telegram.enabled && !this.store.hasReviewNotice(batch.id)) {
+            this.store.enqueue('ops', batch.id, 'telegram', now);
+          }
         } else {
           this.store.updateBatch(batch.id, 'sealed', 'thread_closed');
           for (const post of posts) this.store.updatePost(Store.postKey(post.platform, post.id), 'ready', 'thread_closed');
@@ -225,7 +261,7 @@ export class Engine {
     if (due < now) throw new Error('Schedule must be in the future');
     const post = sourcePostSchema.parse({ platform: 'local', id: randomUUID(), authorId: 'owner', text: input.text,
       createdAt: now, replyToId: null, relationKnown: true, visibility: 'public', attachments: input.attachments || [], metadataComplete: true }) as SourcePost;
-    const unsupported = unsupportedReason(post);
+    const unsupported = unsupportedReason(post, this.config.media.video);
     if (unsupported) throw new Error(unsupported);
     const id = Store.postKey('local', post.id);
     this.store.transaction(() => {
@@ -296,7 +332,7 @@ export class Engine {
     if (action === 'approve') {
       if (!['open', 'review', 'sealed'].includes(batch.state)) throw new Error('Only open/review/sealed batches can be approved');
       const members = this.store.batchPosts(id);
-      if (members.some(m => unsupportedReason(m.post))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
+      if (members.some(m => unsupportedReason(m.post, this.config.media.video))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
       if (members.some(m => !m.post.relationKnown)) throw new Error('Unknown reply relationship cannot be force-published');
       this.store.updateBatch(id, 'sealed', 'owner_confirmed_new_content');
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now);
@@ -320,6 +356,32 @@ export class Engine {
   }
 
   /**
+   * Confirm a held X batch as the owner's manual mirror of one or more downstream posts. The owner's
+   * reply carries mirror code(s) (the candidate ids the notice listed); each valid code is linked to
+   * this batch's X root so reverse sync is blocked, the batch is closed as a mirror, and any pending
+   * echo jobs are cancelled. Returns how many codes matched: zero means the reply carried no usable
+   * code, so the caller re-prompts instead of silently closing the batch.
+   */
+  confirmReviewMirror(batchId: string, replyText: string, now = new Date().toISOString()): { matched: number } {
+    const batch = this.store.getBatch(batchId);
+    if (!batch || batch.platform !== 'x') throw new Error('Review batch not found');
+    if (!['review', 'open'].includes(batch.state)) throw new Error('This batch is no longer awaiting a decision');
+    const codes = [...new Set((replyText.match(/mirror:[^\s]+/gu) ?? []).map(code => code.replace(/[).,!?;、，。]+$/u, '')))]
+      .filter(code => this.store.getMirror(code, now));
+    if (!codes.length) return { matched: 0 };
+    this.store.transaction(() => {
+      for (const code of codes) this.store.matchMirror(code, batch.rootId);
+      this.store.updateBatch(batchId, 'mirror', 'manual_mirror_registered');
+      for (const member of this.store.batchPosts(batchId)) this.store.updatePost(member.key, 'manual_mirror', 'manual_mirror_registered');
+      for (const job of this.store.jobsForAggregate(batchId)) {
+        if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'manual_mirror_registered');
+      }
+      this.store.event('info', `X batch confirmed as manual mirror of ${codes.length} downstream post(s); reverse sync blocked`, batchId);
+    });
+    return { matched: codes.length };
+  }
+
+  /**
    * Build the interactive Telegram notice for a held X batch: what it is, the X root link, the
    * suspected-mirror reason, and the downstream mirror codes to reply with. Kept as a string so the
    * worker delivers it through the same durable step as any other Telegram part.
@@ -334,15 +396,17 @@ export class Engine {
       '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
       `原因：${batch.reason}`,
       url ? `X 原文：${url}` : `批次：${batch.id}`,
-      excerpt ? `摘要：${htmlEscape(excerpt)}` : '',
+      // Plain text only: the Telegram notice path HTML-escapes the whole body before sending, so any
+      // markup here would render as literal tags. Mirror codes stay copyable as plain text.
+      excerpt ? `摘要：${excerpt}` : '',
       '',
       '• 按「發送到其他平台」＝這是新內容，立刻同步到下游。',
       '• 按「略過」＝不要同步這則。',
       '• 按「這是我手動鏡像的」後，回覆本則訊息並附上「鏡像代碼 + 對應平台貼文連結」，即可登記為手動鏡像、阻止反向同步。',
     ];
     if (candidates.length) {
-      lines.push('', '可用的鏡像代碼（點一下即可複製，回覆時貼上代碼與該平台的貼文連結，順序不限）：');
-      for (const candidate of candidates) lines.push(`${candidate.platform}：<code>${htmlEscape(candidate.id)}</code>`);
+      lines.push('', '可用的鏡像代碼（回覆本訊息時貼上代碼與該平台的貼文連結，順序不限）：');
+      for (const candidate of candidates) lines.push(`${candidate.platform}：${candidate.id}`);
     } else {
       lines.push('', '（目前沒有待認領的下游貼文；若確定是手動鏡像，仍可回覆代碼與連結，或用網頁後台處理。）');
     }
@@ -372,9 +436,13 @@ export class Engine {
       images: [], buttons: [{ text: '1️⃣ 要發', data: 'rem:y' }, { text: '2️⃣ 不發', data: 'rem:n' }],
     });
     for (const post of members) {
-      const unsupported = unsupportedReason(post);
+      const unsupported = unsupportedReason(post, this.config.media.video);
       if (unsupported) throw new Error(unsupported);
-      const images = await prepareImages(post.attachments, this.config, this.transport);
+      const videoAttachment = this.config.media.video ? post.attachments.find(a => a.kind === 'video') : undefined;
+      const video = videoAttachment
+        ? await prepareVideo(videoAttachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)
+        : undefined;
+      const images = video ? [] : await prepareImages(post.attachments, this.config, this.transport);
       let text = cleanXLinks(post.text);
       if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
@@ -385,9 +453,9 @@ export class Engine {
         // every image after the first with an empty caption and a repeated footer link. Telegram
         // counts rendered HTML and caps an album caption at 1024, a text message at 4096, so the
         // caption chunk fits the album and any overflow continues as plain follow-up messages.
-        const chunks = splitHtml(text, images.length ? 1024 : 4096, sourceUrl ? 120 : 0);
+        const chunks = splitHtml(text, images.length || video ? 1024 : 4096, sourceUrl ? 120 : 0);
         const caption = chunks[0] ?? '';
-        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, sourceUrl });
+        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl });
         for (let i = 1; i < chunks.length; i++) {
           output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl });
         }
@@ -402,7 +470,7 @@ export class Engine {
         const chunks = splitText(text, job.destination === 'bluesky' ? { graphemes: 300, utf8Bytes: 3000 } : { utf16 });
         chunks.forEach((chunk, index) => {
           const body = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
-          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], sourceUrl });
+          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl });
         });
       }
     }
@@ -467,7 +535,8 @@ export class Worker {
           const prior = store.getStep(job.id, part.key);
           if (prior?.state === 'succeeded' && prior.result) {
             if (part.key === 'notice' && prior.result.chatId && prior.result.messageIds?.[0]) {
-              store.armReminder(prior.result.messageIds[0], prior.result.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
+              if (job.kind === 'ops') store.armReviewNotice(job.aggregateId, prior.result.chatId, prior.result.messageIds[0], now);
+              else store.armReminder(prior.result.messageIds[0], prior.result.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
             } else {
               parent = prior.result; root ??= prior.result;
             }
@@ -478,12 +547,13 @@ export class Worker {
           const ref = await publisher.publish(part, {
             root: part.key === 'notice' ? undefined : root,
             parent: part.key === 'notice' ? undefined : parent,
-            audience: job.kind === 'reminder' ? 'private' : 'public', idempotencyKey: `${job.id}:${part.key}`,
+            audience: job.kind === 'reminder' || job.kind === 'ops' ? 'private' : 'public', idempotencyKey: `${job.id}:${part.key}`,
           });
           store.transaction(() => {
             store.finishStep(job.id, part.key, ref);
-            if (part.key === 'notice' && job.kind === 'reminder' && ref.chatId && ref.messageIds?.[0]) {
-              store.armReminder(ref.messageIds[0], ref.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
+            if (part.key === 'notice' && ref.chatId && ref.messageIds?.[0]) {
+              if (job.kind === 'ops') store.armReviewNotice(job.aggregateId, ref.chatId, ref.messageIds[0], now);
+              else if (job.kind === 'reminder') store.armReminder(ref.messageIds[0], ref.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);
             }
           });
           if (part.key !== 'notice') { parent = ref; root ??= ref; }
@@ -544,8 +614,13 @@ export async function collectCycle(engine: Engine, collectors: Collector[], now?
     const since = engine.store.setting<string | undefined>(`fresh:${collector.platform}`, undefined);
     try {
       engine.ingest(await collector.collect(since, signal), now);
+      // A clean collect resets the consecutive-failure counter, restoring the strict seal-freshness gate.
+      engine.store.setSetting(`collect_failures:${collector.platform}`, 0);
       if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'authenticated');
     } catch (error) {
+      // Count consecutive failures so sealReady can downgrade a persistently unreachable downstream's
+      // freshness requirement rather than letting it block X→downstream sync forever.
+      engine.store.setSetting(`collect_failures:${collector.platform}`, engine.store.setting<number>(`collect_failures:${collector.platform}`, 0) + 1);
       if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'error');
       engine.store.event('error', `${collector.platform} collection failed: ${safeError(error)}`);
     }

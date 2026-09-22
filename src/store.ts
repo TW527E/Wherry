@@ -198,6 +198,14 @@ export class Store {
   deferReviewNoticeEdit(batchId: string, after: string): void {
     this.db.prepare('UPDATE review_notices SET edit_after=? WHERE batch_id=?').run(after, batchId);
   }
+  /**
+   * Notices whose owner-facing text may have changed (state moved off `offered`) and whose 429
+   * back-off, if any, has elapsed. The caller renders the current text and only edits Telegram when
+   * it differs from `syncedSig`, so this over-selects on purpose rather than tracking a revision.
+   */
+  reviewNoticesNeedingEdit(now: string): ReviewNotice[] {
+    return this.db.prepare("SELECT * FROM review_notices WHERE state<>'offered' AND (edit_after IS NULL OR edit_after<=?) ORDER BY at LIMIT 20").all(now).map(row => this.reviewNoticeRow(row));
+  }
   enqueue(kind: Job['kind'], aggregateId: string, destination: Destination, now: string, dueAt = now): string {
     const existing = this.db.prepare('SELECT id FROM jobs WHERE kind=? AND aggregate_id=? AND destination=?').get(kind, aggregateId, destination);
     if (existing) return String(existing.id);

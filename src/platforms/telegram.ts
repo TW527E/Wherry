@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
 import type { PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
 import { htmlEscape, splitText } from '../text.js';
@@ -41,6 +42,15 @@ export class TelegramClient implements Publisher {
     const audience = context.audience === 'private' ? 'private' : context.audience === 'ops' ? 'ops' : 'public'; const chatId = this.chat(audience);
     const reply = context.parent?.messageIds?.[0] ? { message_id: context.parent.messageIds[0], allow_sending_without_reply: false } : undefined;
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
+    if (part.video) {
+      const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
+      const bytes = await readFile(part.video.path);
+      const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', supports_streaming: 'true', ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) },
+        { name: 'crosspost.mp4', type: part.video.mimeType, bytes, field: 'video' });
+      const response = await requestJson(this.transport, this.endpoint('sendVideo'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, 'Telegram sendVideo', true) as TelegramResponse<TelegramMessage>;
+      if (!response.ok || !response.result) throw schemaError('Telegram sendVideo', true);
+      return { id: String(response.result.message_id), messageIds: [response.result.message_id], chatId };
+    }
     if (part.images.length > 4) throw new Error('Telegram publisher accepts at most four images per durable step');
     if (part.images.length === 1) {
       const image = part.images[0]!; const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');

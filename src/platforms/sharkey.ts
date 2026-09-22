@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
 import type { Attachment, Collector, PublishContext, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import {
@@ -195,7 +196,8 @@ export class SharkeyClient implements Publisher, Collector {
     if (!this.config.token) throw new PlatformError('A Sharkey API token is required for publishing', { code: 'MissingCredentials' });
     if (!nonempty(context.idempotencyKey)) throw new PlatformError('A durable idempotency key is required', { code: 'MissingIdempotencyKey' });
     if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Phase 1 accepts at most four static images', { code: 'TooManyImages' });
-    if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
+    if (part.video && part.images.length) throw new PlatformError('A Sharkey note cannot carry both a video and images', { code: 'MixedMedia' });
+    if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length && !part.video)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Sharkey CW must be text', { code: 'InvalidCW' });
     if (context.parent && !noteId(context.parent.id)) throw new PlatformError('Sharkey replies require a note ID', { code: 'InvalidReply' });
     if (context.root && !context.parent) throw new PlatformError('A thread root without a parent is not a valid reply', { code: 'InvalidReply' });
@@ -224,6 +226,20 @@ export class SharkeyClient implements Publisher, Collector {
       // Misskey/Sharkey stores an empty comment as null and echoes it back as null, so treat null and
       // '' as the same "no alt" value; only a genuine mismatch of non-empty text is a real error.
       if (!noteId(file?.id) || (sensitive && file.isSensitive !== true) || (file.comment !== undefined && (file.comment ?? '') !== image.alt)) throw schemaError('Sharkey image upload', false);
+      fileIds.push(file.id);
+    }
+    if (part.video) {
+      if (limits.maxFileBytes !== undefined && part.video.size > limits.maxFileBytes) throw new PlatformError('Video exceeds the Sharkey instance file size limit', { code: 'VideoTooLarge' });
+      if (part.video.alt.length > limits.maxAltTextLength) throw new PlatformError('Video alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
+      // Same pre-publish drive upload as images: a failed/uncertain upload can only leave an orphaned
+      // file, never a visible duplicate, so it is a plain transient (mutation=false), not an uncertain mutation.
+      const bytes = await readFile(part.video.path);
+      const form = multipart({ i: this.config.token, comment: part.video.alt, isSensitive: String(sensitive), force: 'true' }, [
+        { field: 'file', filename: 'crosspost.mp4', mimeType: part.video.mimeType, bytes },
+      ]);
+      const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,
+        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey video upload', false));
+      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true)) throw schemaError('Sharkey video upload', false);
       fileIds.push(file.id);
     }
     // Sharkey does not promise a notes/create idempotency nonce. Never automatically replay an uncertain mutation.

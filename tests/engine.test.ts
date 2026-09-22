@@ -274,7 +274,7 @@ test('unsupported phase-one content is held instead of being silently degraded',
     post({ id: '703', createdAt: at(10), visibility: 'restricted' }),
     post({ id: '704', createdAt: at(10), metadataComplete: false }),
   ];
-  assert.equal(unsupportedReason(notes[0]!), 'only_static_images_in_phase_one');
+  assert.equal(unsupportedReason(notes[0]!), 'video_sync_disabled');
   assert.equal(unsupportedReason(notes[1]!), 'poll_not_supported');
   assert.equal(unsupportedReason(notes[2]!), 'sensitive_content_requires_manual_review');
   assert.equal(unsupportedReason(notes[3]!), 'non_public_content');
@@ -293,6 +293,21 @@ test('unsupported phase-one content is held instead of being silently degraded',
   assert.equal(store.getBatch('x:700')?.state, 'review');
   assert.equal(store.getBatch('x:703'), undefined, 'non-public content is dropped before a batch is opened');
   assert.equal(store.jobs(100).filter(j => j.kind === 'publish').length, 0);
+});
+
+test('video gating: disabled holds video, enabled needs a downloadable source and forbids mixing', () => {
+  const withVideo = (attachments: SourcePost['attachments']): SourcePost => post({ id: '900', createdAt: at(10), attachments });
+  const hlsOnly = withVideo([{ kind: 'video', alt: '' }]);                         // X: no url/path (HLS/blob)
+  const realVideo = withVideo([{ kind: 'video', alt: 'clip', url: 'https://example.com/v.mp4' }]);
+  const mixed = withVideo([{ kind: 'video', alt: '', url: 'https://example.com/v.mp4' }, { kind: 'image', alt: '', url: 'https://example.com/i.jpg' }]);
+  // Opt-out (default): any video is held with the disabled reason.
+  assert.equal(unsupportedReason(hlsOnly, false), 'video_sync_disabled');
+  assert.equal(unsupportedReason(realVideo, false), 'video_sync_disabled');
+  // Opt-in: an X-style HLS video (no fetchable source) is still held, with a source-specific reason.
+  assert.equal(unsupportedReason(hlsOnly, true), 'x_video_has_no_downloadable_source');
+  // Opt-in with a real downloadable source is supported; mixing video and images never is.
+  assert.equal(unsupportedReason(realVideo, true), undefined);
+  assert.equal(unsupportedReason(mixed, true), 'video_must_be_the_only_attachment');
 });
 
 test('Bluesky targets and footers are assembled with the X root link only', async () => {
@@ -371,7 +386,80 @@ test('the owner can hold or retry, and already delivered batches are protected',
   store.updateJob(delivered.id, 'succeeded');
   assert.throws(() => engine.action('skip', 'x:900'), /in-flight|delivered/i);
   assert.throws(() => engine.action('retry', delivered.id), /unknown|failed|review/i);
-  store.updateJob(delivered.id, 'failed', 'explicit rejection');
-  assert.doesNotThrow(() => engine.action('retry', delivered.id));
-  assert.equal(store.getJob(delivered.id)?.state, 'pending');
+    store.updateJob(delivered.id, 'failed', 'explicit rejection');
+    assert.doesNotThrow(() => engine.action('retry', delivered.id));
+    assert.equal(store.getJob(delivered.id)?.state, 'pending');
+});
+
+test('a suspected-mirror X batch is surfaced as one ops notice, and a reply confirms the manual mirror', async () => {
+  const config = loadConfig({
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')),
+    DESTINATIONS: 'bluesky,sharkey,telegram',
+    BLUESKY_ENABLED: 'true', SHARKEY_ENABLED: 'true',
+    TELEGRAM_ENABLED: 'true', TELEGRAM_BOT_TOKEN: 't', TELEGRAM_OWNER_ID: '1',
+    X_ENABLED: 'true', X_HANDLE: 'owner',
+  });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, config, transport);
+  engine.ingest(snapshot([], at(-1000)), at(-1000));
+  for (const source of ['bluesky', 'sharkey'] as const) engine.ingest(snapshot([], at(0), source, `${source}-account`), at(0));
+
+  // A downstream post leaves a pending mirror candidate; an X root with near-identical (not identical)
+  // text is an ambiguous match — held for review, neither auto-published nor auto-suppressed.
+  const native = post({ id: 'at://did:plc:x/9', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'hello world' });
+  engine.ingest(snapshot([native], at(10), 'bluesky', 'bluesky-account'), at(10));
+  engine.ingest(snapshot([post({ id: '950', createdAt: at(10), text: 'hello world, edited a bit' })], at(650)), at(650));
+  for (const source of ['bluesky', 'sharkey'] as const) engine.ingest(snapshot([], at(700), source, `${source}-account`), at(700));
+
+  assert.equal(engine.sealReady(at(900)), 0, 'an ambiguous batch is not sealed for publication');
+  assert.equal(store.getBatch('x:950')?.state, 'review');
+  const ops = store.jobs(100).filter(j => j.kind === 'ops');
+  assert.equal(ops.length, 1, 'a review batch enqueues exactly one ops notice');
+  assert.equal(ops[0]!.destination, 'telegram');
+  assert.equal(ops[0]!.aggregateId, 'x:950');
+
+  // Re-sealing must not enqueue a second notice for the same batch.
+  engine.sealReady(at(905));
+  assert.equal(store.jobs(100).filter(j => j.kind === 'ops').length, 1, 'the notice is not duplicated across cycles');
+
+  // The ops job renders exactly one interactive notice with the three decision buttons, in plain text.
+  const parts = await engine.parts(ops[0]!);
+  assert.equal(parts.length, 1);
+  assert.deepEqual(parts[0]!.buttons?.map(b => b.data), ['rev:a:x:950', 'rev:s:x:950', 'rev:m:x:950']);
+  assert.ok(!/<code>|&lt;/.test(parts[0]!.text), 'notice text is plain; the Telegram path escapes it before sending');
+
+  // The owner confirms the manual mirror by replying with the candidate code: an unknown code matches
+  // nothing, the real code closes the batch as a mirror and links the X id so reverse sync is blocked.
+  const code = engine.mirrorCandidates(at(905)).find(c => c.postId === 'at://did:plc:x/9')!.id;
+  assert.equal(engine.confirmReviewMirror('x:950', 'see mirror:nope:missing').matched, 0);
+  assert.equal(engine.confirmReviewMirror('x:950', `mirrored here: ${code}`).matched, 1);
+  assert.equal(store.getBatch('x:950')?.state, 'mirror');
+  assert.equal(store.getPost('x', '950')?.classification, 'manual_mirror');
+  assert.equal(store.mirrorMatchesXId('950'), true, 'the X id is linked so reverse sync is suppressed');
+});
+
+test('a repeatedly failing downstream collector degrades seal freshness instead of blocking forever', () => {
+  const { store, engine } = setup(['bluesky', 'sharkey']);
+  engine.ingest(snapshot([post({ id: '960', createdAt: at(10) })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'bluesky', 'bluesky-account'), at(700));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  // Refresh X far into the future so at seal time only the downstream watermarks are stale.
+  engine.ingest(snapshot([], at(5000)), at(5000));
+  // The downstream watermarks (at 700) are now well past SOURCE_FRESHNESS_SECONDS, so the batch is held.
+  assert.equal(engine.sealReady(at(5001)), 0, 'a stale downstream mirror source blocks sealing');
+  assert.equal(store.getBatch('x:960')?.state, 'open');
+  // Once each downstream has failed to collect repeatedly, its freshness is downgraded to "ever seen".
+  store.setSetting('collect_failures:bluesky', 3);
+  store.setSetting('collect_failures:sharkey', 3);
+  assert.equal(engine.sealReady(at(5002)), 1, 'a repeatedly-failing downstream no longer blocks the seal');
+  assert.equal(store.getBatch('x:960')?.state, 'sealed');
+  assert.ok(store.events(20).some(e => e.level === 'warn' && /stale downstream/.test(e.message)), 'the degraded seal is surfaced as a warning');
+  // A single X source is never degraded: a stale X watermark still blocks regardless of failures.
+  engine.ingest(snapshot([post({ id: '961', createdAt: at(5000) })], at(5001)), at(5001));
+  store.setSetting('collect_failures:x', 9);
+  assert.equal(store.getBatch('x:961')?.state, 'open');
+  // Seal far enough ahead that X itself is stale; the X batch must remain unsealed.
+  const farLater = new Date(Date.parse(at(5001)) + 4000_000).toISOString();
+  engine.sealReady(farLater);
+  assert.equal(store.getBatch('x:961')?.state, 'open', 'X freshness is never relaxed by the failure counter');
 });

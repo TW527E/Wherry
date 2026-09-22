@@ -1,10 +1,23 @@
+import { createHash } from 'node:crypto';
 import type { AppConfig } from './config.js';
-import { Engine, safeError } from './engine.js';
+import { Engine, Worker, safeError } from './engine.js';
 import { Store } from './store.js';
 import { TelegramClient, type TelegramCallbackQuery, type TelegramUpdateMessage } from './platforms/telegram.js';
-import type { Reminder } from './types.js';
+import type { Reminder, ReviewNotice } from './types.js';
 
-export interface ReminderContext { config: AppConfig; telegram: TelegramClient; store: Store; engine: Engine }
+export interface ReminderContext { config: AppConfig; telegram: TelegramClient; store: Store; engine: Engine; worker: Worker }
+
+/** The owner-facing body a settled review notice is edited down to; empty while still `offered`. */
+function reviewNoticeStatusText(notice: ReviewNotice): string {
+  switch (notice.state) {
+    case 'awaiting_link': return '🪞 你選擇了「這是我手動鏡像的」。\n請「回覆這則通知」，貼上通知裡列出的鏡像代碼（可多個）與該平台的貼文連結。系統不會反向同步這則 X 內容。';
+    case 'approved': return '✅ 已批准：正在把這則 X 內容同步到其他平台，狀態請看 /status。';
+    case 'skipped': return '🚫 已略過：不會同步這則 X 內容。';
+    case 'mirrored': return '🪞 已登記為手動鏡像：不會反向同步這則 X 內容。';
+    default: return '';
+  }
+}
+const noticeSig = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
 export function extractXStatus(text: string, ownerHandle: string): { url: string; id: string } | undefined {
   const candidates = text.match(/https?:\/\/[^\s<>"'，。]+/giu) ?? [];
@@ -39,9 +52,39 @@ function ownerMessage(message: { chat: { id: string | number; type: string }; fr
 }
 
 export async function handleCallback(query: TelegramCallbackQuery, context: ReminderContext): Promise<void> {
-  const { config, telegram, store } = context;
+  const { config, telegram, store, engine, worker } = context;
   if (!query.message || !ownerMessage({ ...query.message, from: query.from }, config)) {
     await telegram.answerCallbackQuery(query.id, '僅限擁有者操作'); return;
+  }
+  const data = query.data ?? '';
+  if (data.startsWith('rev:')) {
+    const notice = store.getReviewNotice(query.message.message_id, String(query.message.chat.id));
+    if (!notice || !['rev:a', 'rev:s', 'rev:m'].includes(data)) { await telegram.answerCallbackQuery(query.id, '這則通知無法使用'); return; }
+    if (notice.state !== 'offered') { await telegram.answerCallbackQuery(query.id, '這則通知已處理，請依訊息操作'); return; }
+    try {
+      if (data === 'rev:a') {
+        engine.action('approve', notice.batchId);
+        store.setReviewNoticeState(notice.batchId, 'approved');
+        void worker.run().catch(() => undefined);
+        await telegram.answerCallbackQuery(query.id, '已批准，正在同步到其他平台');
+      } else if (data === 'rev:s') {
+        engine.action('skip', notice.batchId);
+        store.setReviewNoticeState(notice.batchId, 'skipped');
+        await telegram.answerCallbackQuery(query.id, '已略過，不會同步');
+      } else if (engine.mirrorCandidates().length) {
+        // Codes to confirm against: park the notice and wait for the owner's reply carrying them.
+        store.setReviewNoticeState(notice.batchId, 'awaiting_link');
+        await telegram.answerCallbackQuery(query.id, '請回覆這則通知，貼上鏡像代碼與連結');
+      } else {
+        // No downstream candidate to link, so there is no code to wait for: close it as a mirror now.
+        engine.action('mirror', notice.batchId);
+        store.setReviewNoticeState(notice.batchId, 'mirrored');
+        await telegram.answerCallbackQuery(query.id, '已標記為手動鏡像，不會同步');
+      }
+    } catch (error) {
+      await telegram.answerCallbackQuery(query.id, `操作失敗：${safeError(error)}`.slice(0, 190));
+    }
+    return;
   }
   const reminder = store.getReminder(query.message.message_id, String(query.message.chat.id));
   if (!reminder || !['rem:y', 'rem:n'].includes(query.data ?? '')) {
@@ -75,6 +118,34 @@ export async function handleReminderReply(message: TelegramUpdateMessage, contex
   return true;
 }
 
+/**
+ * The owner tapped 「這是我手動鏡像的」 on a held X batch and is replying with the mirror code(s) plus
+ * the downstream link(s). Register the manual mirror so reverse sync is blocked. Returns true once it
+ * owns the reply (a review notice matched), so the caller stops before treating it as a command.
+ */
+export async function handleReviewReply(message: TelegramUpdateMessage, context: ReminderContext): Promise<boolean> {
+  const { config, telegram, store, engine } = context;
+  if (!ownerMessage(message, config) || !message.reply_to_message || message.document || message.text?.trim().startsWith('/')) return false;
+  const notice = store.getReviewNotice(message.reply_to_message.message_id, String(message.chat.id));
+  if (!notice) return false;
+  if (notice.state !== 'awaiting_link') {
+    await telegram.sendPlain(notice.state === 'offered'
+      ? '請先在原通知按「這是我手動鏡像的」，再回覆鏡像代碼與連結。'
+      : '這則通知已處理，沒有變更登記。', 'private');
+    return true;
+  }
+  let matched: number;
+  try { ({ matched } = engine.confirmReviewMirror(notice.batchId, message.text ?? '')); }
+  catch (error) { await telegram.sendPlain(`登記失敗：${safeError(error)}`, 'private'); return true; }
+  if (!matched) {
+    await telegram.sendPlain('沒有讀到有效的鏡像代碼。請「回覆這則通知」，貼上通知裡列出的「mirror:…」代碼（可多個）與該平台的貼文連結。', 'private');
+    return true;
+  }
+  store.setReviewNoticeState(notice.batchId, 'mirrored');
+  await telegram.sendPlain(`已登記為手動鏡像（${matched} 筆），將阻止反向同步這則 X 內容。`, 'private');
+  return true;
+}
+
 export class TelegramNotifications {
   private active?: Promise<void>;
   constructor(private readonly context: ReminderContext) {
@@ -100,6 +171,24 @@ export class TelegramNotifications {
         const seconds = Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0);
         store.deferReminderEdit(reminder, new Date(Date.now() + seconds * 1000).toISOString());
         store.event('error', `Telegram reminder update failed; saved choice will be retried: ${safeError(error)}`, reminder.aggregateId);
+        break;
+      }
+    }
+    // Edit each settled review notice down to its outcome (approved / skipped / mirrored / awaiting a
+    // reply). Same edit-when-changed, back-off-on-429 discipline as reminders: only touch Telegram when
+    // the freshly rendered body differs from what was last written, and defer on a rate-limit.
+    for (const notice of store.reviewNoticesNeedingEdit(now)) {
+      if (notice.chatId !== config.telegram.privateChatId) continue;
+      const text = reviewNoticeStatusText(notice);
+      const sig = noticeSig(text);
+      if (!text || sig === notice.syncedSig) continue;
+      try {
+        await telegram.editMessageText(notice.chatId, notice.messageId, text);
+        store.reviewNoticeSynced(notice.batchId, sig);
+      } catch (error) {
+        const seconds = Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0);
+        store.deferReviewNoticeEdit(notice.batchId, new Date(Date.now() + seconds * 1000).toISOString());
+        store.event('error', `Telegram review notice update failed; will retry: ${safeError(error)}`, notice.batchId);
         break;
       }
     }
