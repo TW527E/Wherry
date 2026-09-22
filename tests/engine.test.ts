@@ -5,7 +5,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { Store } from '../src/store.js';
-import { Engine, collectCycle, decideMirror, unsupportedReason } from '../src/engine.js';
+import { Engine, collectCycle, decideMirror, exceedsXLimit, holdIsApprovable, unsupportedReason } from '../src/engine.js';
 import type { Collector, Destination, SourcePost, SourceSnapshot, Transport } from '../src/types.js';
 
 const base = Date.parse('2026-09-19T00:00:00.000Z');
@@ -446,6 +446,91 @@ test('a suspected-mirror X batch is surfaced as one ops notice, and a reply conf
   assert.equal(store.getBatch('x:950')?.state, 'mirror');
   assert.equal(store.getPost('x', '950')?.classification, 'manual_mirror');
   assert.equal(store.mirrorMatchesXId('950'), true, 'the X id is linked so reverse sync is suppressed');
+});
+
+test('the long-post hold uses X weighted length and only fires when publishing would split', () => {
+  const longUrl = `https://example.com/${'b'.repeat(80)}`;
+  // A short tweet whose t.co link the collector expanded into a long URL. X counts every link as 23
+  // characters, so the post was never long; counting raw characters held it for no reason at all.
+  const expanded = `${'a'.repeat(250)} ${longUrl}`;
+  assert.ok(expanded.length > 280, 'the expanded form is longer than 280 raw characters');
+  assert.equal(unsupportedReason(post({ id: '980', createdAt: at(10), text: expanded })), undefined,
+    'the expanded link does not make a normal tweet look over-limit');
+
+  // X weighs CJK double, so a 150-character post is past 280 for X — but it still publishes as ONE
+  // downstream post (Bluesky allows 300 graphemes), so there is nothing for the owner to review.
+  const cjk = '中'.repeat(150);
+  assert.equal(exceedsXLimit(cjk), true, 'X counts this as beyond a normal post');
+  assert.equal(unsupportedReason(post({ id: '981', createdAt: at(10), text: cjk })), undefined,
+    'a body that still fits a single downstream post needs no review');
+
+  // Both conditions together are what the hold is for: X counts it long AND publishing would split it.
+  assert.equal(unsupportedReason(post({ id: '982', createdAt: at(10), text: 'x'.repeat(400) })), 'long_x_post_requires_manual_review');
+
+  // Only the long-post hold can be released by approve; content holds have no publish path at all.
+  assert.equal(holdIsApprovable('long_x_post_requires_manual_review'), true);
+  for (const reason of ['poll_not_supported', 'video_sync_disabled', 'sensitive_content_requires_manual_review',
+    'more_than_four_images', 'only_static_images_or_video', 'x_video_has_no_downloadable_source', 'incomplete_metadata']) {
+    assert.equal(holdIsApprovable(reason), false, `${reason} cannot be published, so it must not be approvable`);
+  }
+});
+
+test('a long X post is announced and can be released instead of stalling as a silent dead end', async () => {
+  const config = loadConfig({
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')),
+    DESTINATIONS: 'bluesky,telegram',
+    BLUESKY_ENABLED: 'true', TELEGRAM_ENABLED: 'true', TELEGRAM_BOT_TOKEN: 't', TELEGRAM_OWNER_ID: '1',
+    X_ENABLED: 'true', X_HANDLE: 'owner',
+  });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, config, transport);
+  engine.ingest(snapshot([], at(-1000)), at(-1000));
+  engine.ingest(snapshot([], at(0), 'bluesky', 'bluesky-account'), at(0));
+
+  const body = 'x'.repeat(400);
+  engine.ingest(snapshot([post({ id: '970', createdAt: at(10), text: body })], at(650)), at(650));
+  assert.equal(store.getBatch('x:970')?.state, 'review', 'a long post is held rather than published unreviewed');
+
+  // The hold must be announced: a batch parked in review is not in sealReady's open-batch walk, so
+  // without the notice the owner would never hear about it and the content would silently never sync.
+  const ops = store.jobs(100).filter(j => j.kind === 'ops');
+  assert.equal(ops.length, 1, 'a held batch is announced once');
+  assert.equal(ops[0]!.aggregateId, 'x:970');
+  const notice = (await engine.parts(ops[0]!))[0]!;
+  assert.deepEqual(notice.buttons?.map(b => b.data), ['rev:a:x:970', 'rev:s:x:970', 'rev:m:x:970'], 'a long post offers the release button');
+  assert.match(notice.text, /不會自動同步/, 'the notice explains why it is held');
+
+  // Approving must genuinely publish it — not park it in another failing state.
+  engine.action('approve', 'x:970');
+  assert.equal(store.getBatch('x:970')?.state, 'sealed');
+  const job = store.jobs(100).find(j => j.kind === 'publish' && j.aggregateId === 'x:970' && j.destination === 'bluesky')!;
+  const parts = await engine.parts(job);
+  const bodies = parts.filter(p => !p.isFooter);
+  assert.ok(bodies.length >= 2, 'the long body is split into several downstream parts');
+  assert.equal(bodies.map(p => p.text).join(''), body, 'splitting preserves the text exactly');
+});
+
+test('a hard content hold is announced but offers no publish button', async () => {
+  const config = loadConfig({
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')),
+    DESTINATIONS: 'bluesky,telegram',
+    BLUESKY_ENABLED: 'true', TELEGRAM_ENABLED: 'true', TELEGRAM_BOT_TOKEN: 't', TELEGRAM_OWNER_ID: '1',
+    X_ENABLED: 'true', X_HANDLE: 'owner',
+  });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, config, transport);
+  engine.ingest(snapshot([], at(-1000)), at(-1000));
+  engine.ingest(snapshot([], at(0), 'bluesky', 'bluesky-account'), at(0));
+
+  engine.ingest(snapshot([post({ id: '990', createdAt: at(10), poll: true })], at(650)), at(650));
+  assert.equal(store.getBatch('x:990')?.state, 'review');
+  const ops = store.jobs(100).filter(j => j.kind === 'ops');
+  assert.equal(ops.length, 1, 'a poll hold is announced too, instead of only showing up in /pending');
+  const notice = (await engine.parts(ops[0]!))[0]!;
+  assert.deepEqual(notice.buttons?.map(b => b.data), ['rev:s:x:990', 'rev:m:x:990'], 'no publish button for content that cannot be published');
+  assert.match(notice.text, /無法自動同步/);
+  // Even if the verb is called directly, a poll cannot be force-published.
+  assert.throws(() => engine.action('approve', 'x:990'), /cannot be force-published/i);
 });
 
 test('a repeatedly failing downstream collector degrades seal freshness instead of blocking forever', () => {

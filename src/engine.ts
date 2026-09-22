@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import twitterText from 'twitter-text';
 import type { AppConfig } from './config.js';
 import { Store } from './store.js';
-import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
+import { cleanXLinks, fixupUrl, htmlEscape, normalizeText, similarity, splitText } from './text.js';
 import { prepareImages } from './media.js';
 import { prepareVideo } from './video.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from './types.js';
@@ -29,6 +30,40 @@ export const snapshotSchema = z.object({
 // downstream cannot block X→downstream publishing indefinitely. Never applied to X itself.
 const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
 
+// X's own post limit, measured the way X measures it: every URL counts as 23 characters (the t.co
+// length) and CJK counts double. The collector expands t.co links to their real destinations before a
+// post reaches the engine, so counting raw characters would flag a normal tweet as over-limit purely
+// because a link inside it was expanded.
+const X_WEIGHTED_LIMIT = 280;
+// The tightest single-post limit among the destinations (Bluesky's 300 graphemes / 3000 UTF-8 bytes),
+// the same budget `parts()` splits with. A body that fits this fits Sharkey and Telegram too, so it
+// publishes as ONE post everywhere and there is nothing for the owner to review.
+const SINGLE_PART_LIMIT = { graphemes: 300, utf8Bytes: 3000 } as const;
+
+/** True when X itself counts the post as beyond a normal post (i.e. a Premium/long post). */
+export function exceedsXLimit(text: string): boolean {
+  return twitterText.parseTweet(text).weightedLength > X_WEIGHTED_LIMIT;
+}
+
+/** True when publishing this body would split it into more than one downstream post. */
+function requiresSplit(text: string): boolean {
+  try { return splitText(text, SINGLE_PART_LIMIT).length > 1; }
+  // A body that cannot be split at all (e.g. a single URL longer than the whole budget) also cannot
+  // go out as one post, so it needs the same manual review.
+  catch { return true; }
+}
+
+/**
+ * The content holds a manual approve can still publish. Only the long-post hold qualifies: there the
+ * content itself is fully supported — text the publishers accept and media they can carry — and only
+ * its length needs a human decision, because publishing splits it into as many posts as it takes.
+ * Every other reason describes content that cannot be published at all, so approving it would either
+ * drop part of the post silently or fail the delivery job.
+ */
+export function holdIsApprovable(reason: string | undefined): boolean {
+  return reason === 'long_x_post_requires_manual_review';
+}
+
 export function unsupportedReason(post: SourcePost, videoEnabled = false): string | undefined {
   if (!post.metadataComplete) return 'incomplete_metadata';
   if (post.visibility !== 'public') return 'non_public_content';
@@ -46,7 +81,11 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
   } else if (post.attachments.some(a => a.kind !== 'image' || a.animated)) {
     return 'only_static_images_or_video';
   }
-  if (post.platform === 'x' && graphemes(post.text).length > 280) return 'long_x_post_requires_manual_review';
+  // Hold a long post only when BOTH hold: X itself counted it as beyond a normal post, and publishing
+  // it would really be split into several downstream posts. Either condition alone over-holds — a short
+  // tweet whose t.co link expanded into a long URL is not a long post, and a non-Latin post that X
+  // weighs past 280 may still fit a single downstream post, leaving nothing to review.
+  if (post.platform === 'x' && exceedsXLimit(post.text) && requiresSplit(post.text)) return 'long_x_post_requires_manual_review';
   if (!post.text.trim() && !post.attachments.length) return 'empty_content';
   return undefined;
 }
@@ -182,6 +221,7 @@ export class Engine {
         settleAt: new Date(Math.max(Date.parse(post.createdAt) + this.config.threadWindowSeconds * 1000, Date.parse(now)) + this.config.settleSeconds * 1000).toISOString(),
         state: unsupported ? 'review' : 'open', reason: unsupported || 'collecting_initial_thread' });
       this.store.addPost(post, unsupported ? 'unsupported' : 'collecting', unsupported || 'root', now, id);
+      if (unsupported) this.notifyHeldBatch(id, now);
       return;
     }
     if (!post.replyToAuthorId || post.replyToAuthorId.toLowerCase() !== post.authorId.toLowerCase()) {
@@ -197,11 +237,29 @@ export class Engine {
     const tail = members.at(-1)?.post;
     if (tail?.id !== post.replyToId) {
       this.store.addPost(post, 'mirror_review', 'branch_in_thread', now, batch.id);
-      this.store.updateBatch(batch.id, 'review', 'thread_is_not_linear'); return;
+      this.store.updateBatch(batch.id, 'review', 'thread_is_not_linear');
+      this.notifyHeldBatch(batch.id, now);
+      return;
     }
     const unsupported = unsupportedReason(post, this.config.media.video);
     this.store.addPost(post, unsupported ? 'unsupported' : 'collecting', unsupported || 'initial_self_thread', now, batch.id);
-    if (unsupported) this.store.updateBatch(batch.id, 'review', unsupported);
+    if (unsupported) { this.store.updateBatch(batch.id, 'review', unsupported); this.notifyHeldBatch(batch.id, now); }
+  }
+
+  /** The content reason that keeps this batch out of the automatic publish path, if any. */
+  private holdReason(posts: SourcePost[]): string | undefined {
+    return posts.map(p => unsupportedReason(p, this.config.media.video)).find(Boolean);
+  }
+
+  /**
+   * Announce a batch the engine parked in `review` on purpose, as one interactive Telegram notice.
+   * `sealReady` only walks `open` batches, so a batch that went to `review` at ingest time would
+   * otherwise never be reported: the owner would have to stumble on it in /pending or the Web UI while
+   * the content silently never synced. `hasReviewNotice` keeps a batch from being announced twice.
+   */
+  private notifyHeldBatch(batchId: string, now: string): void {
+    if (!this.config.telegram.enabled || this.store.hasReviewNotice(batchId)) return;
+    this.store.enqueue('ops', batchId, 'telegram', now);
   }
 
   sealReady(now = new Date().toISOString()): number {
@@ -332,7 +390,8 @@ export class Engine {
     if (action === 'approve') {
       if (!['open', 'review', 'sealed'].includes(batch.state)) throw new Error('Only open/review/sealed batches can be approved');
       const members = this.store.batchPosts(id);
-      if (members.some(m => unsupportedReason(m.post, this.config.media.video))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
+      const held = members.map(m => unsupportedReason(m.post, this.config.media.video)).filter(Boolean);
+      if (held.some(reason => !holdIsApprovable(reason))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
       if (members.some(m => !m.post.relationKnown)) throw new Error('Unknown reply relationship cannot be force-published');
       this.store.updateBatch(id, 'sealed', 'owner_confirmed_new_content');
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now);
@@ -391,19 +450,31 @@ export class Engine {
     const root = posts[0];
     const url = root ? fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`) : undefined;
     const excerpt = root ? Array.from(cleanXLinks(root.text)).slice(0, 100).join('') : '';
-    const candidates = this.mirrorCandidates(now);
-    const lines = [
+    const hold = this.holdReason(posts);
+    // Plain text only: the Telegram notice path HTML-escapes the whole body before sending, so any
+    // markup here would render as literal tags. Mirror codes stay copyable as plain text.
+    const lines = hold ? [
+      '⚠️ 這則 X 內容不會自動同步到其他平台，需要你決定。',
+      `原因：${hold}`,
+      url ? `X 原文：${url}` : `批次：${batch.id}`,
+      excerpt ? `摘要：${excerpt}` : '',
+      '',
+      ...(holdIsApprovable(hold)
+        ? ['• 按「仍要發送到其他平台」＝這則其實可以同步（只是較長，發布時會自動分段成一串貼文）。',
+           '• 按「略過」＝不要同步這則，之後不再提醒。']
+        : ['• 這種內容（媒體格式、投票、敏感標記等）無法自動同步；需要的話請自行手動貼到其他平台。',
+           '• 按「略過」＝關閉這則提醒。']),
+    ] : [
       '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
       `原因：${batch.reason}`,
       url ? `X 原文：${url}` : `批次：${batch.id}`,
-      // Plain text only: the Telegram notice path HTML-escapes the whole body before sending, so any
-      // markup here would render as literal tags. Mirror codes stay copyable as plain text.
       excerpt ? `摘要：${excerpt}` : '',
       '',
       '• 按「發送到其他平台」＝這是新內容，立刻同步到下游。',
       '• 按「略過」＝不要同步這則。',
-      '• 按「這是我手動鏡像的」後，回覆本則訊息並附上「鏡像代碼 + 對應平台貼文連結」，即可登記為手動鏡像、阻止反向同步。',
     ];
+    lines.push('• 按「這是我手動鏡像的」後，回覆本則訊息並附上「鏡像代碼 + 對應平台貼文連結」，即可登記為手動鏡像、阻止反向同步。');
+    const candidates = this.mirrorCandidates(now);
     if (candidates.length) {
       lines.push('', '可用的鏡像代碼（回覆本訊息時貼上代碼與該平台的貼文連結，順序不限）：');
       for (const candidate of candidates) lines.push(`${candidate.platform}：${candidate.id}`);
@@ -417,10 +488,15 @@ export class Engine {
     if (job.kind === 'ops') {
       const batch = this.store.getBatch(job.aggregateId);
       if (!batch) throw new Error('Job source not found');
+      const hold = this.holdReason(this.store.batchPosts(batch.id).map(p => p.post));
+      const approvable = !hold || holdIsApprovable(hold);
       return [{
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
         images: [], buttons: [
-          { text: '✅ 發送到其他平台', data: `rev:a:${batch.id}` },
+          // Offer to publish only when the content can actually go out. A hard hold (unsupported media,
+          // a poll, a sensitive label) has no working publish path, so an approve button there would only
+          // ever fail the delivery job; the owner skips it or mirrors it manually instead.
+          ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: `rev:a:${batch.id}` }] : []),
           { text: '🚫 略過', data: `rev:s:${batch.id}` },
           { text: '🪞 這是我手動鏡像的', data: `rev:m:${batch.id}` },
         ],
@@ -437,7 +513,9 @@ export class Engine {
     });
     for (const post of members) {
       const unsupported = unsupportedReason(post, this.config.media.video);
-      if (unsupported) throw new Error(unsupported);
+      // An owner-approved long post IS published here (its body is split into parts below). Any other
+      // hold means the content is not publishable at all, so fail loudly rather than send a degraded post.
+      if (unsupported && !holdIsApprovable(unsupported)) throw new Error(unsupported);
       const videoAttachment = this.config.media.video ? post.attachments.find(a => a.kind === 'video') : undefined;
       const video = videoAttachment
         ? await prepareVideo(videoAttachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)
