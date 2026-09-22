@@ -9,20 +9,20 @@ import { parseSessionFile } from './platforms/session.js';
 import { createInterface } from 'node:readline/promises';
 import { readFile, writeFile, chmod } from 'node:fs/promises';
 
-const usage = `crosspost-bridge — X-first cross-posting with manual X publishing
+const usage = `wherry — X-first cross-posting with manual X publishing
 
 Usage:
-  crosspost-bridge serve                 Run the scheduler, worker and Web UI
-  crosspost-bridge once                  Run one collect + seal + publish cycle
-  crosspost-bridge status                Print jobs, batches and recent events
-  crosspost-bridge scan                  Collect sources only (never publishes)
-  crosspost-bridge publish <batchId>     Enqueue downstream publication for a sealed batch
-  crosspost-bridge schedule <iso> <text> Create a local scheduled post (no X write)
-  crosspost-bridge action <verb> <id>    skip | approve | mirror | retry | reconcile
-  crosspost-bridge doctor                Validate configuration and report capabilities
-  crosspost-bridge login                 Open a visible browser to log into X once (saves the session)
-  crosspost-bridge export-session        Export the X login to X_SESSION_FILE (default: data/x-session.json)
-  crosspost-bridge import-session        Install the session file at X_SESSION_FILE into this machine's X profile
+  wherry serve                 Run the scheduler, worker and Web UI
+  wherry once                  Run one collect + seal + publish cycle
+  wherry status                Print jobs, batches and recent events
+  wherry scan                  Collect sources only (never publishes)
+  wherry publish <batchId>     Enqueue downstream publication for a sealed batch
+  wherry schedule <iso> <text> Create a local scheduled post (no X write)
+  wherry action <verb> <id>    skip | approve | mirror | retry | reconcile
+  wherry doctor                Validate configuration and report capabilities
+  wherry login                 Open a visible browser to log into X once (saves the session)
+  wherry export-session        Export the X login to X_SESSION_FILE (default: data/x-session.json)
+  wherry import-session        Install the session file at X_SESSION_FILE into this machine's X profile
 
 X publishing is always manual. This tool only reads X and can never post to it.`;
 
@@ -38,7 +38,7 @@ async function main(): Promise<number> {
         const app = await createWeb(runtime);
         await app.listen({ host: config.host, port: config.port });
         runtime.store.event('info', `Service started in ${config.mode} mode on ${config.host}:${config.port}`);
-        console.log(`crosspost-bridge listening on http://${config.host}:${config.port} (mode=${config.mode})`);
+        console.log(`wherry listening on http://${config.host}:${config.port} (mode=${config.mode})`);
         if (config.mode !== 'live') console.log('preview mode: no remote publication is performed');
         runtime.start();
         // Kick one cycle at startup without blocking the serve loop. runCycle already swallows its own

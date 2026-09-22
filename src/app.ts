@@ -223,7 +223,7 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
 
 function helpText(): string {
   const lines = TELEGRAM_COMMANDS.map(c => `/${c.command}${c.args ? ` ${c.args}` : ''} — ${c.description}`);
-  return ['📋 Crosspost Bridge 指令', ...lines, '', '💡 更新 X 登入：打 /session 再上傳 x-session.json（或直接在檔案說明打 /session）。上傳的檔案會在安裝後自動刪除。', 'ℹ️ X 發文一律手動；本工具只讀 X、把新貼文同步到 Bluesky / Sharkey。'].join('\n');
+  return ['📋 Wherry 指令', ...lines, '', '💡 更新 X 登入：打 /session 再上傳 x-session.json（或直接在檔案說明打 /session）。上傳的檔案會在安裝後自動刪除。', 'ℹ️ X 發文一律手動；本工具只讀 X、把新貼文同步到 Bluesky / Sharkey。'].join('\n');
 }
 
 async function handleCommand(raw: string, context: CommandContext): Promise<void> {
@@ -354,7 +354,7 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
   return app;
 }
 
-const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Crosspost Bridge</title><style>
+const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wherry</title><style>
 :root{--bg:#0f1419;--card:#fff;--line:#e1e8ed;--muted:#536471;--accent:#1d9bf0;--ok:#00ba7c;--warn:#f4b400;--err:#f4212e}
 *{box-sizing:border-box}body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:#f7f9f9;color:#0f1419}
 header{background:var(--bg);color:#fff;padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
@@ -381,7 +381,7 @@ pre{background:#f7f9f9;border:1px solid var(--line);padding:.75rem;border-radius
 .toast{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#0f1419;color:#fff;padding:.6rem 1rem;border-radius:999px;font-size:.85rem;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.show{opacity:1}
 </style></head><body>
-<header><h1>🔗 Crosspost Bridge</h1><span id="mode" class="pill">…</span><span id="xsess" class="pill ghost" style="background:#eff3f4;color:#0f1419"></span><span style="flex:1"></span>
+<header><h1>🔗 Wherry</h1><span id="mode" class="pill">…</span><span id="xsess" class="pill ghost" style="background:#eff3f4;color:#0f1419"></span><span style="flex:1"></span>
 <button onclick="scan(this)">立即檢查</button><button class="ghost" onclick="load()">重新整理</button></header>
 <main>
 <div class="card"><label>Web token（僅在 .env 設定 WEB_TOKEN 時需要）</label><input id="token" type="password" placeholder="Bearer token"></div>

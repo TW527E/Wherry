@@ -204,7 +204,7 @@ export class TelegramNotifications {
       return safeError(new Error(text));
     };
     try {
-      await telegram.sendPlain(`⚠️ Crosspost Bridge 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, audience);
+      await telegram.sendPlain(`⚠️ Wherry 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, audience);
       store.setSetting('telegram:error_offset', errors.at(-1)!.id);
       store.setSetting('telegram:error_retry_at', '');
     } catch (error) {

@@ -34,7 +34,7 @@ export interface AppConfig {
   x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string; sandbox: boolean };
   media: { video: boolean; ffmpegPath: string; ffprobePath: string };
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
-  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string };
+  sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string; driveFolder: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
 }
 
@@ -85,6 +85,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       token: env.SHARKEY_TOKEN || '', userId: env.SHARKEY_USER_ID || '', username: env.SHARKEY_USERNAME || '',
       // `??` not `||`: an explicit empty string disables the signature, while leaving it unset keeps the default.
       signature: env.SHARKEY_SIGNATURE ?? DEFAULT_SHARKEY_SIGNATURE,
+      // Drive folder that synced media is uploaded into. `??` with `.trim()`: an explicit empty string
+      // (or all-whitespace) uploads to the drive root, while leaving it unset keeps the default folder.
+      // The folder is looked up by name at the drive root and created on first use (needs read+write:drive).
+      driveFolder: (env.SHARKEY_DRIVE_FOLDER ?? 'Wherry').trim(),
     },
     telegram: {
       enabled: bool(env.TELEGRAM_ENABLED, false), token: env.TELEGRAM_BOT_TOKEN || '',

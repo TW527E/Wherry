@@ -5,6 +5,7 @@ import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity,
 import { blueskyRecordKey } from '../src/platforms/bluesky.js';
 import { fullSizeImageUrl } from '../src/platforms/x.js';
 import { TelegramClient } from '../src/platforms/telegram.js';
+import { SharkeyClient } from '../src/platforms/sharkey.js';
 import type { HttpOptions, HttpResponse, PreparedImage, Transport } from '../src/types.js';
 
 test('blueskyRecordKey produces a valid, deterministic TID', () => {
@@ -102,6 +103,82 @@ test('several images from one post go out as a single Telegram album with the ca
   assert.match(captured[0]!.body, /attach:\/\/photo0/);
   assert.match(captured[0]!.body, /attach:\/\/photo2/);
   assert.deepEqual(ref.messageIds, [41, 42, 43], 'every album message id is recorded for threading');
+});
+
+test('Sharkey uploads media into the configured Drive folder, creating it once when absent', async () => {
+  const calls: Array<{ method: string; body: string }> = [];
+  const json = (value: unknown): HttpResponse => ({ status: 200, headers: {}, body: new TextEncoder().encode(JSON.stringify(value)) });
+  let findCalls = 0;
+  const transport: Transport = {
+    async request(url: string, options?: HttpOptions): Promise<HttpResponse> {
+      const method = url.split('/api/')[1] ?? url;
+      const body = options?.body instanceof Uint8Array ? new TextDecoder().decode(options.body) : String(options?.body ?? '');
+      calls.push({ method, body });
+      if (method === 'users/show') return json({ id: 'user1', username: 'owner', host: null });
+      if (method === 'meta') return json({ maxNoteTextLength: 3000, maxCwLength: 500, maxFileCommentLength: 2000, policies: { canPublicNote: true } });
+      // First lookup finds nothing → the client must create the folder, then never create it twice.
+      if (method === 'drive/folders/find') { findCalls++; return json([]); }
+      if (method === 'drive/folders/create') return json({ id: 'folder1', name: 'Wherry', parentId: null });
+      if (method === 'drive/files/create') return json({ id: 'file1', comment: null, isSensitive: false });
+      if (method === 'notes/create') return json({ createdNote: { id: 'note1', uri: null } });
+      throw new Error(`unexpected Sharkey call: ${method}`);
+    },
+    async json<T>() { throw new Error('unused') as T; },
+  };
+  const config = {
+    enabled: true, baseUrl: 'https://sharkey.example', token: 'tok', userId: 'user1', username: 'owner',
+    signature: '', driveFolder: 'Wherry',
+  };
+  const client = new SharkeyClient(config, transport);
+  const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
+  const ref = await client.publish(
+    { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9' },
+    { audience: 'public', idempotencyKey: 'k:0' },
+  );
+  assert.equal(ref.id, 'note1');
+  const upload = calls.find(c => c.method === 'drive/files/create');
+  assert.ok(upload, 'the image is uploaded to the drive');
+  assert.match(upload!.body, /name="folderId"\r\n\r\nfolder1/, 'the upload carries the resolved folder id');
+
+  // A second publish on the same client reuses the cached folder id — no second find/create.
+  await client.publish(
+    { key: 'k:1', sourcePostId: '10', text: 'again', images: [image], sourceUrl: 'https://fixupx.com/owner/status/10' },
+    { audience: 'public', idempotencyKey: 'k:1' },
+  );
+  assert.equal(findCalls, 1, 'the folder is resolved once and cached for later publishes');
+  assert.equal(calls.filter(c => c.method === 'drive/folders/create').length, 1, 'the folder is created only once');
+});
+
+test('an empty SHARKEY_DRIVE_FOLDER uploads to the drive root with no folder lookup', async () => {
+  const calls: string[] = [];
+  const json = (value: unknown): HttpResponse => ({ status: 200, headers: {}, body: new TextEncoder().encode(JSON.stringify(value)) });
+  const transport: Transport = {
+    async request(url: string, options?: HttpOptions): Promise<HttpResponse> {
+      const method = url.split('/api/')[1] ?? url;
+      calls.push(method);
+      if (method === 'users/show') return json({ id: 'user1', username: 'owner', host: null });
+      if (method === 'meta') return json({ maxNoteTextLength: 3000, maxCwLength: 500, maxFileCommentLength: 2000, policies: { canPublicNote: true } });
+      if (method === 'drive/files/create') {
+        const body = options?.body instanceof Uint8Array ? new TextDecoder().decode(options.body) : '';
+        assert.doesNotMatch(body, /name="folderId"/, 'no folder id is sent when uploading to the root');
+        return json({ id: 'file1', comment: null, isSensitive: false });
+      }
+      if (method === 'notes/create') return json({ createdNote: { id: 'note1', uri: null } });
+      throw new Error(`unexpected Sharkey call: ${method}`);
+    },
+    async json<T>() { throw new Error('unused') as T; },
+  };
+  const config = {
+    enabled: true, baseUrl: 'https://sharkey.example', token: 'tok', userId: 'user1', username: 'owner',
+    signature: '', driveFolder: '',
+  };
+  const client = new SharkeyClient(config, transport);
+  const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
+  await client.publish(
+    { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9' },
+    { audience: 'public', idempotencyKey: 'k:0' },
+  );
+  assert.ok(!calls.includes('drive/folders/find'), 'an empty folder name skips folder resolution entirely');
 });
 
 test('link cleaning rewrites X URLs but preserves other links and punctuation', () => {

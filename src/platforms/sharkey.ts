@@ -125,6 +125,10 @@ export class SharkeyClient implements Publisher, Collector {
   private accountPromise?: Promise<SharkeyAccount>;
   private limits?: SharkeyLimits;
   private limitsPromise?: Promise<SharkeyLimits>;
+  // Resolved once per process: null means "upload to the drive root" (folder disabled or empty name),
+  // a string is the target folder's id. `undefined` = not resolved yet.
+  private folderId?: string | null;
+  private folderPromise?: Promise<string | null>;
 
   constructor(private readonly config: SharkeyConfig, private readonly transport: Transport, private readonly options: SharkeyOptions = {}) {
     this.baseUrl = httpsBase(config.baseUrl, 'Sharkey instance');
@@ -161,6 +165,38 @@ export class SharkeyClient implements Publisher, Collector {
       return this.account;
     })();
     try { return await this.accountPromise; } finally { this.accountPromise = undefined; }
+  }
+
+  /**
+   * Resolve the configured Drive folder to an id, uploading media into it instead of the root.
+   * The folder is matched by exact name among the account's top-level folders and created on first
+   * use if absent (needs read:drive + write:drive). An empty configured name resolves to null =
+   * upload to the root. The result is cached for the process; on error the cache is left unset so a
+   * later publish retries the lookup rather than being poisoned by one transient failure.
+   */
+  private async resolveFolder(): Promise<string | null> {
+    if (this.folderId !== undefined) return this.folderId;
+    const name = this.config.driveFolder;
+    if (!name) { this.folderId = null; return null; }
+    if (this.folderPromise) return this.folderPromise;
+    this.folderPromise = (async () => {
+      // folders/find lists matching folders; folderId:null scopes the search to the drive root so a
+      // same-named nested folder is never picked. Finding is a read, not a mutation.
+      const found = await this.api('drive/folders/find', { name, folderId: null });
+      if (!Array.isArray(found)) throw schemaError('Sharkey drive folder lookup');
+      for (const raw of found) {
+        const folder = object(raw);
+        // Only accept a top-level folder (parentId null) whose name matches exactly.
+        if (folder && noteId(folder.id) && folder.name === name && (folder.parentId === null || folder.parentId === undefined)) return folder.id;
+      }
+      // None at the root: create it. A duplicate is harmless (Sharkey allows same-named folders), so
+      // this stays a plain non-uncertain call the worker may safely retry.
+      const created = object(await this.api('drive/folders/create', { name, parentId: null }, false));
+      if (!created || !noteId(created.id)) throw schemaError('Sharkey drive folder creation', false);
+      return created.id;
+    })();
+    try { const id = await this.folderPromise; this.folderId = id; return id; }
+    finally { this.folderPromise = undefined; }
   }
 
   async getLimits(): Promise<SharkeyLimits> {
@@ -211,9 +247,10 @@ export class SharkeyClient implements Publisher, Collector {
     }
     const fileIds: string[] = [];
     const sensitive = part.cw !== undefined && part.cw.length > 0;
+    const folderId = (part.images.length || part.video) ? await this.resolveFolder() : null;
     for (let index = 0; index < part.images.length; index++) {
       const image = part.images[index]!;
-      const form = multipart({ i: this.config.token, comment: image.alt, isSensitive: String(sensitive), force: 'true' }, [
+      const form = multipart({ i: this.config.token, comment: image.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
         { field: 'file', filename: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, mimeType: image.mimeType, bytes: image.bytes },
       ]);
       // Uploading a drive file is a PRE-publish step, not the publish itself: the note is only created
@@ -234,7 +271,7 @@ export class SharkeyClient implements Publisher, Collector {
       // Same pre-publish drive upload as images: a failed/uncertain upload can only leave an orphaned
       // file, never a visible duplicate, so it is a plain transient (mutation=false), not an uncertain mutation.
       const bytes = await readFile(part.video.path);
-      const form = multipart({ i: this.config.token, comment: part.video.alt, isSensitive: String(sensitive), force: 'true' }, [
+      const form = multipart({ i: this.config.token, comment: part.video.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
         { field: 'file', filename: 'crosspost.mp4', mimeType: part.video.mimeType, bytes },
       ]);
       const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,

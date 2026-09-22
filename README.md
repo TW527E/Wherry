@@ -1,4 +1,4 @@
-# crosspost-bridge
+# Wherry
 
 X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動完成**；工具只讀取你自己的 X 內容，並自動同步到 Bluesky、dvd.chat（Sharkey）與 Telegram。
 
