@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { isPublicAddress, SafeHttp, validatePublicUrl, HttpError } from '../src/security/http.js';
 import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape } from '../src/text.js';
 import { blueskyRecordKey } from '../src/platforms/bluesky.js';
-import { fullSizeImageUrl } from '../src/platforms/x.js';
+import { fullSizeImageUrl, hasSensitiveWarning, parseTweetFacts } from '../src/platforms/x.js';
 import { TelegramClient } from '../src/platforms/telegram.js';
 import { SharkeyClient } from '../src/platforms/sharkey.js';
 import type { HttpOptions, HttpResponse, PreparedImage, Transport } from '../src/types.js';
@@ -180,6 +180,34 @@ test('an empty SHARKEY_DRIVE_FOLDER uploads to the drive root with no folder loo
     { audience: 'public', idempotencyKey: 'k:0' },
   );
   assert.ok(!calls.includes('drive/folders/find'), 'an empty folder name skips folder resolution entirely');
+});
+
+test('the X sensitive-media warning is recognised but ordinary post chrome is not', () => {
+  // The warning X renders in place of media it has flagged, in both interfaces this collector sees.
+  assert.equal(hasSensitiveWarning('The following media includes potentially sensitive content'), true);
+  assert.equal(hasSensitiveWarning('This media may contain sensitive material'), true);
+  assert.equal(hasSensitiveWarning('以下媒體可能包含敏感內容'), true);
+  assert.equal(hasSensitiveWarning('這則貼文可能包含敏感內容'), true);
+  // The collector passes the post's UI text with the tweet BODY removed, so these are the strings the
+  // check actually sees for an ordinary post. None of them may be read as a sensitive flag.
+  for (const chrome of ['誠誠-ChengCheng 💫@TW527E·1h12345', 'Replying to @someone', 'Show more', 'Translate post', 'Pinned', '1:23', '']) {
+    assert.equal(hasSensitiveWarning(chrome), false, `ordinary chrome must not match: ${JSON.stringify(chrome)}`);
+  }
+});
+
+test('the poll flag and sensitive label survive parsing into post facts', () => {
+  const base = { id: '123', authorId: 'owner', createdAt: '2026-09-19T00:00:00.000Z' };
+  // Both flags were previously never set for X posts: the collector did not detect either, so a poll
+  // synced as its question alone and flagged media synced with no marking at all.
+  const poll = parseTweetFacts({ ...base, text: 'which one', poll: true }, 'owner');
+  assert.equal(poll.poll, true);
+  assert.equal(poll.sensitive, false);
+  const flagged = parseTweetFacts({ ...base, text: 'nsfw', labels: ['sensitive_media'] }, 'owner');
+  assert.equal(flagged.sensitive, true);
+  assert.equal(flagged.poll, false);
+  const plain = parseTweetFacts({ ...base, text: 'hello' }, 'owner');
+  assert.equal(plain.poll, false, 'a post with no poll widget is not a poll');
+  assert.equal(plain.sensitive, false, 'a post with no warning is not sensitive');
 });
 
 test('link cleaning rewrites X URLs but preserves other links and punctuation', () => {
