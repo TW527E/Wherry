@@ -291,15 +291,13 @@ test('unsupported phase-one content is held instead of being silently degraded',
   const notes = [
     post({ id: '700', createdAt: at(10), attachments: [{ kind: 'video', alt: '' }] }),
     post({ id: '701', createdAt: at(10), poll: true }),
-    post({ id: '702', createdAt: at(10), sensitive: true }),
     post({ id: '703', createdAt: at(10), visibility: 'restricted' }),
     post({ id: '704', createdAt: at(10), metadataComplete: false }),
   ];
   assert.equal(unsupportedReason(notes[0]!), 'video_sync_disabled');
   assert.equal(unsupportedReason(notes[1]!), 'poll_not_supported');
-  assert.equal(unsupportedReason(notes[2]!), 'sensitive_content_requires_manual_review');
-  assert.equal(unsupportedReason(notes[3]!), 'non_public_content');
-  assert.equal(unsupportedReason(notes[4]!), 'incomplete_metadata');
+  assert.equal(unsupportedReason(notes[2]!), 'non_public_content');
+  assert.equal(unsupportedReason(notes[3]!), 'incomplete_metadata');
   const { store, engine } = setup();
   engine.ingest(snapshot(notes, at(650)), at(650));
   // Keep the mirror watchers fresh so the hold is caused by the content, not by stale observers.
@@ -598,6 +596,30 @@ test('a reminder is not queued when Telegram has no way to deliver it', () => {
   const previewNative = post({ id: 'at://did:plc:x/78', platform: 'bluesky', authorId: 'bluesky-account', createdAt: at(5), text: 'native post body' });
   previewEngine.ingest(snapshot([previewNative], at(10), 'bluesky', 'bluesky-account'), at(10));
   assert.equal(previewStore.jobs(100).filter(j => j.kind === 'reminder').length, 1);
+});
+
+test('source-flagged sensitive content publishes with a marking instead of being held', async () => {
+  const { store, engine } = setup(['bluesky', 'sharkey']);
+  // Text-only so the parts render without network; what is under test is that the flag survives the trip.
+  const flagged = post({ id: '710', createdAt: at(10), sensitive: true, text: 'flagged body' });
+  assert.equal(unsupportedReason(flagged), undefined, 'a flagged post is publishable, not held');
+  engine.ingest(snapshot([flagged], at(650)), at(650));
+  for (const source of ['bluesky', 'sharkey'] as const) engine.ingest(snapshot([], at(700), source, `${source}-account`), at(700));
+  assert.equal(engine.sealReady(at(900)), 1, 'the batch seals and publishes normally');
+  assert.equal(store.getPost('x', '710')?.classification, 'ready');
+  for (const destination of ['bluesky', 'sharkey'] as const) {
+    const job = store.jobs(100).find(j => j.kind === 'publish' && j.destination === destination)!;
+    for (const part of await engine.parts(job)) {
+      if (part.isFooter) continue;
+      assert.equal(part.sensitive, true, `${destination} carries the marking on every part`);
+    }
+  }
+
+  // An unflagged post carries no marking, so nothing is over-labelled.
+  engine.ingest(snapshot([post({ id: '711', createdAt: at(10), text: 'plain body' })], at(650)), at(650));
+  engine.sealReady(at(900));
+  const plainJob = store.jobs(100).find(j => j.kind === 'publish' && j.aggregateId === 'x:711' && j.destination === 'bluesky')!;
+  assert.ok((await engine.parts(plainJob)).every(p => p.sensitive === undefined && p.cw === undefined));
 });
 
 test('a repeatedly failing downstream collector degrades seal freshness instead of blocking forever', () => {

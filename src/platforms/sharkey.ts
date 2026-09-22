@@ -258,7 +258,9 @@ export class SharkeyClient implements Publisher, Collector {
       if (image.alt.length > limits.maxAltTextLength) throw new PlatformError('Image alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
     }
     const fileIds: string[] = [];
-    const sensitive = part.cw !== undefined && part.cw.length > 0;
+    // A file is marked sensitive when the source flagged the post, or when a source CW came with it
+    // (Sharkey blurs such media per the viewer's own settings, so the warning travels without blocking).
+    const sensitive = part.sensitive === true || (part.cw !== undefined && part.cw.length > 0);
     const folderId = (part.images.length || part.video) ? await this.resolveFolder() : null;
     const uploadStamp = this.now().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
     for (let index = 0; index < part.images.length; index++) {

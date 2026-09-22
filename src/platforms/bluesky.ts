@@ -451,6 +451,10 @@ export class BlueskyClient implements Publisher, Collector {
       ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: part.video!.width, height: part.video!.height }, ...(part.video!.alt ? { alt: part.video!.alt } : {}) }
       : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;
     const record: JsonObject = { $type: collection, text, createdAt: this.now().toISOString(),
+      // A source-flagged sensitive post carries a self-label — the mechanism Bluesky hides or warns on
+      // for content its author marks. `graphic-media` is the generic "warn before showing" value; X's own
+      // category (nudity/violence/other) never reaches the collector, so no narrower claim is made.
+      ...(part.sensitive ? { labels: { $type: 'com.atproto.label.defs#selfLabels', values: [{ val: 'graphic-media' }] } } : {}),
       ...(facets.length ? { facets } : {}), ...(reply ? { reply } : {}),
       ...(embed ? { embed } : {}) };
     const expectedUri = `at://${session.did}/${collection}/${key}`;

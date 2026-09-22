@@ -85,7 +85,14 @@ export interface PublishPart {
   key: string;
   sourcePostId: string;
   text: string;
+  /** The source's own human-readable warning, carried through as-is (e.g. another platform's CW text). */
   cw?: string;
+  /**
+   * The source flagged this content as sensitive (X's media warning, or a source CW). NOT a hold: the
+   * post still publishes, and each destination carries the marking its platform supports — Bluesky a
+   * self-label, Sharkey a sensitive drive file, Telegram a media spoiler.
+   */
+  sensitive?: boolean;
   images: PreparedImage[];
   /**
    * A single transcoded video, mutually exclusive with images (X and Bluesky both forbid mixing).

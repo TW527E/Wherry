@@ -144,7 +144,8 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | 晚發的自回覆（超過 root 窗口） | `skipped_late_self_reply` |
 | 回覆一串早已同步完成的舊推文 | `self_reply_outside_new_batch` |
 | 串文分支（非線性） | 保留待審，不強行攤平 |
-| 轉貼、引用、非公開、敏感、投票、影片、GIF、超過 4 張圖 | 保留或忽略，不會靜默降級 |
+| 轉貼、引用、非公開、投票、影片、GIF、超過 4 張圖 | 保留或忽略，不會靜默降級 |
+| 敏感內容（你標了敏感的媒體、來源端的 CW） | 照常同步，但帶著各平台的標記（Bluesky selfLabels、dvd.chat 敏感檔、Telegram spoiler） |
 | 你手動貼到 X 的鏡像 | `manual_mirror`，不同步 |
 
 ### 防回音怎麼判斷

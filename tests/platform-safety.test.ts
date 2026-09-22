@@ -93,7 +93,7 @@ test('several images from one post go out as a single Telegram album with the ca
   );
   const image = (n: number): PreparedImage => ({ bytes: new Uint8Array([n]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: String(n) });
   const ref = await client.publish(
-    { key: 'k:0', sourcePostId: '9', text: '我的內文', images: [image(1), image(2), image(3)], sourceUrl: 'https://fixupx.com/owner/status/9' },
+    { key: 'k:0', sourcePostId: '9', text: '我的內文', images: [image(1), image(2), image(3)], sourceUrl: 'https://fixupx.com/owner/status/9', sensitive: true },
     { audience: 'public', idempotencyKey: 'k:0' },
   );
   assert.equal(captured.length, 1, 'three images are one album call, not three messages');
@@ -102,6 +102,7 @@ test('several images from one post go out as a single Telegram album with the ca
   assert.match(captured[0]!.body, /原文連結/, 'the source link rides on the album caption');
   assert.match(captured[0]!.body, /attach:\/\/photo0/);
   assert.match(captured[0]!.body, /attach:\/\/photo2/);
+  assert.match(captured[0]!.body, /has_spoiler/, 'a flagged post sends its album with a spoiler');
   assert.deepEqual(ref.messageIds, [41, 42, 43], 'every album message id is recorded for threading');
 });
 
@@ -119,7 +120,8 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
       // First lookup finds nothing → the client must create the folder, then never create it twice.
       if (method === 'drive/folders/find') { findCalls++; return json([]); }
       if (method === 'drive/folders/create') return json({ id: 'folder1', name: 'Wherry', parentId: null });
-      if (method === 'drive/files/create') return json({ id: 'file1', comment: null, isSensitive: false });
+      // The upload echoes back isSensitive, which the client checks against the flag it sent.
+      if (method === 'drive/files/create') return json({ id: 'file1', comment: null, isSensitive: true });
       if (method === 'notes/create') return json({ createdNote: { id: 'note1', uri: null } });
       throw new Error(`unexpected Sharkey call: ${method}`);
     },
@@ -132,7 +134,7 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
   const client = new SharkeyClient(config, transport, { now: () => new Date('2026-09-21T15:30:00.000Z') });
   const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
   const ref = await client.publish(
-    { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9' },
+    { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9', sensitive: true },
     { audience: 'public', idempotencyKey: 'k:0' },
   );
   assert.equal(ref.id, 'note1');
@@ -140,6 +142,7 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
   assert.ok(upload, 'the image is uploaded to the drive');
   assert.match(upload!.body, /name="folderId"\r\n\r\nfolder1/, 'the upload carries the resolved folder id');
   assert.match(upload!.body, /filename="Wherry_20260921T153000Z-0\.jpg"/, 'the filename follows the configured template');
+  assert.match(upload!.body, /name="isSensitive"\r\n\r\ntrue/, 'a flagged post marks its drive file sensitive');
 
   // A second publish on the same client reuses the cached folder id — no second find/create.
   await client.publish(

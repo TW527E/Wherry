@@ -73,7 +73,9 @@ export function holdIsApprovable(reason: string | undefined): boolean {
 export function unsupportedReason(post: SourcePost, videoEnabled = false): string | undefined {
   if (!post.metadataComplete) return 'incomplete_metadata';
   if (post.visibility !== 'public') return 'non_public_content';
-  if (post.sensitive || post.cw) return 'sensitive_content_requires_manual_review';
+  // Sensitive content is NOT held: it publishes with the marking each destination supports (see
+  // PublishPart.sensitive). Holding it left the owner with content that could never sync, while every
+  // platform involved has a real mechanism for carrying the warning.
   if (post.poll) return 'poll_not_supported';
   if (post.attachments.length > 4) return 'more_than_four_images';
   const video = post.attachments.find(a => a.kind === 'video');
@@ -551,6 +553,11 @@ export class Engine {
       let text = cleanXLinks(post.text);
       if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
+      // A source-flagged sensitive post publishes like any other, carrying its marking on every part:
+      // the warning applies to the whole thread, and the destinations that act on it (Sharkey's drive
+      // files, Telegram's media) are on the part that holds the media.
+      const sensitive = Boolean(post.sensitive || post.cw);
+      const marking = { ...(sensitive ? { sensitive: true } : {}), ...(post.cw ? { cw: post.cw } : {}) };
       const key = createHash('sha256').update(post.id).digest('hex').slice(0, 16);
       if (job.destination === 'telegram') {
         // A tweet's images belong to ONE post, so send them as a single album (sendMediaGroup)
@@ -560,9 +567,9 @@ export class Engine {
         // caption chunk fits the album and any overflow continues as plain follow-up messages.
         const chunks = splitHtml(text, images.length || video ? 1024 : 4096, sourceUrl ? 120 : 0);
         const caption = chunks[0] ?? '';
-        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl });
+        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking });
         for (let i = 1; i < chunks.length; i++) {
-          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl });
+          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl, ...marking });
         }
       } else {
         // Sharkey renders MFM, so instead of a trailing reply carrying the X link (Bluesky's footer),
@@ -575,7 +582,7 @@ export class Engine {
         const chunks = splitText(text, job.destination === 'bluesky' ? { graphemes: 300, utf8Bytes: 3000 } : { utf16 });
         chunks.forEach((chunk, index) => {
           const body = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
-          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl });
+          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking });
         });
       }
     }
