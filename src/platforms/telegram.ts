@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
+import { isSensitiveContent, warningPrefix } from '../content-warning.js';
 import type { PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
 import { htmlEscape, splitText } from '../text.js';
 import { PlatformError, requestJson, schemaError } from './parse.js';
@@ -41,11 +42,15 @@ export class TelegramClient implements Publisher {
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     const audience = context.audience === 'private' ? 'private' : context.audience === 'ops' ? 'ops' : 'public'; const chatId = this.chat(audience);
     const reply = context.parent?.messageIds?.[0] ? { message_id: context.parent.messageIds[0], allow_sending_without_reply: false } : undefined;
+    if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Telegram CW must be text', { code: 'InvalidCW' });
+    const sensitive = isSensitiveContent(part);
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
+    const body = htmlEscape(part.text);
+    const rendered = `${htmlEscape(warningPrefix(part))}${sensitive && body ? `<tg-spoiler>${body}</tg-spoiler>` : body}${link}`;
     if (part.video) {
-      const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
+      const caption = rendered; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
       const bytes = await readFile(part.video.path);
-      const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', supports_streaming: 'true', ...(part.sensitive ? { has_spoiler: 'true' } : {}), ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) },
+      const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', supports_streaming: 'true', ...(sensitive ? { has_spoiler: 'true' } : {}), ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) },
         { name: 'crosspost.mp4', type: part.video.mimeType, bytes, field: 'video' });
       const response = await requestJson(this.transport, this.endpoint('sendVideo'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, 'Telegram sendVideo', true) as TelegramResponse<TelegramMessage>;
       if (!response.ok || !response.result) throw schemaError('Telegram sendVideo', true);
@@ -53,8 +58,8 @@ export class TelegramClient implements Publisher {
     }
     if (part.images.length > 4) throw new Error('Telegram publisher accepts at most four images per durable step');
     if (part.images.length === 1) {
-      const image = part.images[0]!; const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
-      const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', ...(part.sensitive ? { has_spoiler: 'true' } : {}), ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) }, { name: `crosspost.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, type: image.mimeType, bytes: image.bytes, field: 'photo' });
+      const image = part.images[0]!; const caption = rendered; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
+      const form = multipart({ chat_id: chatId, caption, parse_mode: 'HTML', ...(sensitive ? { has_spoiler: 'true' } : {}), ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) }, { name: `crosspost.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, type: image.mimeType, bytes: image.bytes, field: 'photo' });
       const response = await requestJson(this.transport, this.endpoint('sendPhoto'), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, 'Telegram sendPhoto', true) as TelegramResponse<TelegramMessage>;
       if (!response.ok || !response.result) throw schemaError('Telegram sendPhoto', true);
       return { id: String(response.result.message_id), messageIds: [response.result.message_id], chatId };
@@ -62,13 +67,13 @@ export class TelegramClient implements Publisher {
     if (part.images.length > 1) {
       // Several photos from one tweet post as a single album, caption (with the link) on the
       // first item — the whole group is one durable step so a retry replays the same album.
-      const caption = `${htmlEscape(part.text)}${link}`; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
+      const caption = rendered; if (caption.length > MAX_CAPTION) throw new Error('Telegram caption requires core text splitter before publish');
       const files = part.images.map((image, index) => ({
         name: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, type: image.mimeType, bytes: image.bytes, field: `photo${index}`,
       }));
       const media = part.images.map((image, index) => ({
         type: 'photo', media: `attach://photo${index}`,
-        ...(part.sensitive ? { has_spoiler: true } : {}),
+        ...(sensitive ? { has_spoiler: true } : {}),
         ...(index === 0 ? { caption, parse_mode: 'HTML' } : {}),
       }));
       const form = multipartMulti({ chat_id: chatId, media: JSON.stringify(media), ...(reply ? { reply_parameters: JSON.stringify(reply) } : {}) }, files);
@@ -77,9 +82,10 @@ export class TelegramClient implements Publisher {
       const ids = response.result.map(message => message.message_id);
       return { id: String(ids[0]), messageIds: ids, chatId };
     }
-    const text = `${htmlEscape(part.text)}${link}`; if (text.length > MAX_TEXT) throw new Error('Telegram message requires core text splitter before publish');
+    const text = rendered; if (text.length > MAX_TEXT) throw new Error('Telegram message requires core text splitter before publish');
     const markup = part.buttons?.length ? { reply_markup: { inline_keyboard: [part.buttons.map(b => ({ text: b.text, callback_data: b.data }))] } } : {};
-    const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...(reply ? { reply_parameters: reply } : {}), ...markup });
+    const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML',
+      ...(sensitive ? { link_preview_options: { is_disabled: true } } : {}), ...(reply ? { reply_parameters: reply } : {}), ...markup });
     return { id: String(result.message_id), messageIds: [result.message_id], chatId };
   }
   async sendPlain(text: string, audience: TelegramAudience = 'ops'): Promise<RemoteRef> {

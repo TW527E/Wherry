@@ -1,7 +1,8 @@
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { BROWSER_CHOICES } from './platforms/browser.js';
-import type { Destination } from './types.js';
+import { BLUESKY_SENSITIVE_LABELS, DEFAULT_BLUESKY_SENSITIVE_LABEL } from './content-warning.js';
+import type { Destination, SensitiveLabel } from './types.js';
 
 const bool = (value: string | undefined, fallback: boolean): boolean => value === undefined ? fallback : value === 'true';
 
@@ -33,7 +34,7 @@ export interface AppConfig {
   destinations: Destination[];
   x: { enabled: boolean; handle: string; profileDir: string; browser: string; executablePath: string; headless: boolean; maxPages: number; sessionFile: string; sandbox: boolean };
   media: { video: boolean; ffmpegPath: string; ffprobePath: string };
-  bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string };
+  bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string; sensitiveLabel: SensitiveLabel };
   sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string; driveFolder: string; uploadName: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
 }
@@ -79,6 +80,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       enabled: bool(env.BLUESKY_ENABLED, false), identifier: env.BLUESKY_IDENTIFIER || '',
       appPassword: env.BLUESKY_APP_PASSWORD || '', serviceUrl: env.BLUESKY_SERVICE_URL || 'https://bsky.social',
       publicUrl: 'https://public.api.bsky.app',
+      sensitiveLabel: z.enum(BLUESKY_SENSITIVE_LABELS).parse(env.BLUESKY_SENSITIVE_LABEL ?? DEFAULT_BLUESKY_SENSITIVE_LABEL),
     },
     sharkey: {
       enabled: bool(env.SHARKEY_ENABLED, false), baseUrl: env.SHARKEY_URL || 'https://dvd.chat',

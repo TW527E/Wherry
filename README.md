@@ -74,6 +74,7 @@ docker compose logs -f
 | `CHROMIUM_PATH` | `X_BROWSER=path` 時的瀏覽器執行檔路徑 |
 | `X_PROFILE_DIR` | 你手動登入一次後保留的瀏覽器 profile 目錄（請保持私密） |
 | `BLUESKY_*` | 官方 API，請用 **app password**，不要用主密碼 |
+| `BLUESKY_SENSITIVE_LABEL` | 未分類敏感內容的 self-label，預設 `graphic-media`（血腥／暴力類，不是通用警告）；依內容可選 `porn`、`sexual`、`nudity`、`graphic-media` |
 | `SHARKEY_*` | dvd.chat API token，權限只需 `write:drive`、`write:notes` |
 | `TELEGRAM_TOKEN` | bot token（BotFather 取得） |
 | `TELEGRAM_PUBLIC_CHAT_ID` | 對外同步的頻道（一律用數字 ID，不是 @username） |
@@ -82,7 +83,7 @@ docker compose logs -f
 | `TELEGRAM_OWNER_ID` | 唯一可下指令、按提醒按鈕、上傳 session 的使用者 ID |
 | `TELEGRAM_POLL_COMMANDS` | `true` 才輪詢並處理指令與互動按鈕（僅 `live`） |
 
-完整 40 個設定鍵（用途＋取得方式）見 [`docs/configuration.md`](docs/configuration.md)。
+完整設定說明（用途＋取得方式）見 [`docs/configuration.md`](docs/configuration.md)。
 
 **設定會強制檢查**：若 `DESTINATIONS` 含 `bluesky`，就必須同時 `BLUESKY_ENABLED=true`，`sharkey` 同理。原因是工具必須觀察那個帳號才能排除「手動鏡像」，否則防回音會失去依據。這是刻意的設計，不是可以繞過的選項。
 
@@ -136,7 +137,7 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 3. 只有同一作者、沿著直接回覆鏈、且在窗口內的自回覆會加入同一批次。
 4. 批次在窗口結束、且**每個下游平台都有近期掃描**之後才封存；封存才發布。
 
-### 什麼不會被同步
+### 不同步與特殊處理
 
 | 情況 | 判定 |
 |---|---|
@@ -145,8 +146,10 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | 回覆一串早已同步完成的舊推文 | `self_reply_outside_new_batch` |
 | 串文分支（非線性） | 保留待審，不強行攤平 |
 | 轉貼、引用、非公開、投票、影片、GIF、超過 4 張圖 | 保留或忽略，不會靜默降級 |
-| 敏感內容（你標了敏感的媒體、來源端的 CW） | 照常同步，但帶著各平台的標記（Bluesky selfLabels、dvd.chat 敏感檔、Telegram spoiler） |
+| 敏感內容（你標了敏感的媒體、來源端的 CW） | 照常同步：Bluesky 每段 selfLabels＋CW 文字、Sharkey 每段 CW＋敏感檔案、Telegram 正文與媒體 spoiler |
 | 你手動貼到 X 的鏡像 | `manual_mirror`，不同步 |
+
+敏感標記不會解除非公開、投票或不支援媒體的限制。來源沒有 CW 時使用「來源標記為敏感內容」，各分段都預留警告長度；Bluesky 的媒體遮蔽仍依讀者設定，純文字只保留可見 CW，不保證折疊。X 偵測僅涵蓋頁面可見的警告，不能保證辨認所有敏感內容。詳見 [敏感內容同步說明](docs/configuration.md#敏感內容如何同步)。
 
 ### 防回音怎麼判斷
 

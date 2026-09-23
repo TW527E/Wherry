@@ -395,7 +395,9 @@ bot token，preview 模式需要 `telegram` 在 `DESTINATIONS` 內。沒有管�
 | Bluesky 影片僅 MP4 | 二階段轉碼管線 |
 | dvd.chat CW ≤500、文字 ≤3000 | 自動截斷或拆文 |
 | Telegram 4096/1024 限制 | 自動拆則 |
-| 來源標記為敏感（X 的媒體警告、來源端的 CW） | 不保留，照常發布但**帶著標記**：Bluesky `selfLabels`（`graphic-media`，即「顯示前先警告」）、dvd.chat 該檔 `isSensitive`（CW 文字若有則一併沿用）、Telegram 媒體加 spoiler |
+| 來源標記為敏感（X 的媒體警告、來源端的 CW） | 照常發布並保留警告：Bluesky 每段 `selfLabels` 與 CW 前綴；Sharkey 每段 CW、所有媒體檔 `isSensitive=true`；Telegram 正文與媒體 spoiler、停用敏感文字訊息的連結預覽 |
+
+Bluesky 優先保留來源已知分類，未分類時用 `BLUESKY_SENSITIVE_LABEL`（預設 `graphic-media`，可設 `porn`／`sexual`／`nudity`／`graphic-media`）。`graphic-media` 指血腥／暴力等刺激性媒體，**不是通用警告**；請依實際內容選擇。Bluesky 的自行標記 `!warn` 不生效，媒體標籤也不折疊純文字，因此另保留可見的 CW。沒有來源 CW 時使用「來源標記為敏感內容」；分段預留警告長度，不會為了送出而靜默刪除警告。
 
 ### 8.3 dvd.chat 檔案大小（使用者補充資訊）
 

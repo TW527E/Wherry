@@ -1,6 +1,6 @@
 # 設定與維運參考
 
-本文件說明 [`src/config.ts`](../src/config.ts) 讀取的 **40 個設定鍵**、憑證取得方法與維運方式。可直接使用的安全起點是 [`.env.example`](../.env.example)；日常操作入口見 [README](../README.md)。未啟用的帳戶欄位可以留空，不需要為了啟動工具申請所有平台的憑證。
+本文件說明 [`src/config.ts`](../src/config.ts) 讀取的設定、憑證取得方法與維運方式。可直接使用的安全起點是 [`.env.example`](../.env.example)；日常操作入口見 [README](../README.md)。未啟用的帳戶欄位可以留空，不需要為了啟動工具申請所有平台的憑證。
 
 ## 目錄
 
@@ -21,7 +21,7 @@
 4. 整數必須落在表列範圍內，上下限都包含；使用不帶單位的十進位數字。空字串會轉成 `0`，本表整數設定都會因此驗證失敗。
 5. 路徑以**工作目錄**解析，不是以 `.env` 所在位置解析。不要依賴 `~`、`$DATA_DIR` 或 `${DATA_DIR}` 展開；本程式未使用 `dotenv-expand`。含空白的路徑請加雙引號，伺服器上建議用絕對路徑。
 6. `X_PROFILE_DIR`／`X_SESSION_FILE` 留空才會跟隨 `DATA_DIR`。若寫死 `./data/x-profile`，之後改 `DATA_DIR` 不會一起搬動它。
-7. `.env.example` 有 39 個啟用中的指定值，另以註解列出 `X_SANDBOX`，合計涵蓋 40 個鍵。未知鍵不會自動變成新功能；沒有 `X_PASSWORD`、`MAX_IMAGE_BYTES`、影片發布開關或回填歷史貼文開關。
+7. `.env.example` 同時列出必填與選填設定；有預設值的選填項目可保留註解，該行仍寫出預設值供參考。未知鍵不會自動變成新功能；沒有 `X_PASSWORD`、`MAX_IMAGE_BYTES` 或回填歷史貼文開關。
 
 **preview 不是離線沙盒。** 它使用模擬 publisher，不送出平台貼文、Telegram 提醒／告警／指令回覆；但已啟用的來源仍會連網讀取，媒體可能下載，本機基準、批次與模擬送出狀態仍會保存。Telegram 命令輪詢只在 `live` 啟動。需要完全離線時，停用所有來源及 Telegram，且不要執行 `login`／`import-session` 等會連線的命令。
 
@@ -56,12 +56,12 @@ Web 頁面可輸入 token；目前 UI 會把它保存在該瀏覽器來源的 `l
 | `X_SESSION_FILE` | `DATA_DIR/x-session.json` | `export-session` 寫入與 `import-session` 讀取的檔案路徑；空字串採預設。檔案接受上限固定 **262144 bytes（256 KiB）**。 | 由 `export-session` 產生，不是任意瀏覽器 cookie 匯出檔；自訂位置要先建立私密父目錄。 |
 | `X_SANDBOX` | **Linux 且 UID=0：`false`；其他環境：`true`** | Chromium sandbox 開關。不設定時依平台與使用者判斷；若強制設定，仍按一般布林規則解析。設 false 會降低瀏覽器隔離。 | 正式部署使用非 root 專用帳戶並保留 sandbox。只有了解環境限制時才明確覆寫，勿以空值或 `auto` 表示自動。 |
 
-`chrome-beta`／`msedge-beta` 也會先查找已知的 stable 安裝位置，找不到才回退到對應 channel；它們不是版本鎖定。若需要精確執行檔，使用 `X_BROWSER=path` + `CHROMIUM_PATH`。作業系統的 `HOME`／Windows 安裝路徑環境變數會影響自動偵測，這些不是本程式的 40 個應用設定鍵。
+`chrome-beta`／`msedge-beta` 也會先查找已知的 stable 安裝位置，找不到才回退到對應 channel；它們不是版本鎖定。若需要精確執行檔，使用 `X_BROWSER=path` + `CHROMIUM_PATH`。作業系統的 `HOME`／Windows 安裝路徑環境變數會影響自動偵測，這些不是本程式的應用設定鍵。
 
 目前 collector 讀取 X 個人頁的主時間軸，不是完整歷史 API，也不保證呈現所有自回覆。核心只能組合**實際收集到且關係明確**的線性串文；不要把 `X_MAX_PAGES` 或時間窗口當成「完整串文一定不漏」的保證。
 
 <a id="bluesky"></a>
-## Bluesky（4 個）
+## Bluesky（5 個）
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
@@ -69,8 +69,21 @@ Web 頁面可輸入 token；目前 UI 會把它保存在該瀏覽器來源的 `l
 | `BLUESKY_IDENTIFIER` | 空字串 | 完整 handle（不含 `@`）、支援的 DID（`did:plc`／`did:web`）或登入 email。 | 建議從自己的官方 App 個人頁複製 handle；email 是登入識別值，不是公開名稱。 |
 | `BLUESKY_APP_PASSWORD` | 空字串 | 專用應用程式密碼，不是主密碼。即使只觀察來源，目前 runtime 也要求此值。 | 在 [官方 App passwords 頁](https://bsky.app/settings/app-passwords) 建立，見 [詳細步驟](#credentials)。 |
 | `BLUESKY_SERVICE_URL` | `https://bsky.social` | 使用 email 登入時的 bootstrap 服務；必須是 HTTPS 基底位址。實際 PDS 仍透過帳戶 DID 文件探索，並非任意指定公開 AppView 的開關。 | 官方託管帳戶通常保持預設；自架 PDS 使用管理員公布的服務原點，且不得是被 HTTP 防護拒絕的內網位址。 |
+| `BLUESKY_SENSITIVE_LABEL` | `graphic-media` | 來源標為敏感但未提供已知分類時的 self-label；只接受 `porn`、`sexual`、`nudity`、`graphic-media`，空值會報錯。已知來源分類優先保留。 | 依實際內容選擇；`graphic-media` 指血腥／暴力等刺激性媒體，不是通用警告。詳見下方說明。 |
 
 公開 AppView 固定為 `https://public.api.bsky.app`，沒有對應 env 設定。Handle／DID 會透過公開解析與 DID 文件找 PDS；不要為了登入問題把憑證放到 URL 或隨意改成不受信任的服務。
+
+### 敏感內容如何同步
+
+已偵測到的敏感標記不再單獨構成保留原因，但非公開內容、投票、不完整資料及不支援的媒體仍照原規則處理。
+
+- **Bluesky**：每個內容分段都帶 `selfLabels` 及可見的 `CW: …` 前綴。來源已有 `porn`／`sexual`／`nudity`／`graphic-media` 時保留分類；未分類才用 `BLUESKY_SENSITIVE_LABEL`。媒體遮蔽受讀者偏好控制，這些標籤不會自動折疊純文字。自行附上的 `!warn` 會被 Bluesky 的 moderation 規則忽略，因此不使用它假裝通用警告。
+- **Sharkey**：每段都有 CW，媒體檔案同時設定 `isSensitive=true`。沿用來源 CW；只有敏感旗標或空白 CW 時，使用「來源標記為敏感內容」。
+- **Telegram**：保留可見警告，正文與圖片說明使用 spoiler，單張圖片、相簿每張圖片及影片都帶 `has_spoiler`；敏感文字訊息停用連結預覽，避免預覽繞過遮蔽。私人手動 X 提醒也保留警告。
+
+分段會預留 CW／HTML 的長度，不會在發布時才把原本剛好達上限的內容擠爆。若 CW 本身過長而無法容納，工作會明確報錯，不會刪掉警告後繼續發送。舊的 review 批次不會因更新而自行補發；仍須人工檢查後處理。
+
+X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，或 X 改版／語言不受支援，仍可能漏偵測；這不是對未標記內容的自動分類器。
 
 <a id="sharkey"></a>
 ## Sharkey（5 個）
@@ -285,7 +298,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | X 出現登入牆、challenge、零推文或解析失敗 | 在本機自行重新驗證，匯出新 session 後安全匯入；不要自動繞過驗證。也可能是 X 前端改版，保留檢查點並查看錯誤。 |
 | `Incomplete snapshot`／backlog 超出預算 | 該輪不推進來源檢查點；X 可在上限內調整 `X_MAX_PAGES`，降低合理輪詢間隔。B/S 頁數並無 env 可任意放大。不要清除 checkpoint 來假裝沒有缺口。 |
 | X 批次停在 `open` | 檢查窗口、settle 時間與所需來源的新鮮度；Bluesky／Sharkey 若被列為 destination 卻缺憑證或持續讀取失敗，會阻止正常封存。 |
-| 批次或工作停在 `review` | 先看原因；疑似鏡像要人工決定，敏感／非公開／不完整或不支援媒體不能用 approve 強行放行。 |
+| 批次或工作停在 `review` | 先看原因；疑似鏡像或長文要人工決定，非公開／不完整或不支援媒體不能用 approve 強行放行。敏感標記本身不再保留；無其他問題時會帶警告同步。 |
 | 401／403／Sharkey `read:account` 不足 | 核對同帳戶的憑證與實例；Sharkey 優先填自己的 username 或 user ID，若採 `/api/i` 才另外需要 read scope。不要把 token 或完整回應貼到 issue。 |
 | Telegram 不回指令／按鈕沒反應 | 需 live、enabled、token、`TELEGRAM_POLL_COMMANDS=true`，且 owner/private chat 都正確；先 `/start`，檢查是否另有 poller／webhook。preview 不會回應。 |
 | Telegram 沒有告警 | 需 live 及可用 Telegram 設定；ops 空白時才回退 private。只轉送新 `error` 事件，並非所有訊息。即使 pollCommands=false 仍應可發告警。 |

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
+import { BLUESKY_SENSITIVE_LABELS, isSensitiveContent, warningPrefix } from '../content-warning.js';
 import type { Attachment, Collector, HttpOptions, PreparedVideo, PublishContext, Publisher, PublishPart, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import {
   PlatformError, canonicalJson, httpsBase, isoDate, jsonBody, nonempty, object, own,
@@ -231,12 +232,15 @@ function parsePost(entry: unknown, accountId: string, pds: string): ParsedPost {
   else if (own(view, 'embed')) { valid = false; attachments.push({ kind: 'unknown', alt: '' }); }
   const restricted = labels.includes('!no-unauthenticated') || labels.includes('!hide');
   const contentLabels = [...new Set(labels.filter(label => label !== '!no-unauthenticated'))];
+  const sensitiveLabels = BLUESKY_SENSITIVE_LABELS.filter(label => contentLabels.includes(label)
+    || (label === 'graphic-media' && contentLabels.some(value => value === 'gore' || value === 'nsfl')));
   return { valid, post: {
     platform: 'bluesky', id: view.uri as string, authorId: author.did, createdAt: record.createdAt,
     text, url: postUrl(view.uri), rootId, replyToId, replyToAuthorId, relationKnown,
     visibility: restricted ? 'restricted' : 'public', repost, quoteUrl,
     poll: own(record, 'poll') && record.poll != null,
     sensitive: contentLabels.length > 0, cw: contentLabels.length ? `Bluesky labels: ${contentLabels.join(', ')}` : undefined,
+    ...(sensitiveLabels.length ? { sensitiveLabels } : {}),
     attachments, metadataComplete: valid,
   } };
 }
@@ -420,7 +424,15 @@ export class BlueskyClient implements Publisher, Collector {
     if (part.video && part.images.length) throw new PlatformError('A Bluesky post cannot carry both a video and images', { code: 'MixedMedia' });
     if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Bluesky accepts at most four images per part', { code: 'TooManyImages' });
     for (const image of part.images) validateImage(image, 2_000_000);
-    const text = part.cw ? `CW: ${part.cw}\n\n${part.text}` : part.text;
+    if (typeof part.text !== 'string') throw new PlatformError('Bluesky text must be a string', { code: 'InvalidText' });
+    if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Bluesky CW must be text', { code: 'InvalidCW' });
+    if (part.sensitiveLabels !== undefined && (!Array.isArray(part.sensitiveLabels)
+      || part.sensitiveLabels.some(label => !BLUESKY_SENSITIVE_LABELS.includes(label)))) {
+      throw new PlatformError('Unsupported Bluesky sensitive label', { code: 'InvalidSensitiveLabel' });
+    }
+    const sensitive = isSensitiveContent(part);
+    const labels = sensitive ? [...new Set(part.sensitiveLabels?.length ? part.sensitiveLabels : [this.config.sensitiveLabel])] : [];
+    const text = `${warningPrefix(part)}${part.text}`;
     if (typeof text !== 'string' || (!text.trim() && !part.images.length && !part.video)) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
     if (Buffer.byteLength(text) > 3000 || Array.from(segmenter.segment(text)).length > 300) throw new PlatformError('Split Bluesky parts before publishing (300 graphemes / 3000 UTF-8 bytes)', { code: 'TextTooLong' });
     let reply: { root: StrongRef; parent: StrongRef } | undefined;
@@ -451,10 +463,9 @@ export class BlueskyClient implements Publisher, Collector {
       ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: part.video!.width, height: part.video!.height }, ...(part.video!.alt ? { alt: part.video!.alt } : {}) }
       : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;
     const record: JsonObject = { $type: collection, text, createdAt: this.now().toISOString(),
-      // A source-flagged sensitive post carries a self-label — the mechanism Bluesky hides or warns on
-      // for content its author marks. `graphic-media` is the generic "warn before showing" value; X's own
-      // category (nudity/violence/other) never reaches the collector, so no narrower claim is made.
-      ...(part.sensitive ? { labels: { $type: 'com.atproto.label.defs#selfLabels', values: [{ val: 'graphic-media' }] } } : {}),
+      // Known source categories take precedence over the configured fallback. These labels moderate
+      // media, not arbitrary text; the CW prefix also keeps a text-only warning visible.
+      ...(labels.length ? { labels: { $type: 'com.atproto.label.defs#selfLabels', values: labels.map(val => ({ val })) } } : {}),
       ...(facets.length ? { facets } : {}), ...(reply ? { reply } : {}),
       ...(embed ? { embed } : {}) };
     const expectedUri = `at://${session.did}/${collection}/${key}`;

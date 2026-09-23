@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
+import { contentWarning, isSensitiveContent } from '../content-warning.js';
 import type { Attachment, Collector, PublishContext, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import {
   PlatformError, httpsBase, isoDate, jsonBody, multipart, nonempty, object, own, positiveInteger,
@@ -247,20 +248,19 @@ export class SharkeyClient implements Publisher, Collector {
     if (part.video && part.images.length) throw new PlatformError('A Sharkey note cannot carry both a video and images', { code: 'MixedMedia' });
     if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length && !part.video)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Sharkey CW must be text', { code: 'InvalidCW' });
+    const cw = contentWarning(part);
+    const sensitive = isSensitiveContent(part);
     if (context.parent && !noteId(context.parent.id)) throw new PlatformError('Sharkey replies require a note ID', { code: 'InvalidReply' });
     if (context.root && !context.parent) throw new PlatformError('A thread root without a parent is not a valid reply', { code: 'InvalidReply' });
     for (const image of part.images) validateImage(image);
     const limits = await this.getLimits();
     if (!limits.canPublicNote) throw new PlatformError('The account role cannot create public notes', { code: 'PublicNotesNotAllowed' });
-    if (part.text.length > limits.maxNoteTextLength || (part.cw?.length ?? 0) > limits.maxCwLength) throw new PlatformError('Split text/CW to the Sharkey instance limits before publishing', { code: 'TextTooLong' });
+    if (part.text.length > limits.maxNoteTextLength || (cw?.length ?? 0) > limits.maxCwLength) throw new PlatformError('Split text/CW to the Sharkey instance limits before publishing', { code: 'TextTooLong' });
     for (const image of part.images) {
       validateImage(image, limits.maxFileBytes);
       if (image.alt.length > limits.maxAltTextLength) throw new PlatformError('Image alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
     }
     const fileIds: string[] = [];
-    // A file is marked sensitive when the source flagged the post, or when a source CW came with it
-    // (Sharkey blurs such media per the viewer's own settings, so the warning travels without blocking).
-    const sensitive = part.sensitive === true || (part.cw !== undefined && part.cw.length > 0);
     const folderId = (part.images.length || part.video) ? await this.resolveFolder() : null;
     const uploadStamp = this.now().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
     for (let index = 0; index < part.images.length; index++) {
@@ -299,7 +299,7 @@ export class SharkeyClient implements Publisher, Collector {
     // Sharkey does not promise a notes/create idempotency nonce. Never automatically replay an uncertain mutation.
     const result = object(await this.api('notes/create', {
       text: part.text || null, visibility: 'public', localOnly: false,
-      ...(part.cw !== undefined ? { cw: part.cw } : {}), ...(fileIds.length ? { fileIds } : {}),
+      ...(cw !== undefined ? { cw } : {}), ...(fileIds.length ? { fileIds } : {}),
       ...(context.parent ? { replyId: context.parent.id } : {}),
     }, true));
     const note = object(result?.createdNote);

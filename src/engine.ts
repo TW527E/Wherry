@@ -3,7 +3,8 @@ import { z } from 'zod';
 import twitterText from 'twitter-text';
 import type { AppConfig } from './config.js';
 import { Store } from './store.js';
-import { cleanXLinks, fixupUrl, htmlEscape, normalizeText, similarity, splitText } from './text.js';
+import { BLUESKY_SENSITIVE_LABELS, contentWarning, isSensitiveContent, warningPrefix } from './content-warning.js';
+import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
 import { prepareImages } from './media.js';
 import { prepareVideo } from './video.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from './types.js';
@@ -18,7 +19,8 @@ export const sourcePostSchema = z.object({
   createdAt: z.string().datetime(), text: z.string().max(100_000), url: z.string().url().optional(), rootId: z.string().optional(),
   replyToId: z.string().nullable().optional(), replyToAuthorId: z.string().nullable().optional(), relationKnown: z.boolean(),
   visibility: z.enum(['public', 'restricted', 'unknown']), repost: z.boolean().optional(), quoteUrl: z.string().optional(), poll: z.boolean().optional(),
-  cw: z.string().optional(), sensitive: z.boolean().optional(), attachments: z.array(attachmentSchema).max(100), metadataComplete: z.boolean(),
+  cw: z.string().optional(), sensitive: z.boolean().optional(), sensitiveLabels: z.array(z.enum(BLUESKY_SENSITIVE_LABELS)).max(4).optional(),
+  attachments: z.array(attachmentSchema).max(100), metadataComplete: z.boolean(),
 });
 export const snapshotSchema = z.object({
   platform: z.enum(['x', 'bluesky', 'sharkey']), accountId: z.string().min(1), posts: z.array(sourcePostSchema).max(1000),
@@ -73,9 +75,7 @@ export function holdIsApprovable(reason: string | undefined): boolean {
 export function unsupportedReason(post: SourcePost, videoEnabled = false): string | undefined {
   if (!post.metadataComplete) return 'incomplete_metadata';
   if (post.visibility !== 'public') return 'non_public_content';
-  // Sensitive content is NOT held: it publishes with the marking each destination supports (see
-  // PublishPart.sensitive). Holding it left the owner with content that could never sync, while every
-  // platform involved has a real mechanism for carrying the warning.
+  // Warnings are carried by publishers; they do not make otherwise supported public content unpublishable.
   if (post.poll) return 'poll_not_supported';
   if (post.attachments.length > 4) return 'more_than_four_images';
   const video = post.attachments.find(a => a.kind === 'video');
@@ -145,7 +145,7 @@ export function decideMirror(posts: SourcePost[], candidates: ReturnType<Store['
 export class Engine {
   constructor(readonly store: Store, readonly config: AppConfig, readonly transport: Transport) {}
 
-  ingest(value: unknown, now = new Date().toISOString()): { added: number; baseline: boolean } {
+  ingest(value: unknown, now: string = new Date().toISOString()): { added: number; baseline: boolean } {
     const snapshot = snapshotSchema.parse(value) as SourceSnapshot;
     // A snapshot that neither completed nor tells us how far it safely reached is a structural
     // failure (nothing rendered, schema broken): refuse it so the checkpoint does not advance.
@@ -491,7 +491,7 @@ export class Engine {
       ...(holdIsApprovable(hold)
         ? ['• 按「仍要發送到其他平台」＝這則其實可以同步（只是較長，發布時會自動分段成一串貼文）。',
            '• 按「略過」＝不要同步這則，之後不再提醒。']
-        : ['• 這種內容（媒體格式、投票、敏感標記等）無法自動同步；需要的話請自行手動貼到其他平台。',
+        : ['• 這種內容（不支援的媒體格式、投票等）無法自動同步；需要的話請自行手動貼到其他平台。',
            '• 按「略過」＝關閉這則提醒。']),
     ] : [
       '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
@@ -522,9 +522,7 @@ export class Engine {
       return [{
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
         images: [], buttons: [
-          // Offer to publish only when the content can actually go out. A hard hold (unsupported media,
-          // a poll, a sensitive label) has no working publish path, so an approve button there would only
-          // ever fail the delivery job; the owner skips it or mirrors it manually instead.
+          // Unsupported media and polls have no publish path, even with owner approval.
           ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: `rev:a:${batch.id}` }] : []),
           { text: '🚫 略過', data: `rev:s:${batch.id}` },
           { text: '🪞 這是我手動鏡像的', data: `rev:m:${batch.id}` },
@@ -553,11 +551,9 @@ export class Engine {
       let text = cleanXLinks(post.text);
       if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
-      // A source-flagged sensitive post publishes like any other, carrying its marking on every part:
-      // the warning applies to the whole thread, and the destinations that act on it (Sharkey's drive
-      // files, Telegram's media) are on the part that holds the media.
-      const sensitive = Boolean(post.sensitive || post.cw);
-      const marking = { ...(sensitive ? { sensitive: true } : {}), ...(post.cw ? { cw: post.cw } : {}) };
+      const sensitive = isSensitiveContent(post);
+      const marking = sensitive ? { sensitive: true, cw: contentWarning(post), sensitiveLabels: post.sensitiveLabels } : {};
+      const prefix = warningPrefix(marking);
       const key = createHash('sha256').update(post.id).digest('hex').slice(0, 16);
       if (job.destination === 'telegram') {
         // A tweet's images belong to ONE post, so send them as a single album (sendMediaGroup)
@@ -565,7 +561,8 @@ export class Engine {
         // every image after the first with an empty caption and a repeated footer link. Telegram
         // counts rendered HTML and caps an album caption at 1024, a text message at 4096, so the
         // caption chunk fits the album and any overflow continues as plain follow-up messages.
-        const chunks = splitHtml(text, images.length || video ? 1024 : 4096, sourceUrl ? 120 : 0);
+        const chunks = splitHtml(text, images.length || video ? 1024 : 4096,
+          (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0));
         const caption = chunks[0] ?? '';
         output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking });
         for (let i = 1; i < chunks.length; i++) {
@@ -579,7 +576,9 @@ export class Engine {
           ? this.config.sharkey.signature.replaceAll('{url}', sourceUrl) : '';
         // Reserve room for the signature (plus the blank line) inside the note limit so the last chunk still fits.
         const utf16 = signature ? Math.max(1, 3000 - signature.length - 2) : 3000;
-        const chunks = splitText(text, job.destination === 'bluesky' ? { graphemes: 300, utf8Bytes: 3000 } : { utf16 });
+        const chunks = splitText(text, job.destination === 'bluesky'
+          ? { graphemes: 300 - graphemes(prefix).length, utf8Bytes: 3000 - Buffer.byteLength(prefix, 'utf8') }
+          : { utf16 });
         chunks.forEach((chunk, index) => {
           const body = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
           output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking });
