@@ -1,5 +1,6 @@
 export type SourcePlatform = 'x' | 'bluesky' | 'sharkey' | 'local';
 export type Destination = 'bluesky' | 'sharkey' | 'telegram';
+export type SensitiveLabel = 'porn' | 'sexual' | 'nudity' | 'graphic-media';
 export type Classification = 'baseline' | 'collecting' | 'ready' | 'manual_mirror' | 'mirror_review' | 'ignored' | 'unsupported';
 export type JobState = 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'review' | 'cancelled';
 
@@ -34,6 +35,7 @@ export interface SourcePost {
   poll?: boolean;
   cw?: string;
   sensitive?: boolean;
+  sensitiveLabels?: SensitiveLabel[];
   attachments: Attachment[];
   metadataComplete: boolean;
 }
@@ -85,14 +87,11 @@ export interface PublishPart {
   key: string;
   sourcePostId: string;
   text: string;
-  /** The source's own human-readable warning, carried through as-is (e.g. another platform's CW text). */
+  /** Source warning, separate from the body so publishers can apply native CW or a length-budgeted prefix. */
   cw?: string;
-  /**
-   * The source flagged this content as sensitive (X's media warning, or a source CW). NOT a hold: the
-   * post still publishes, and each destination carries the marking its platform supports — Bluesky a
-   * self-label, Sharkey a sensitive drive file, Telegram a media spoiler.
-   */
   sensitive?: boolean;
+  /** Preserve known source categories; publishers use the configured fallback only when these are absent. */
+  sensitiveLabels?: SensitiveLabel[];
   images: PreparedImage[];
   /**
    * A single transcoded video, mutually exclusive with images (X and Bluesky both forbid mixing).
