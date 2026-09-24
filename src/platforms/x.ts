@@ -223,6 +223,145 @@ export class XCollector implements Collector {
     }).catch(() => false);
   }
 
+  /**
+   * Parse one rendered tweet <article> into TweetFacts. `ctx.own`/`ctx.authorId` come from the
+   * caller's permalink parse; `threadParentId`/`threadParentAuthor`, when set, link a self-thread
+   * continuation to the tweet above it. Returns the facts plus the article's plain text so the
+   * caller can do its own pinned/oldest bookkeeping. Shared by the timeline scan and the thread
+   * expansion below so both read a tweet identically.
+   */
+  private async parseArticle(article: Locator, ctx: { own: string; authorId: string; threadParentId?: string; threadParentAuthor?: string }, signal?: AbortSignal): Promise<{ parsed: TweetFacts; articleText: string }> {
+    const { own, authorId } = ctx;
+    const links = await article.locator('a[href*="/status/"]').evaluateAll(nodes => nodes.map(node => (node as HTMLAnchorElement).href));
+    const time = await article.locator('time').getAttribute('datetime').catch(() => null);
+    // X truncates a link's DISPLAY text ("youtube.com/watch…") while the real destination is the
+    // anchor href. Reading innerText would sync the broken truncated string, so reconstruct the
+    // text from the tweetText node: use each <a>'s href for external links, keep emoji alt text,
+    // and keep visible text for everything else.
+    const text = await article.locator('[data-testid="tweetText"]').first().evaluate((node: Element) => {
+      const walk = (el: Element): string => {
+        let out = '';
+        for (const child of Array.from(el.childNodes)) {
+          if (child.nodeType === 3) { out += child.textContent || ''; continue; } // text node
+          if (!(child instanceof Element)) continue;
+          if (child.tagName === 'IMG') { out += (child as HTMLImageElement).alt || ''; continue; } // emoji
+          if (child.tagName === 'A') {
+            const href = (child as HTMLAnchorElement).href;
+            const shown = child.textContent || '';
+            // Mentions/hashtags/cashtags and t.co-expanded display links: keep the real href for
+            // external URLs (display text is truncated with an ellipsis), else keep visible text.
+            out += /^https?:\/\//.test(href) && /[…]|\/\S*…/.test(shown) ? href
+              : /^https?:\/\//.test(href) && !shown.startsWith('@') && !shown.startsWith('#') && !shown.startsWith('$') ? (shown.includes('…') ? href : shown)
+              : shown;
+            continue;
+          }
+          out += walk(child);
+        }
+        return out;
+      };
+      return walk(node);
+    }).catch(() => '');
+    const articleText = await article.innerText().catch(() => '');
+    const replyMatch = articleText.match(/Replying to\s+(@[A-Za-z0-9_]{1,15})/i);
+    // A link-preview card puts its destination only in the card, not the tweet text. Capture it
+    // so a card-only tweet still carries its link downstream.
+    const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]').first().getAttribute('href').catch(() => null);
+    const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
+    const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
+    // cardPoll is the current rendered widget; preserve its entire choice list in one read so
+    // percentages cannot be paired with labels from a different render. No vote/reveal action.
+    const pollRead = await article.evaluate((node: Element, selector: string) => {
+      const clone = node.cloneNode(true) as Element;
+      clone.querySelectorAll('[data-testid="quoteTweet"], article, [data-testid="tweetText"]').forEach(element => element.remove());
+      const detected = clone.querySelector(selector) !== null;
+      if (!detected) return { detected: false, html: '', capturedAt: new Date().toISOString() };
+      clone.querySelectorAll('script, style, svg').forEach(element => element.remove());
+      for (const element of [clone, ...clone.querySelectorAll('*')]) {
+        for (const attribute of [...element.attributes]) {
+          if (!['role', 'data-testid', 'dir', 'aria-label', 'aria-hidden', 'aria-checked', 'aria-disabled', 'aria-posinset', 'aria-setsize', 'alt', 'hidden', 'disabled'].includes(attribute.name)) element.removeAttribute(attribute.name);
+        }
+      }
+      const html = clone.outerHTML;
+      return { detected: true, html: html.length <= 256_000 ? html : '', capturedAt: new Date().toISOString() };
+    }, X_POLL_SELECTOR);
+    const parsedPoll = pollRead.detected ? parseXPoll(pollRead.html, pollRead.capturedAt) : undefined;
+    const hasPoll = pollRead.detected;
+    const pollData = parsedPoll?.pollData;
+    // Read the post's UI text with the tweet body removed: the sensitive-media warning lives in the
+    // media chrome, and a post that merely writes about sensitive content must not be flagged.
+    const chromeText = await article.evaluate((node: Element) => {
+      const clone = node.cloneNode(true) as Element;
+      clone.querySelectorAll('[data-testid="tweetText"]').forEach(element => element.remove());
+      return (clone as HTMLElement).innerText || '';
+    }).catch(() => '');
+    const sensitive = hasSensitiveWarning(chromeText);
+    // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
+    const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
+    if (hasVideo) media.push({ kind: 'video', alt: '' });
+    // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
+    // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
+    // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
+    const quote = links.find(value => { try { const qid = new URL(value).pathname.match(statusPath)?.[1]; return Boolean(qid) && qid !== own; } catch { return false; } });
+    // A card link that is not a quoted tweet and not already in the text is the tweet's only URL;
+    // append it so it survives the sync. (Quote cards are handled via quoteUrl, not here.)
+    let bodyText = text;
+    if (cardHref && !text.includes(cardHref)) {
+      try {
+        // Skip the card only if it points at THIS tweet (a self sub-page); any other card is an
+        // external link worth keeping. A quoted tweet is a different id and handled via quoteUrl.
+        const cardId = new URL(cardHref).pathname.match(statusPath)?.[1];
+        if (!cardId || cardId === own) bodyText = text ? `${text}\n${cardHref}` : cardHref;
+      } catch { /* ignore malformed card href */ }
+    }
+    // Expand any t.co short link the DOM left in the text to its real destination before the
+    // post is handed downstream, so other platforms show the real URL, not a t.co short link.
+    bodyText = await this.resolveShortLinks(bodyText, signal);
+    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor }, this.config.handle);
+    return { parsed, articleText };
+  }
+
+  /**
+   * Read the full self-thread from a root's status page. The Posts timeline only renders a
+   * truncated preview of a self-thread (the root plus its first reply, then "Show this thread"),
+   * so continuations past the first live only here. Starting at the root, take each consecutive
+   * article authored by the same handle, linking it to the previous one, and stop at the first
+   * tweet by anyone else (where the author's own thread ends and other people's replies begin).
+   * Continuations already collected on the timeline are skipped via `seen`.
+   */
+  private async collectThreadTail(page: Page, rootId: string, seen: Set<string>, signal?: AbortSignal): Promise<TweetFacts[]> {
+    const url = `https://x.com/${encodeURIComponent(this.config.handle)}/status/${rootId}`;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    let settled = 0; let lastCount = -1;
+    for (let i = 0; i < 20; i++) {
+      if (signal?.aborted) return [];
+      const count = await page.locator('article[data-testid="tweet"]').count().catch(() => 0);
+      if (count === lastCount) settled++; else { settled = 0; lastCount = count; }
+      if (lastCount >= 1 && settled >= 3) break;
+      await page.waitForTimeout(500);
+    }
+    const out: TweetFacts[] = [];
+    let prevId: string | undefined; let started = false;
+    for (const article of await page.locator('article[data-testid="tweet"]').all()) {
+      if (signal?.aborted) break;
+      const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
+      const ownPath = permalink ? new URL(permalink, 'https://x.com').pathname : '';
+      const id = ownPath.match(statusPath)?.[1];
+      const author = ownPath.split('/')[1] || '';
+      if (!id) continue;
+      if (!started) { if (id === rootId) { started = true; prevId = rootId; } continue; }
+      // The author's own thread runs as an unbroken same-author chain right after the root; the
+      // first tweet by anyone else marks the reply section, where the self-thread ends.
+      if (author.toLowerCase() !== this.config.handle.toLowerCase()) break;
+      if (!seen.has(id)) {
+        seen.add(id);
+        const { parsed } = await this.parseArticle(article, { own: id, authorId: author, threadParentId: prevId, threadParentAuthor: this.config.handle }, signal);
+        out.push(parsed);
+      }
+      prevId = id;
+    }
+    return out;
+  }
+
   private async browserPage(): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
     // The previous context died (Chromium crash, OOM kill, external close). A stale cached
@@ -313,6 +452,10 @@ export class XCollector implements Collector {
     // timeline from the top, so cache the geometry probe per tweet-id and pay for it once instead of
     // once-per-round — the repeated layout sweeps were what stalled a live scan for minutes.
     const connector = new Map<string, boolean>();
+    // Roots of a self-thread seen on the Posts timeline. The timeline only renders a truncated
+    // preview of a self-thread (root + first reply, then "Show this thread"), so the continuations
+    // past the first are collected afterwards from each root's own thread page.
+    const threadRoots = new Set<string>();
     for (let round = 0; round < this.config.maxPages; round++) {
       const articles = await page.locator('article[data-testid="tweet"]').all();
       // The author's own tweet immediately above the current one in DOM order, carrying whether it
@@ -321,7 +464,6 @@ export class XCollector implements Collector {
       // article above was parsed in an earlier round (and is skipped as `seen` this round).
       let prev: { id: string; author: string; replyBelow: boolean } | undefined;
       for (const article of articles) {
-        const links = await article.locator('a[href*="/status/"]').evaluateAll(nodes => nodes.map(node => (node as HTMLAnchorElement).href));
         const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
         const ownPath = permalink ? new URL(permalink, 'https://x.com').pathname : '';
         const own = ownPath.match(statusPath)?.[1];
@@ -341,92 +483,13 @@ export class XCollector implements Collector {
         if (own) prev = { id: own, author: authorId, replyBelow };
         if (!own || seen.has(own)) continue;
         seen.add(own);
-        const time = await article.locator('time').getAttribute('datetime').catch(() => null);
-        // X truncates a link's DISPLAY text ("youtube.com/watch…") while the real destination is the
-        // anchor href. Reading innerText would sync the broken truncated string, so reconstruct the
-        // text from the tweetText node: use each <a>'s href for external links, keep emoji alt text,
-        // and keep visible text for everything else.
-        const text = await article.locator('[data-testid="tweetText"]').first().evaluate((node: Element) => {
-          const walk = (el: Element): string => {
-            let out = '';
-            for (const child of Array.from(el.childNodes)) {
-              if (child.nodeType === 3) { out += child.textContent || ''; continue; } // text node
-              if (!(child instanceof Element)) continue;
-              if (child.tagName === 'IMG') { out += (child as HTMLImageElement).alt || ''; continue; } // emoji
-              if (child.tagName === 'A') {
-                const href = (child as HTMLAnchorElement).href;
-                const shown = child.textContent || '';
-                // Mentions/hashtags/cashtags and t.co-expanded display links: keep the real href for
-                // external URLs (display text is truncated with an ellipsis), else keep visible text.
-                out += /^https?:\/\//.test(href) && /[…]|\/\S*…/.test(shown) ? href
-                  : /^https?:\/\//.test(href) && !shown.startsWith('@') && !shown.startsWith('#') && !shown.startsWith('$') ? (shown.includes('…') ? href : shown)
-                  : shown;
-                continue;
-              }
-              out += walk(child);
-            }
-            return out;
-          };
-          return walk(node);
-        }).catch(() => '');
-        const articleText = await article.innerText().catch(() => '');
-        const replyMatch = articleText.match(/Replying to\s+(@[A-Za-z0-9_]{1,15})/i);
-        // A link-preview card puts its destination only in the card, not the tweet text. Capture it
-        // so a card-only tweet still carries its link downstream.
-        const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]').first().getAttribute('href').catch(() => null);
-        const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
-        const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
-        // cardPoll is the current rendered widget; preserve its entire choice list in one read so
-        // percentages cannot be paired with labels from a different render. No vote/reveal action.
-        const pollRead = await article.evaluate((node: Element, selector: string) => {
-          const clone = node.cloneNode(true) as Element;
-          clone.querySelectorAll('[data-testid="quoteTweet"], article, [data-testid="tweetText"]').forEach(element => element.remove());
-          const detected = clone.querySelector(selector) !== null;
-          if (!detected) return { detected: false, html: '', capturedAt: new Date().toISOString() };
-          clone.querySelectorAll('script, style, svg').forEach(element => element.remove());
-          for (const element of [clone, ...clone.querySelectorAll('*')]) {
-            for (const attribute of [...element.attributes]) {
-              if (!['role', 'data-testid', 'dir', 'aria-label', 'aria-hidden', 'aria-checked', 'aria-disabled', 'aria-posinset', 'aria-setsize', 'alt', 'hidden', 'disabled'].includes(attribute.name)) element.removeAttribute(attribute.name);
-            }
-          }
-          const html = clone.outerHTML;
-          return { detected: true, html: html.length <= 256_000 ? html : '', capturedAt: new Date().toISOString() };
-        }, X_POLL_SELECTOR);
-        const parsedPoll = pollRead.detected ? parseXPoll(pollRead.html, pollRead.capturedAt) : undefined;
-        const hasPoll = pollRead.detected;
-        const pollData = parsedPoll?.pollData;
-        // Read the post's UI text with the tweet body removed: the sensitive-media warning lives in the
-        // media chrome, and a post that merely writes about sensitive content must not be flagged.
-        const chromeText = await article.evaluate((node: Element) => {
-          const clone = node.cloneNode(true) as Element;
-          clone.querySelectorAll('[data-testid="tweetText"]').forEach(element => element.remove());
-          return (clone as HTMLElement).innerText || '';
-        }).catch(() => '');
-        const sensitive = hasSensitiveWarning(chromeText);
-        // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
-        const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
-        if (hasVideo) media.push({ kind: 'video', alt: '' });
-        // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
-        // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
-        // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
-        const quote = links.find(value => { try { const qid = new URL(value).pathname.match(statusPath)?.[1]; return Boolean(qid) && qid !== own; } catch { return false; } });
-        // A card link that is not a quoted tweet and not already in the text is the tweet's only URL;
-        // append it so it survives the sync. (Quote cards are handled via quoteUrl, not here.)
-        let bodyText = text;
-        if (cardHref && !text.includes(cardHref)) {
-          try {
-            // Skip the card only if it points at THIS tweet (a self sub-page); any other card is an
-            // external link worth keeping. A quoted tweet is a different id and handled via quoteUrl.
-            const cardId = new URL(cardHref).pathname.match(statusPath)?.[1];
-            if (!cardId || cardId === own) bodyText = text ? `${text}\n${cardHref}` : cardHref;
-          } catch { /* ignore malformed card href */ }
-        }
-        // Expand any t.co short link the DOM left in the text to its real destination before the
-        // post is handed downstream, so other platforms show the real URL, not a t.co short link.
-        bodyText = await this.resolveShortLinks(bodyText, signal);
-        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: threadParent?.id, threadParentAuthor: threadParent?.author }, this.config.handle);
+        const { parsed, articleText } = await this.parseArticle(article, { own, authorId, threadParentId: threadParent?.id, threadParentAuthor: threadParent?.author }, signal);
         if (!/pinned|置頂/i.test(articleText) && parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
+        // A root drawing a reply connector below it has a self-thread whose continuations past the
+        // first are truncated off the Posts timeline; remember it so the thread page can be opened
+        // after the scan to collect the rest.
+        if (!threadParent && parsed.replyToId === null && replyBelow) threadRoots.add(own);
       }
       // The gap since the last fetch is covered only once the oldest tweet seen is at/older than
       // the watermark AND the render has stopped growing. The no-growth condition matters:
@@ -442,6 +505,17 @@ export class XCollector implements Collector {
       if (signal?.aborted) break;
       await page.mouse.wheel(0, 1800);
       await page.waitForTimeout(800);
+    }
+    // The Posts timeline shows only a truncated preview of each self-thread (root + first reply),
+    // so open every detected root's own thread page and collect the same-author continuations past
+    // the first. Without this the engine never sees reply #2 onward and syncs a partial thread.
+    for (const rootId of threadRoots) {
+      if (signal?.aborted) break;
+      const tail = await this.collectThreadTail(page, rootId, seen, signal);
+      for (const parsed of tail) {
+        facts.push(parsed);
+        if (parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
+      }
     }
     if (!facts.length) {
       // Distinguish a genuinely empty timeline from a page that never rendered any tweet element
