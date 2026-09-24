@@ -768,11 +768,20 @@ export async function collectCycle(engine: Engine, collectors: Collector[], now?
       engine.store.setSetting(`collect_failures:${collector.platform}`, 0);
       if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'authenticated');
     } catch (error) {
+      // A shutdown aborts the in-flight collect; that is a clean stop, not a failure. Don't count it
+      // and don't alert — it self-recovers on the next start.
+      if (signal?.aborted) break;
       // Count consecutive failures so sealReady can downgrade a persistently unreachable downstream's
       // freshness requirement rather than letting it block X→downstream sync forever.
-      engine.store.setSetting(`collect_failures:${collector.platform}`, engine.store.setting<number>(`collect_failures:${collector.platform}`, 0) + 1);
+      const failures = engine.store.setting<number>(`collect_failures:${collector.platform}`, 0) + 1;
+      engine.store.setSetting(`collect_failures:${collector.platform}`, failures);
       if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'error');
-      engine.store.event('error', `${collector.platform} collection failed: ${safeError(error)}`);
+      // A single blip (Cloudflare 502/522, a dropped connection) self-recovers next cycle, so it stays a
+      // warning in /status and the web log. Only a persistent outage — the same threshold that degrades
+      // the seal gate — escalates to an error the owner is paged about on Telegram, and only on the
+      // crossing so a long outage doesn't page every cycle.
+      const level = failures === DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES ? 'error' : 'warn';
+      engine.store.event(level, `${collector.platform} collection failed: ${safeError(error)}`);
     }
   }
 }

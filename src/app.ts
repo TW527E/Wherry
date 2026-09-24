@@ -155,7 +155,7 @@ export function createRuntime(config = loadConfig()): Runtime {
         }
         await notifications?.flush();
       }
-    })().catch(error => { store.event('error', `Telegram command polling failed: ${safeError(error)}`); })
+    })().catch(error => { store.event('warn', `Telegram command polling failed: ${safeError(error)}`); })
       .finally(async () => { try { await notifications?.flush(); } finally { commands = undefined; } });
     return commands;
   };

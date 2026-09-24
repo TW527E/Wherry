@@ -72,6 +72,37 @@ test('collectCycle threads the last fetch watermark into the next collect', asyn
   assert.equal(sinceSeen[1], at(10));
 });
 
+test('collectCycle keeps transient failures out of Telegram but pages once on a persistent outage', async () => {
+  const store = new Store(':memory:');
+  const engine = new Engine(store, makeConfig(['sharkey']), transport);
+  const failing: Collector = {
+    platform: 'sharkey',
+    async collect() { throw new Error('Incomplete sharkey snapshot; checkpoint unchanged (Collection failed (TELEGRAM_522))'); },
+  };
+  // Blips 1 and 2 are warnings (visible in /status, never forwarded to Telegram).
+  await collectCycle(engine, [failing], at(10));
+  await collectCycle(engine, [failing], at(20));
+  assert.equal(store.events(20).filter(e => e.level === 'error').length, 0, 'transient blips do not page');
+  assert.ok(store.events(20).some(e => e.level === 'warn' && /collection failed/.test(e.message)), 'but are logged as warnings');
+  // The third consecutive failure crosses the persistence threshold and pages exactly once.
+  await collectCycle(engine, [failing], at(30));
+  await collectCycle(engine, [failing], at(40));
+  assert.equal(store.events(50).filter(e => e.level === 'error').length, 1, 'a persistent outage pages once, not every cycle');
+});
+
+test('collectCycle treats a shutdown abort as a clean stop, not a failure', async () => {
+  const store = new Store(':memory:');
+  const engine = new Engine(store, makeConfig(['sharkey']), transport);
+  const aborted: Collector = {
+    platform: 'x',
+    async collect() { throw new Error('X collection aborted before start'); },
+  };
+  await collectCycle(engine, [aborted], at(10), AbortSignal.abort());
+  assert.equal(store.events(20).length, 0, 'an abort logs nothing');
+  assert.equal(store.setting('collect_failures:x', 0), 0, 'and does not count as a failure');
+});
+
+
 test('a repost by another author does not reject the whole snapshot', () => {
   const { engine } = setup(['bluesky']);
   const repost = post({ id: 'r1', createdAt: at(30), authorId: 'someone-else', platform: 'bluesky', repost: true });
