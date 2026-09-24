@@ -295,7 +295,7 @@ test('unsupported phase-one content is held instead of being silently degraded',
     post({ id: '704', createdAt: at(10), metadataComplete: false }),
   ];
   assert.equal(unsupportedReason(notes[0]!), 'video_sync_disabled');
-  assert.equal(unsupportedReason(notes[1]!), 'poll_not_supported');
+  assert.equal(unsupportedReason(notes[1]!), 'poll_details_unavailable');
   assert.equal(unsupportedReason(notes[2]!), 'non_public_content');
   assert.equal(unsupportedReason(notes[3]!), 'incomplete_metadata');
   const { store, engine } = setup();

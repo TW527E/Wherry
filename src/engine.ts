@@ -7,6 +7,7 @@ import { BLUESKY_SENSITIVE_LABELS, contentWarning, isSensitiveContent, warningPr
 import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
 import { prepareImages } from './media.js';
 import { prepareVideo } from './video.js';
+import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from './types.js';
 
 const attachmentSchema = z.object({
@@ -19,6 +20,7 @@ export const sourcePostSchema = z.object({
   createdAt: z.string().datetime(), text: z.string().max(100_000), url: z.string().url().optional(), rootId: z.string().optional(),
   replyToId: z.string().nullable().optional(), replyToAuthorId: z.string().nullable().optional(), relationKnown: z.boolean(),
   visibility: z.enum(['public', 'restricted', 'unknown']), repost: z.boolean().optional(), quoteUrl: z.string().optional(), poll: z.boolean().optional(),
+  pollData: pollSnapshotSchema.optional(),
   cw: z.string().optional(), sensitive: z.boolean().optional(), sensitiveLabels: z.array(z.enum(BLUESKY_SENSITIVE_LABELS)).max(4).optional(),
   attachments: z.array(attachmentSchema).max(100), metadataComplete: z.boolean(),
 });
@@ -76,7 +78,11 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
   if (!post.metadataComplete) return 'incomplete_metadata';
   if (post.visibility !== 'public') return 'non_public_content';
   // Warnings are carried by publishers; they do not make otherwise supported public content unpublishable.
-  if (post.poll) return 'poll_not_supported';
+  if (post.poll || post.pollData !== undefined) {
+    if (post.platform !== 'x') return 'poll_not_supported';
+    if (!pollSnapshotSchema.safeParse(post.pollData).success) return 'poll_details_unavailable';
+    if (!xPollUrl(post)) return 'poll_source_url_invalid';
+  }
   if (post.attachments.length > 4) return 'more_than_four_images';
   const video = post.attachments.find(a => a.kind === 'video');
   if (video) {
@@ -94,7 +100,7 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
   // tweet whose t.co link expanded into a long URL is not a long post, and a non-Latin post that X
   // weighs past 280 may still fit a single downstream post, leaving nothing to review.
   if (post.platform === 'x' && exceedsXLimit(post.text) && requiresSplit(post.text)) return 'long_x_post_requires_manual_review';
-  if (!post.text.trim() && !post.attachments.length) return 'empty_content';
+  if (!post.text.trim() && !post.attachments.length && !post.pollData) return 'empty_content';
   return undefined;
 }
 
@@ -122,12 +128,15 @@ export function decideMirror(posts: SourcePost[], candidates: ReturnType<Store['
     const expected = normalizeText(candidate.post.text);
     const textEqual = expected === text || expected === spaced;
     const mediaMatch = compatibleMedia(candidate.post.attachments, media);
+    // A repeated question is not proof of the same poll. The native collectors do not retain poll
+    // choices, so only an explicit owner link can conclusively identify these manual mirrors.
+    const hasPoll = posts.some(post => post.poll || post.pollData) || candidate.post.poll || candidate.post.pollData;
     // Text alone is only evidence when it is distinctive; a media fingerprint is evidence on its own.
     // A short text match leaves `evidence` false, which drops it into the `possible` check below and so
     // reaches the owner as a review notice rather than being suppressed without a word.
     const evidence = (Boolean(expected) && expected.length >= MIRROR_MATCH_MIN_TEXT_LENGTH)
       || (media.length > 0 && mediaMatch === 'same');
-    if (textEqual && mediaMatch === 'same' && evidence && !candidate.expired) { exact.push(candidate.id); continue; }
+    if (textEqual && mediaMatch === 'same' && evidence && !candidate.expired && !hasPoll) { exact.push(candidate.id); continue; }
     const sameMediaHash = media.some(a => a.sha256 && candidate.post.attachments.some(b => b.sha256 === a.sha256));
     const shorter = Math.min(expected.length, spaced.length), longer = Math.max(expected.length, spaced.length);
     const containment = longer > 0 && shorter / longer >= 0.3 && (expected.includes(spaced) || spaced.includes(expected));
@@ -491,7 +500,7 @@ export class Engine {
       ...(holdIsApprovable(hold)
         ? ['• 按「仍要發送到其他平台」＝這則其實可以同步（只是較長，發布時會自動分段成一串貼文）。',
            '• 按「略過」＝不要同步這則，之後不再提醒。']
-        : ['• 這種內容（不支援的媒體格式、投票等）無法自動同步；需要的話請自行手動貼到其他平台。',
+        : ['• 這種內容（投票資料不完整、不支援的媒體格式等）無法自動同步；需要的話請自行手動貼到其他平台。',
            '• 按「略過」＝關閉這則提醒。']),
     ] : [
       '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
@@ -513,7 +522,7 @@ export class Engine {
     return lines.filter((line, index) => line !== '' || lines[index - 1] !== '').join('\n');
   }
 
-  async parts(job: Job): Promise<PublishPart[]> {
+  async parts(job: Job, now = new Date().toISOString()): Promise<PublishPart[]> {
     if (job.kind === 'ops') {
       const batch = this.store.getBatch(job.aggregateId);
       if (!batch) throw new Error('Job source not found');
@@ -522,7 +531,7 @@ export class Engine {
       return [{
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
         images: [], buttons: [
-          // Unsupported media and polls have no publish path, even with owner approval.
+          // Incomplete polls and unsupported media have no publish path, even with owner approval.
           ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: `rev:a:${batch.id}` }] : []),
           { text: '🚫 略過', data: `rev:s:${batch.id}` },
           { text: '🪞 這是我手動鏡像的', data: `rev:m:${batch.id}` },
@@ -543,6 +552,12 @@ export class Engine {
       // An owner-approved long post IS published here (its body is split into parts below). Any other
       // hold means the content is not publishable at all, so fail loudly rather than send a degraded post.
       if (unsupported && !holdIsApprovable(unsupported)) throw new Error(unsupported);
+      const poll = post.platform === 'x' ? post.pollData : undefined;
+      const sensitive = isSensitiveContent(post);
+      if (poll && job.destination !== 'bluesky') {
+        if (post.attachments.length) throw new Error('A native X poll cannot be combined with media');
+        if (job.destination === 'telegram' && sensitive) throw new Error('Telegram cannot hide native poll questions/options with a spoiler; sensitive polls require review');
+      }
       const videoAttachment = this.config.media.video ? post.attachments.find(a => a.kind === 'video') : undefined;
       const video = videoAttachment
         ? await prepareVideo(videoAttachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)
@@ -551,7 +566,11 @@ export class Engine {
       let text = cleanXLinks(post.text);
       if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
-      const sensitive = isSensitiveContent(post);
+      if (poll) {
+        const pollText = job.destination === 'bluesky' ? formatXPoll(poll, xPollUrl(post)!)
+          : `🗳️ 此平台為獨立投票，票數不與 X 或其他平台合併。\n截止時間${poll.expiresAtEstimated ? '（依 X 倒數估算）' : ''}：${poll.expiresAt}\nX 原投票：${xPollUrl(post)!}`;
+        text += `${text ? '\n\n' : ''}${pollText}`;
+      }
       const marking = sensitive ? { sensitive: true, cw: contentWarning(post), sensitiveLabels: post.sensitiveLabels } : {};
       const prefix = warningPrefix(marking);
       const key = createHash('sha256').update(post.id).digest('hex').slice(0, 16);
@@ -568,6 +587,12 @@ export class Engine {
         for (let i = 1; i < chunks.length; i++) {
           output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl, ...marking });
         }
+        if (poll) {
+          const question = cleanXLinks(post.text).trim();
+          output.push({ key: `${key}:poll`, sourcePostId: post.id,
+            text: !question ? '🗳️ X 投票' : Array.from(question).length <= 300 ? question : '🗳️ 請參閱上一則貼文的投票問題',
+            images: [], poll, sourceUrl: xPollUrl(post)! });
+        }
       } else {
         // Sharkey renders MFM, so instead of a trailing reply carrying the X link (Bluesky's footer),
         // an X-sourced note gets the configured attribution appended to its own body — a blank line then
@@ -581,7 +606,8 @@ export class Engine {
           : { utf16 });
         chunks.forEach((chunk, index) => {
           const body = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
-          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking });
+          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
+            ...(poll && job.destination === 'sharkey' && index === chunks.length - 1 ? { poll } : {}) });
         });
       }
     }
@@ -590,6 +616,15 @@ export class Engine {
       const url = fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`);
       if (!url) throw new Error('X root URL invalid');
       output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, images: [], sourceUrl: url, isFooter: true });
+    }
+    if (job.destination !== 'bluesky') {
+      for (const part of output) {
+        if (!part.poll) continue;
+        const prior = this.store.getStep(job.id, part.key);
+        // Receipts survive expiry; an uncertain creation must reach reconciliation, not a fresh-poll check.
+        if (prior?.state === 'started' || (prior?.state === 'succeeded' && prior.result)) continue;
+        nativePollPayload(part.poll, job.destination, Date.parse(now));
+      }
     }
     return output;
   }
@@ -628,7 +663,7 @@ export class Worker {
       if (!store.claimJob(job.id)) continue;
       let activeKey: string | undefined;
       try {
-        const parts = await this.engine.parts(job);
+        const parts = await this.engine.parts(job, now);
         let root: RemoteRef | undefined, parent: RemoteRef | undefined;
         let interrupted = false;
         for (const part of parts) {
@@ -654,7 +689,7 @@ export class Worker {
             continue;
           }
           if (prior?.state === 'started') throw Object.assign(new Error('Uncertain previous remote delivery; reconciliation required'), { uncertain: true });
-          store.beginStep(job.id, part.key, { text: part.text, sourcePostId: part.sourcePostId, imageHashes: part.images.map(i => i.sha256) }, now);
+          store.beginStep(job.id, part.key, { text: part.text, sourcePostId: part.sourcePostId, imageHashes: part.images.map(i => i.sha256), ...(part.poll ? { poll: part.poll } : {}) }, now);
           const ref = await publisher.publish(part, {
             root: part.key === 'notice' ? undefined : root,
             parent: part.key === 'notice' ? undefined : parent,

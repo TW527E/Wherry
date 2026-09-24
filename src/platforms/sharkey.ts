@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
 import { contentWarning, isSensitiveContent } from '../content-warning.js';
+import { nativePollPayload } from '../poll.js';
 import type { Attachment, Collector, PublishContext, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import {
   PlatformError, httpsBase, isoDate, jsonBody, multipart, nonempty, object, own, positiveInteger,
@@ -246,7 +247,11 @@ export class SharkeyClient implements Publisher, Collector {
     if (!nonempty(context.idempotencyKey)) throw new PlatformError('A durable idempotency key is required', { code: 'MissingIdempotencyKey' });
     if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Phase 1 accepts at most four static images', { code: 'TooManyImages' });
     if (part.video && part.images.length) throw new PlatformError('A Sharkey note cannot carry both a video and images', { code: 'MixedMedia' });
-    if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length && !part.video)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
+    if (part.poll) {
+      if (part.images.length || part.video) throw new PlatformError('An X poll cannot be combined with media', { code: 'MixedMedia' });
+      nativePollPayload(part.poll, 'sharkey', this.now().getTime());
+    }
+    if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length && !part.video && !part.poll)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Sharkey CW must be text', { code: 'InvalidCW' });
     const cw = contentWarning(part);
     const sensitive = isSensitiveContent(part);
@@ -300,10 +305,18 @@ export class SharkeyClient implements Publisher, Collector {
     const result = object(await this.api('notes/create', {
       text: part.text || null, visibility: 'public', localOnly: false,
       ...(cw !== undefined ? { cw } : {}), ...(fileIds.length ? { fileIds } : {}),
+      ...(part.poll ? { poll: nativePollPayload(part.poll, 'sharkey', this.now().getTime()) } : {}),
       ...(context.parent ? { replyId: context.parent.id } : {}),
     }, true));
     const note = object(result?.createdNote);
     if (!noteId(note?.id)) throw schemaError('Sharkey note creation', true);
+    if (part.poll) {
+      const createdPoll = object(note.poll);
+      if (!createdPoll || createdPoll.multiple !== false || !isoDate(createdPoll.expiresAt)
+        || Date.parse(createdPoll.expiresAt) !== Date.parse(part.poll.expiresAt!)
+        || !Array.isArray(createdPoll.choices) || createdPoll.choices.length !== part.poll.options.length
+        || createdPoll.choices.some((choice, index) => object(choice)?.text !== part.poll!.options[index]!.text)) throw schemaError('Sharkey poll creation', true);
+    }
     return { id: note.id, uri: webUrl(note.uri), url: `${this.baseUrl}/notes/${encodeURIComponent(note.id)}` };
   }
 

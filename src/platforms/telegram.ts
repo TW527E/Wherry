@@ -1,9 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
 import { isSensitiveContent, warningPrefix } from '../content-warning.js';
+import { nativePollPayload } from '../poll.js';
 import type { PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
-import { htmlEscape, splitText } from '../text.js';
-import { PlatformError, requestJson, schemaError } from './parse.js';
+import { fixupUrl, htmlEscape, splitText } from '../text.js';
+import { PlatformError, nonempty, object, positiveInteger, requestJson, schemaError } from './parse.js';
 
 export type TelegramAudience = 'private' | 'ops' | 'public';
 interface TelegramResponse<T> { ok: boolean; result?: T; description?: string; parameters?: { retry_after?: number } }
@@ -27,7 +28,7 @@ function multipart(fields: Record<string, string>, file?: MultipartFile): { body
 
 export class TelegramClient implements Publisher {
   readonly destination = 'telegram' as const;
-  constructor(private readonly config: AppConfig['telegram'], private readonly transport: Transport) {}
+  constructor(private readonly config: AppConfig['telegram'], private readonly transport: Transport, private readonly now: () => Date = () => new Date()) {}
   private chat(audience: TelegramAudience): string {
     const value = audience === 'private' ? this.config.privateChatId : audience === 'ops' ? this.config.opsChatId : this.config.publicChatId;
     if (!value) throw new Error(`Telegram ${audience} chat is not configured`); return value;
@@ -44,6 +45,29 @@ export class TelegramClient implements Publisher {
     const reply = context.parent?.messageIds?.[0] ? { message_id: context.parent.messageIds[0], allow_sending_without_reply: false } : undefined;
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Telegram CW must be text', { code: 'InvalidCW' });
     const sensitive = isSensitiveContent(part);
+    if (part.poll) {
+      if (sensitive) throw new PlatformError('Telegram native polls cannot hide their questions/options with a spoiler', { code: 'SensitivePollUnsupported' });
+      if (part.images.length || part.video || part.buttons?.length) throw new PlatformError('A native poll must be a separate durable Telegram step', { code: 'InvalidPollPart' });
+      const poll = nativePollPayload(part.poll, 'telegram', this.now().getTime());
+      if (typeof part.text !== 'string' || !part.text.trim() || Array.from(part.text).length > 300) throw new PlatformError('Telegram poll questions must be 1–300 characters', { code: 'InvalidPollQuestion' });
+      const sourceUrl = part.sourceUrl && fixupUrl(part.sourceUrl)?.replace('https://fixupx.com/', 'https://x.com/');
+      if (!sourceUrl) throw new PlatformError('A native X poll requires a valid source link', { code: 'InvalidPollSource' });
+      const result = await this.call<TelegramMessage>('sendPoll', {
+        chat_id: chatId, question: part.text, options: poll.choices.map(text => ({ text })),
+        is_anonymous: true, type: 'regular', allows_multiple_answers: false,
+        close_date: Math.floor(poll.expiresAt / 1000), ...(reply ? { reply_parameters: reply } : {}),
+        reply_markup: { inline_keyboard: [[{ text: 'X 原投票（票數獨立）', url: sourceUrl }]] },
+      });
+      const returned = object(result);
+      const createdPoll = object(returned?.poll);
+      if (!positiveInteger(returned?.message_id) || !createdPoll || !nonempty(createdPoll.id)
+        || createdPoll.question !== part.text || createdPoll.type !== 'regular'
+        || createdPoll.is_anonymous !== true || createdPoll.allows_multiple_answers !== false
+        || createdPoll.close_date !== Math.floor(poll.expiresAt / 1000)
+        || !Array.isArray(createdPoll.options) || createdPoll.options.length !== poll.choices.length
+        || createdPoll.options.some((choice, index) => object(choice)?.text !== poll.choices[index])) throw schemaError('Telegram sendPoll', true);
+      return { id: String(result.message_id), messageIds: [result.message_id], chatId };
+    }
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
     const body = htmlEscape(part.text);
     const rendered = `${htmlEscape(warningPrefix(part))}${sensitive && body ? `<tg-spoiler>${body}</tg-spoiler>` : body}${link}`;

@@ -18,6 +18,24 @@ export interface Attachment {
   animated?: boolean;
 }
 
+export interface PollOption {
+  text: string;
+  percentage?: number;
+}
+
+export interface PollSnapshot {
+  options: PollOption[];
+  status: 'open' | 'closed' | 'unknown';
+  capturedAt: string;
+  /** Absolute deadline derived from the source, not a duration restarted by delivery/retries. */
+  expiresAt?: string;
+  expiresAtEstimated?: boolean;
+  totalVotes?: number;
+  /** Preserve abbreviated counts as displayed; never infer exact counts from percentages or "1.2K". */
+  totalVotesText?: string;
+  statusText?: string;
+}
+
 export interface SourcePost {
   platform: SourcePlatform;
   id: string;
@@ -33,6 +51,8 @@ export interface SourcePost {
   repost?: boolean;
   quoteUrl?: string;
   poll?: boolean;
+  /** A complete read-only snapshot; poll=true without details remains non-publishable. */
+  pollData?: PollSnapshot;
   cw?: string;
   sensitive?: boolean;
   sensitiveLabels?: SensitiveLabel[];
@@ -87,6 +107,8 @@ export interface PublishPart {
   key: string;
   sourcePostId: string;
   text: string;
+  /** Source metadata for native creation; original votes are never seeded into the new poll. */
+  poll?: PollSnapshot;
   /** Source warning, separate from the body so publishers can apply native CW or a length-budgeted prefix. */
   cw?: string;
   sensitive?: boolean;

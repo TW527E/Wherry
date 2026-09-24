@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { cleanXLinks } from './text.js';
 import type { Batch, Classification, Destination, EventRecord, Job, JobState, Reminder, ReminderState, RemoteRef, ReviewNotice, ReviewNoticeState, SourcePlatform, SourcePost, StoredPost } from './types.js';
 
 type Row = Record<string, unknown>;
@@ -245,7 +246,7 @@ export class Store {
     const rows = this.db.prepare('SELECT s.state,s.content,s.result FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.destination=?').all(platform);
     for (const row of rows) {
       if (row.result) { const ref = decode<RemoteRef>(row.result); if (ref.id === id || ref.uri === id) return 'known'; }
-      if (row.state === 'started' && decode<{ text: string }>(row.content).text === text) return 'possible';
+      if (row.state === 'started' && cleanXLinks(decode<{ text: string }>(row.content).text) === text) return 'possible';
     }
     return undefined;
   }

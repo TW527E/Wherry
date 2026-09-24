@@ -420,6 +420,7 @@ export class BlueskyClient implements Publisher, Collector {
   }
 
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
+    if (part.poll) throw new PlatformError('Bluesky has no native polls; render the X options and link before publishing', { code: 'PollNotSupported' });
     const key = blueskyRecordKey(context.idempotencyKey);
     if (part.video && part.images.length) throw new PlatformError('A Bluesky post cannot carry both a video and images', { code: 'MixedMedia' });
     if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Bluesky accepts at most four images per part', { code: 'TooManyImages' });

@@ -1,6 +1,7 @@
 import { chromium, type BrowserContext, type Page } from 'playwright-core';
 import type { AppConfig } from '../config.js';
-import type { Attachment, Collector, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
 import { resolveBrowserPlan, verifyBrowserPlan, type BrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
 
@@ -37,6 +38,7 @@ export interface TweetFacts {
   quoteUrl?: string;
   attachments: Attachment[];
   poll: boolean;
+  pollData?: PollSnapshot;
   sensitive: boolean;
   metadataComplete: boolean;
 }
@@ -63,11 +65,6 @@ export function hasSensitiveWarning(chromeText: string): boolean {
   return /(?:may contain|includes?|含有|可能包含|包含)[^。\n]{0,40}(?:sensitive|敏感)/i.test(chromeText)
     || /(?:sensitive content|sensitive material|敏感內容|敏感媒材)/i.test(chromeText);
 }
-/**
- * The poll widget. A poll renders either its results block (once voted or closed) or its choices, and
- * the choices are `role="radio"` inside the poll's `role="group"`.
- */
-const pollSelector = '[data-testid="pollResults"], [data-testid="pollPercentage"], [data-testid="pollTotalVotes"], [data-testid="pollTimeRemaining"]';
 const allowedHosts = new Set(['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'twimg.com', 'pbs.twimg.com', 'video.twimg.com']);
 
 /**
@@ -110,6 +107,7 @@ export function parseTweetFacts(input: {
   id: string; url?: string; authorId: string; createdAt?: string; text?: string; labels?: string[];
   statusLinks?: string[]; replyingTo?: string; attachments?: Attachment[]; repost?: boolean; quoteUrl?: string;
   poll?: boolean;
+  pollData?: PollSnapshot;
 }, ownerHandle: string): TweetFacts {
   const ownUrl = input.url;
   const parentLink = (input.statusLinks || []).map(value => {
@@ -131,7 +129,8 @@ export function parseTweetFacts(input: {
     relationKnown,
     repost: input.repost ?? false,
     quoteUrl: validMediaUrl(input.quoteUrl),
-    poll: input.poll ?? false,
+    poll: input.poll === true || input.pollData !== undefined,
+    ...(input.pollData ? { pollData: input.pollData } : {}),
     attachments: (input.attachments || []).map(a => ({ ...a, url: validMediaUrl(a.url) })),
     sensitive: Boolean(input.labels?.length),
     metadataComplete: Boolean(input.id && input.authorId && input.createdAt && relationKnown),
@@ -325,12 +324,25 @@ export class XCollector implements Collector {
         const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]').first().getAttribute('href').catch(() => null);
         const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
         const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
-        // A poll's choices are `role="radio"` inside its `role="group"`; two or more distinguish a real
-        // poll from a stray radio control. Without this the poll's question text would sync alone and
-        // every choice would be dropped downstream without a word.
-        const pollBlock = await article.locator(pollSelector).count().catch(() => 0);
-        const pollChoices = await article.locator('[role="group"] [role="radio"]').count().catch(() => 0);
-        const hasPoll = pollBlock > 0 || pollChoices >= 2;
+        // cardPoll is the current rendered widget; preserve its entire choice list in one read so
+        // percentages cannot be paired with labels from a different render. No vote/reveal action.
+        const pollRead = await article.evaluate((node: Element, selector: string) => {
+          const clone = node.cloneNode(true) as Element;
+          clone.querySelectorAll('[data-testid="quoteTweet"], article, [data-testid="tweetText"]').forEach(element => element.remove());
+          const detected = clone.querySelector(selector) !== null;
+          if (!detected) return { detected: false, html: '', capturedAt: new Date().toISOString() };
+          clone.querySelectorAll('script, style, svg').forEach(element => element.remove());
+          for (const element of [clone, ...clone.querySelectorAll('*')]) {
+            for (const attribute of [...element.attributes]) {
+              if (!['role', 'data-testid', 'dir', 'aria-label', 'aria-hidden', 'aria-checked', 'aria-disabled', 'aria-posinset', 'aria-setsize', 'alt', 'hidden', 'disabled'].includes(attribute.name)) element.removeAttribute(attribute.name);
+            }
+          }
+          const html = clone.outerHTML;
+          return { detected: true, html: html.length <= 256_000 ? html : '', capturedAt: new Date().toISOString() };
+        }, X_POLL_SELECTOR);
+        const parsedPoll = pollRead.detected ? parseXPoll(pollRead.html, pollRead.capturedAt) : undefined;
+        const hasPoll = pollRead.detected;
+        const pollData = parsedPoll?.pollData;
         // Read the post's UI text with the tweet body removed: the sensitive-media warning lives in the
         // media chrome, and a post that merely writes about sensitive content must not be flagged.
         const chromeText = await article.evaluate((node: Element) => {
@@ -360,7 +372,7 @@ export class XCollector implements Collector {
         // Expand any t.co short link the DOM left in the text to its real destination before the
         // post is handed downstream, so other platforms show the real URL, not a t.co short link.
         bodyText = await this.resolveShortLinks(bodyText, signal);
-        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, labels: sensitive ? ['sensitive_media'] : undefined }, this.config.handle);
+        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined }, this.config.handle);
         if (!/pinned|置頂/i.test(articleText) && parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
       }
@@ -387,7 +399,7 @@ export class XCollector implements Collector {
         ? 'X page rendered tweets but none were parseable (tweet layout may have changed); no checkpoint advanced'
         : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
     }
-    const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, poll: f.poll, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
+    const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, poll: f.poll, pollData: f.pollData, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
     if (reachedWatermark) return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: true, warnings: [] };
     // Budget exhausted before reaching the watermark. The posts parsed fine — we just did not
     // scroll back far enough. Report `oldest` as the watermark so the engine advances the
