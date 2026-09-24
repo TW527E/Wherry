@@ -1,15 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const installer = readFileSync(new URL('../deploy/install.sh', import.meta.url), 'utf8');
 const entrypoint = '\nmain "$@"\n';
 assert.ok(installer.endsWith(entrypoint), 'load definitions only; never run the real installer from tests');
 const definitions = installer.slice(0, -entrypoint.length);
-const invoke = (source: string) => spawnSync('bash', ['-c', 'source /dev/stdin'], { input: `${definitions}\n${source}`, encoding: 'utf8',
-  env: { ...process.env, WHERRY_TEST_ROOT: fileURLToPath(new URL('../', import.meta.url)) } });
+// Run the definitions plus the probe from a real script file: the installer reads ${BASH_SOURCE[0]}
+// under `set -u`, which is unbound with `bash -c`, and a piped /dev/stdin cannot be reopened on some
+// hosts. A file path satisfies both without running the real entrypoint.
+const invoke = (source: string) => {
+  const dir = mkdtempSync(join(tmpdir(), 'wherry-deploy-'));
+  try {
+    const script = join(dir, 'probe.sh');
+    writeFileSync(script, `${definitions}\n${source}`);
+    return spawnSync('bash', [script], { encoding: 'utf8',
+      env: { ...process.env, WHERRY_TEST_ROOT: fileURLToPath(new URL('../', import.meta.url)) } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
 
 test('deployment uses shell fail-fast semantics and stops before later steps after failure', () => {
   const syntax = spawnSync('bash', ['-n'], { input: installer, encoding: 'utf8' });
