@@ -115,7 +115,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   // The template must yield a filesystem-safe name. Fill the placeholders with representative values
   // and check the result up front, so a bad SHARKEY_UPLOAD_NAME fails at startup, not mid-publish.
   if (config.sharkey.enabled) {
-    const sample = config.sharkey.uploadName.replace('{timestamp}', '20260921T153000Z').replace('{index}', '0').replace('{ext}', 'jpg');
+    const sample = config.sharkey.uploadName.replaceAll('{timestamp}', '20260921T153000Z').replaceAll('{index}', '0').replaceAll('{ext}', 'jpg');
     if (!sample || !/^[A-Za-z0-9_.-]+$/.test(sample)) {
       throw new Error('SHARKEY_UPLOAD_NAME must resolve to a name using only letters, digits, _, . and - (allowed placeholders: {timestamp}, {index}, {ext})');
     }

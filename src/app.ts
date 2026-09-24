@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import { FastifyInstance, fastify } from 'fastify';
 import { loadConfig, publicConfig, type AppConfig } from './config.js';
 import { SafeHttp } from './security/http.js';
@@ -55,8 +54,7 @@ export function createRuntime(config = loadConfig()): Runtime {
     const client = new SharkeyClient(config.sharkey, transport); collectors.push(client);
     if (live) publishers.set('sharkey', client);
   }
-  // The Telegram client is built whenever configured: command polling and session uploads are
-  // owner-only reads/admin and safe in any mode. It only becomes a publisher in live.
+  // Preview may construct the client, but only live mode polls commands or publishes messages.
   if (config.telegram.enabled && config.telegram.token) {
     telegram = new TelegramClient(config.telegram, transport);
     if (live) publishers.set('telegram', telegram);
@@ -76,7 +74,7 @@ export function createRuntime(config = loadConfig()): Runtime {
   const heavy = new SerialWork();
   const control = new SerialWork();
   const notifications = telegram ? new TelegramNotifications({ config, engine, telegram, store, worker }) : undefined;
-  const timers: NodeJS.Timeout[] = [];
+  const timers = new Set<NodeJS.Timeout>();
   // Aborted on stop() so an in-flight collection scroll ends promptly instead of running out its
   // whole page budget (× reload + sleeps) while shutdown waits on it.
   const shutdown = new AbortController();
@@ -164,7 +162,7 @@ export function createRuntime(config = loadConfig()): Runtime {
     started = true;
     const every = (ms: number, task: () => Promise<void>): void => {
       const timer = setInterval(() => { void task().catch(error => { store.event('error', `Background task failed: ${safeError(error)}`); }); }, ms);
-      timer.unref(); timers.push(timer);
+      timer.unref(); timers.add(timer);
     };
     every(config.pollSeconds * 1000, once);
     if (live && telegram) every(15_000, () => notifications!.flush());
@@ -177,7 +175,11 @@ export function createRuntime(config = loadConfig()): Runtime {
       const pollLoop = (): void => {
         if (stopped) return;
         void commandCycle().catch(error => { store.event('error', `Background task failed: ${safeError(error)}`); })
-          .finally(() => { if (!stopped) { const t = setTimeout(pollLoop, 500); t.unref(); timers.push(t); } });
+          .finally(() => {
+            if (stopped) return;
+            const timer = setTimeout(() => { timers.delete(timer); pollLoop(); }, 500);
+            timer.unref(); timers.add(timer);
+          });
       };
       pollLoop();
     }
@@ -190,9 +192,9 @@ export function createRuntime(config = loadConfig()): Runtime {
       stopped = true;
       shutdown.abort();
       for (const timer of timers) clearInterval(timer);
-      worker.stop();
+      const workerStopped = worker.stop();
       stopping = (async () => {
-        await Promise.allSettled([cycle, commands, menu]);
+        await Promise.allSettled([cycle, commands, menu, workerStopped]);
         await heavy.drain();
         await control.drain();
         await notifications?.flush();
@@ -285,7 +287,6 @@ async function handleSessionUpload(
     catch (error) { context.store.event('error', `Could not delete uploaded session message: ${safeError(error)}`); }
     const note = deleted ? '已刪除你上傳的檔案訊息。' : '⚠️ 無法自動刪除該檔案訊息，請你手動刪除，以免憑證留在對話中。';
     const file = parseSessionFile(bytes);
-    if (file.handle && file.handle.toLowerCase() !== context.config.x.handle.toLowerCase()) throw new Error('Session belongs to a different configured X handle');
     const result = await installSession(context.config.x, file);
     context.store.setSetting('x:session_state', result.authenticated ? 'authenticated' : 'error');
     context.store.event('info', `X session uploaded via Telegram for @${file.handle || context.config.x.handle}; authenticated=${result.authenticated}; messageDeleted=${deleted}`);

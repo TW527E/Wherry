@@ -177,7 +177,6 @@ export interface HttpResponse {
 }
 export interface Transport {
   request(url: string, options?: HttpOptions): Promise<HttpResponse>;
-  json<T = unknown>(url: string, options?: HttpOptions): Promise<T>;
 }
 
 export interface Job {
@@ -229,9 +228,8 @@ export interface Reminder {
  * A held X batch (`review` state) surfaced to the owner as an interactive Telegram message.
  * `offered` = buttons live; `awaiting_link` = the owner tapped 手動鏡像 and we wait for the reply
  * carrying the downstream mirror code(s); `approved` = sent to the downstream queue; `skipped`
- * and `mirrored` are the two terminal decisions. `revision`/`syncedRevision`/`editAfter` drive the
- * same edit-when-changed, back-off-on-429 loop the reminder uses, so the one message keeps
- * reflecting per-platform delivery status without re-sending.
+ * and `mirrored` are the two terminal decisions. State changes edit the original Telegram
+ * message, with back-off after a failed edit.
  */
 export type ReviewNoticeState = 'offered' | 'awaiting_link' | 'approved' | 'skipped' | 'mirrored';
 
@@ -240,14 +238,7 @@ export interface ReviewNotice {
   chatId: string;
   messageId: number;
   state: ReviewNoticeState;
-  /**
-   * A hash of the message body last written to Telegram. The notice text also changes when the
-   * per-platform delivery jobs advance (⏳ → ✅/❌) with no state change of its own, so flush edits
-   * the message whenever the freshly-rendered signature differs from this — not on a revision
-   * counter. Empty until the first edit.
-   */
-  syncedSig: string;
-  /** Back-off timestamp after a Telegram 429, mirroring the reminder edit loop. */
+  /** Retry time after a failed Telegram edit. */
   editAfter?: string;
   at: string;
 }

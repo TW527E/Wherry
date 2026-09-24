@@ -10,8 +10,7 @@ export class UnsupportedMediaError extends Error {
 }
 const hash = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
 
-async function sourceBytes(attachment: Attachment, config: MediaConfig, transport: Transport): Promise<Buffer> {
-  if (attachment.kind !== 'image' || attachment.animated) throw new UnsupportedMediaError('Phase 1 supports static images only');
+export async function sourceBytes(attachment: Attachment, config: Pick<MediaConfig, 'dataDir' | 'maxDownloadBytes'>, transport: Transport): Promise<Buffer> {
   if (attachment.path) {
     const mediaRoot = resolve(config.dataDir, 'media');
     const actual = await realpath(resolve(attachment.path));
@@ -40,10 +39,11 @@ export async function prepareImages(attachments: Attachment[], config: MediaConf
   if (attachments.length > 4) throw new UnsupportedMediaError('Phase 1 supports at most four images');
   const result: PreparedImage[] = [];
   for (const attachment of attachments) {
+    if (attachment.kind !== 'image' || attachment.animated) throw new UnsupportedMediaError('Phase 1 supports static images only');
     const bytes = await sourceBytes(attachment, config, transport);
     const metadata = await inspect(bytes);
     let output: Buffer | undefined;
-    let mimeType: 'image/png' | 'image/jpeg' = metadata.hasAlpha ? 'image/png' : 'image/jpeg';
+    const mimeType: 'image/png' | 'image/jpeg' = metadata.hasAlpha ? 'image/png' : 'image/jpeg';
     for (const size of [4000, 3000, 2048, 1600, 1200, 800, 500]) {
       const pipeline = sharp(bytes, { limitInputPixels: 40_000_000 }).rotate().resize({ width: size, height: size, fit: 'inside', withoutEnlargement: true });
       output = metadata.hasAlpha ? await pipeline.png({ compressionLevel: 9, palette: true, quality: 90 }).toBuffer() : await pipeline.jpeg({ quality: size >= 2048 ? 85 : 76, mozjpeg: true }).toBuffer();

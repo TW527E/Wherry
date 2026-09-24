@@ -17,7 +17,6 @@
     "verify": "npm run check && npm test && npm run build"
   },
   "dependencies": {
-    "@atproto/api": "^0.18.3",
     "cheerio": "^1.1.2",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.2",
@@ -28,6 +27,7 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@atproto/api": "^0.18.3",
     "@types/node": "^24.10.1",
     "@types/twitter-text": "^3.1.10",
     "tsx": "^4.20.6",

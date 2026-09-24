@@ -1,6 +1,6 @@
 [Unit]
 Description=Crosspost Bridge scheduler and worker
-Documentation=https://github.com/TW527E/Twitter-Sharkey-Bluesky
+Documentation=https://github.com/TW527E/Wherry
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300

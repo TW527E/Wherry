@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { graphemes } from '../text.js';
 import type { AppConfig } from '../config.js';
 import { BLUESKY_SENSITIVE_LABELS, isSensitiveContent, warningPrefix } from '../content-warning.js';
 import type { Attachment, Collector, HttpOptions, PreparedVideo, PublishContext, Publisher, PublishPart, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
@@ -12,11 +14,8 @@ import {
 export type BlueskyConfig = AppConfig['bluesky'];
 export interface BlueskySession { did: string; handle: string; pds: string; accessJwt: string; refreshJwt: string }
 export interface BlueskyOptions {
-  maxPages?: number;
   now?: () => Date;
   session?: BlueskySession;
-  /** Optional durable secret storage. Rotation is retained in this client even without a callback. */
-  onSession?: (session: BlueskySession) => void | Promise<void>;
 }
 interface Identity { did: string; handle: string; pds: string }
 interface StrongRef { uri: string; cid: string }
@@ -29,8 +28,6 @@ const collection = 'app.bsky.feed.post';
 // so the SSRF-guarded transport still governs the request.
 const videoServiceDid = 'did:web:video.bsky.app';
 const videoServiceUrl = 'https://video.bsky.app';
-const segmenter = new Intl.Segmenter('und', { granularity: 'grapheme' });
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 const didValid = (value: unknown): value is string => typeof value === 'string' &&
   (/^did:plc:[a-z2-7]{24}$/.test(value) || /^did:web:[^\s/?#]+$/.test(value));
 /** Non-narrowing form for values already known to be strings. */
@@ -251,7 +248,6 @@ export class BlueskyClient implements Publisher, Collector {
   readonly platform = 'bluesky' as const;
   private readonly serviceUrl: string;
   private readonly publicUrl: string;
-  private readonly maxPages: number;
   private readonly now: () => Date;
   private identity?: Identity;
   private session?: BlueskySession;
@@ -259,11 +255,9 @@ export class BlueskyClient implements Publisher, Collector {
   private loggingIn?: Promise<BlueskySession>;
   private refreshing?: Promise<BlueskySession>;
 
-  constructor(private readonly config: BlueskyConfig, private readonly transport: Transport, private readonly options: BlueskyOptions = {}) {
+  constructor(private readonly config: BlueskyConfig, private readonly transport: Transport, options: BlueskyOptions = {}) {
     this.serviceUrl = httpsBase(config.serviceUrl, 'Bluesky bootstrap service');
     this.publicUrl = httpsBase(config.publicUrl, 'Bluesky public AppView');
-    this.maxPages = options.maxPages ?? 3;
-    if (!positiveInteger(this.maxPages) || this.maxPages > 3) throw new PlatformError('Bluesky maxPages must be between 1 and 3', { code: 'InvalidPagination' });
     this.now = options.now ?? (() => new Date());
     if (options.session) {
       const session = options.session;
@@ -271,8 +265,6 @@ export class BlueskyClient implements Publisher, Collector {
       this.session = { ...session, pds: httpsBase(session.pds, 'Stored Bluesky PDS') };
     }
   }
-
-  getSession(): BlueskySession | undefined { return this.session ? { ...this.session } : undefined; }
 
   private async resolvePds(did: string): Promise<string> {
     const doc = object(await requestJson(this.transport, publicDidUrl(did), { method: 'GET', maxBytes: 256_000 }, 'Bluesky DID discovery'));
@@ -288,13 +280,6 @@ export class BlueskyClient implements Publisher, Collector {
     if (!didValid(session?.did) || !nonempty(session?.handle) || !nonempty(session?.accessJwt) || !nonempty(session?.refreshJwt)
       || (expectedDid !== undefined && session.did !== expectedDid) || session.active === false) throw schemaError('Bluesky session');
     return { did: session.did, handle: session.handle, accessJwt: session.accessJwt, refreshJwt: session.refreshJwt, pds };
-  }
-
-  private async save(session: BlueskySession): Promise<BlueskySession> {
-    this.session = session;
-    try { await this.options.onSession?.({ ...session }); }
-    catch { throw new PlatformError('Bluesky session persistence failed', { code: 'SessionPersistenceFailed' }); }
-    return session;
   }
 
   private async discover(): Promise<Identity> {
@@ -322,8 +307,8 @@ export class BlueskyClient implements Publisher, Collector {
       }
       const pds = await this.resolvePds(did);
       const identity = { did, handle, pds };
-      if (bootstrap) await this.save({ ...bootstrap, pds });
-      else if (this.session && this.session.pds !== pds) await this.save({ ...this.session, pds });
+      if (bootstrap) this.session = { ...bootstrap, pds };
+      else if (this.session && this.session.pds !== pds) this.session = { ...this.session, pds };
       this.identity = identity;
       return identity;
     })();
@@ -339,7 +324,8 @@ export class BlueskyClient implements Publisher, Collector {
       const session = this.decodeSession(await requestJson(this.transport, `${identity.pds}/xrpc/com.atproto.server.createSession`,
         jsonBody({ identifier: this.config.identifier, password: this.config.appPassword }), 'Bluesky login'), identity.pds, identity.did);
       this.identity = { ...identity, handle: session.handle };
-      return this.save(session);
+      this.session = session;
+      return session;
     })();
     try { return { ...await this.loggingIn }; } finally { this.loggingIn = undefined; }
   }
@@ -352,7 +338,8 @@ export class BlueskyClient implements Publisher, Collector {
       const refreshed = this.decodeSession(await requestJson(this.transport, `${pds}/xrpc/com.atproto.server.refreshSession`,
         { method: 'POST', headers: { authorization: `Bearer ${current.refreshJwt}` } }, 'Bluesky session refresh'), pds, current.did);
       this.identity = { did: refreshed.did, handle: refreshed.handle, pds };
-      return this.save(refreshed);
+      this.session = refreshed;
+      return refreshed;
     })();
     try { return { ...await this.refreshing }; } finally { this.refreshing = undefined; }
   }
@@ -379,9 +366,6 @@ export class BlueskyClient implements Publisher, Collector {
    * the job until the blob is ready. Pre-publish like uploadBlob — an uncertain failure can only
    * orphan a job/blob, never create a visible post — so it stays a plain transient (mutation=false),
    * leaving the record create afterwards as the one idempotent mutation.
-   *
-   * This path only runs against the live video service (video.bsky.app); there is no offline fixture,
-   * so it needs real-account verification.
    */
   private async uploadVideoBlob(video: PreparedVideo, did: string): Promise<JsonObject> {
     const exp = Math.floor(this.now().getTime() / 1000) + 30 * 60;
@@ -434,8 +418,8 @@ export class BlueskyClient implements Publisher, Collector {
     const sensitive = isSensitiveContent(part);
     const labels = sensitive ? [...new Set(part.sensitiveLabels?.length ? part.sensitiveLabels : [this.config.sensitiveLabel])] : [];
     const text = `${warningPrefix(part)}${part.text}`;
-    if (typeof text !== 'string' || (!text.trim() && !part.images.length && !part.video)) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
-    if (Buffer.byteLength(text) > 3000 || Array.from(segmenter.segment(text)).length > 300) throw new PlatformError('Split Bluesky parts before publishing (300 graphemes / 3000 UTF-8 bytes)', { code: 'TextTooLong' });
+    if (!text.trim() && !part.images.length && !part.video) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
+    if (Buffer.byteLength(text) > 3000 || graphemes(text).length > 300) throw new PlatformError('Split Bluesky parts before publishing (300 graphemes / 3000 UTF-8 bytes)', { code: 'TextTooLong' });
     let reply: { root: StrongRef; parent: StrongRef } | undefined;
     if (context.parent) {
       const parent = strong({ uri: context.parent.uri ?? context.parent.id, cid: context.parent.cid });
@@ -504,7 +488,7 @@ export class BlueskyClient implements Publisher, Collector {
       accountId = identity.did;
       let cursor: string | undefined;
       const cursors = new Set<string>();
-      for (let page = 0; page < this.maxPages; page++) {
+      for (let page = 0; page < 3; page++) {
         const query = new URLSearchParams({ actor: identity.did, limit: '100', filter: 'posts_with_replies', includePins: 'false' });
         if (cursor) query.set('cursor', cursor);
         const result = object(await requestJson(this.transport, `${this.publicUrl}/xrpc/app.bsky.feed.getAuthorFeed?${query}`,

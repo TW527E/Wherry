@@ -137,15 +137,4 @@ export class SafeHttp implements Transport {
       return response;
     }
   }
-
-  async json<T = unknown>(url: string, options: HttpOptions = {}): Promise<T> {
-    const response = await this.request(url, options);
-    const retry = Number(response.headers['retry-after']);
-    if (response.status < 200 || response.status >= 300) {
-      throw new HttpError(`External API returned HTTP ${response.status}`, response.status, Number.isFinite(retry) ? retry : undefined,
-        response.status >= 500 && mutation((options.method || 'GET').toUpperCase()));
-    }
-    try { return JSON.parse(Buffer.from(response.body).toString('utf8')) as T; }
-    catch { throw new HttpError('External API returned invalid JSON', response.status, undefined, mutation((options.method || 'GET').toUpperCase())); }
-  }
 }

@@ -13,7 +13,6 @@ const at = (offsetSeconds: number): string => new Date(base + offsetSeconds * 10
 
 const transport: Transport = {
   async request() { throw new Error('network is not available in tests'); },
-  async json<T>() { throw new Error('network is not available in tests') as T; },
 };
 
 function config(destinations: Destination[] = ['bluesky']) {
@@ -91,7 +90,8 @@ test('a retry after a partial failure never repeats an already delivered part', 
   job = store.getJob(job.id)!;
   assert.equal(job.state, 'succeeded');
   assert.equal(publisher.calls.length, 4, 'only the two remaining parts are retried');
-  assert.deepEqual(publisher.calls, ['bluesky-root', 'bluesky-reply', 'bluesky-reply', 'bluesky-footer'].map((_, i) => publisher.calls[i]));
+  const expectedKeys = (await engine.parts(job)).map(part => part.key);
+  assert.deepEqual(publisher.calls, [expectedKeys[0], expectedKeys[1], expectedKeys[1], expectedKeys[2]]);
   const keys = publisher.calls;
   assert.equal(new Set(keys).size, 3, 'each part key is published at most once per successful step');
 });

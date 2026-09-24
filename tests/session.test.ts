@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { loadConfig } from '../src/config.js';
+import { installSession } from '../src/platforms/x.js';
 import { buildSessionFile, parseSessionFile, filterXState, MAX_SESSION_BYTES, type StorageState } from '../src/platforms/session.js';
 
 const encode = (value: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(value));
@@ -59,4 +61,22 @@ test('parseSessionFile rejects a file with no X auth cookie', () => {
 test('parseSessionFile rejects an oversized file before parsing', () => {
   const big = new Uint8Array(MAX_SESSION_BYTES + 1);
   assert.throws(() => parseSessionFile(big), /too large/);
+});
+
+test('session import filters unrelated cookies and normalizes attributes at the parsing boundary', () => {
+  const file = buildSessionFile(stateWith([{ name: 'auth_token', domain: '.x.com' }]), 'owner');
+  const parsed = parseSessionFile(encode({ ...file, state: { cookies: [
+    { name: 'auth_token', value: 'session', domain: '.x.com', path: 42, expires: 'invalid', sameSite: 'invalid' },
+    { name: 'unrelated', value: 'secret', domain: '.example.com' },
+    { name: 'lookalike', value: 'secret', domain: 'x.com.example.com' },
+  ], origins: [{ origin: 'https://example.com', localStorage: [] }] } }));
+  assert.deepEqual(parsed.state, { cookies: [{ name: 'auth_token', value: 'session', domain: '.x.com', path: '/', expires: -1,
+    httpOnly: false, secure: true, sameSite: 'Lax' }], origins: [] });
+  assert.throws(() => parseSessionFile(encode({ ...file, state: { cookies: [{ name: 'auth_token', value: '', domain: '.x.com' }] } })), /auth cookie/);
+});
+
+test('the shared session installer rejects disabled X or a different handle before opening a browser', async () => {
+  const file = buildSessionFile(stateWith([{ name: 'auth_token', domain: '.x.com' }]), 'other');
+  await assert.rejects(installSession(loadConfig({}).x, file), /X_ENABLED is false/);
+  await assert.rejects(installSession(loadConfig({ X_ENABLED: 'true', X_HANDLE: 'owner' }).x, file), /different configured X handle/);
 });

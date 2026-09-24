@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { AppConfig } from './config.js';
 import { Engine, Worker, safeError } from './engine.js';
 import { Store } from './store.js';
@@ -8,16 +7,15 @@ import type { Reminder, ReviewNotice } from './types.js';
 export interface ReminderContext { config: AppConfig; telegram: TelegramClient; store: Store; engine: Engine; worker: Worker }
 
 /** The owner-facing body a settled review notice is edited down to; empty while still `offered`. */
-function reviewNoticeStatusText(notice: ReviewNotice): string {
+function reviewNoticeStatusText(notice: ReviewNotice, engine: Engine): string {
   switch (notice.state) {
-    case 'awaiting_link': return '🪞 你選擇了「這是我手動鏡像的」。\n請「回覆這則通知」，貼上通知裡列出的鏡像代碼（可多個）與該平台的貼文連結。系統不會反向同步這則 X 內容。';
+    case 'awaiting_link': return `🪞 你選擇了「這是我手動鏡像的」。\n請「回覆這則通知」，貼上鏡像代碼（可多個）與該平台的貼文連結。系統不會反向同步這則 X 內容。\n\n${engine.mirrorCandidates().map(candidate => `${candidate.platform}：${candidate.id}`).join('\n')}`;
     case 'approved': return '✅ 已批准：正在把這則 X 內容同步到其他平台，狀態請看 /status。';
     case 'skipped': return '🚫 已略過：不會同步這則 X 內容。';
     case 'mirrored': return '🪞 已登記為手動鏡像：不會反向同步這則 X 內容。';
     default: return '';
   }
 }
-const noticeSig = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
 export function extractXStatus(text: string, ownerHandle: string): { url: string; id: string } | undefined {
   const candidates = text.match(/https?:\/\/[^\s<>"'，。]+/giu) ?? [];
@@ -59,15 +57,17 @@ export async function handleCallback(query: TelegramCallbackQuery, context: Remi
   const data = query.data ?? '';
   if (data.startsWith('rev:')) {
     const notice = store.getReviewNotice(query.message.message_id, String(query.message.chat.id));
-    if (!notice || !['rev:a', 'rev:s', 'rev:m'].includes(data)) { await telegram.answerCallbackQuery(query.id, '這則通知無法使用'); return; }
+    // Old messages included the batch ID; the stored message mapping remains authoritative.
+    const action = ['rev:a', 'rev:s', 'rev:m'].find(value => data === value || data === `${value}:${notice?.batchId}`);
+    if (!notice || !action) { await telegram.answerCallbackQuery(query.id, '這則通知無法使用'); return; }
     if (notice.state !== 'offered') { await telegram.answerCallbackQuery(query.id, '這則通知已處理，請依訊息操作'); return; }
     try {
-      if (data === 'rev:a') {
+      if (action === 'rev:a') {
         engine.action('approve', notice.batchId);
         store.setReviewNoticeState(notice.batchId, 'approved');
         void worker.run().catch(() => undefined);
         await telegram.answerCallbackQuery(query.id, '已批准，正在同步到其他平台');
-      } else if (data === 'rev:s') {
+      } else if (action === 'rev:s') {
         engine.action('skip', notice.batchId);
         store.setReviewNoticeState(notice.batchId, 'skipped');
         await telegram.answerCallbackQuery(query.id, '已略過，不會同步');
@@ -174,27 +174,21 @@ export class TelegramNotifications {
         break;
       }
     }
-    // Edit each settled review notice down to its outcome (approved / skipped / mirrored / awaiting a
-    // reply). Same edit-when-changed, back-off-on-429 discipline as reminders: only touch Telegram when
-    // the freshly rendered body differs from what was last written, and defer on a rate-limit.
     for (const notice of store.reviewNoticesNeedingEdit(now)) {
       if (notice.chatId !== config.telegram.privateChatId) continue;
-      const text = reviewNoticeStatusText(notice);
-      const sig = noticeSig(text);
-      if (!text || sig === notice.syncedSig) continue;
+      const text = reviewNoticeStatusText(notice, this.context.engine);
+      if (!text) continue;
       try {
         await telegram.editMessageText(notice.chatId, notice.messageId, text);
-        store.reviewNoticeSynced(notice.batchId, sig);
+        store.reviewNoticeSynced(notice);
       } catch (error) {
         const seconds = Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0);
-        store.deferReviewNoticeEdit(notice.batchId, new Date(Date.now() + seconds * 1000).toISOString());
+        store.deferReviewNoticeEdit(notice, new Date(Date.now() + seconds * 1000).toISOString());
         store.event('error', `Telegram review notice update failed; will retry: ${safeError(error)}`, notice.batchId);
         break;
       }
     }
     if (store.setting<string>('telegram:error_retry_at', '') > now) return;
-    // Error/failure notices always go to the owner's private chat with the bot, never the ops group.
-    const audience = 'private';
     if (!config.telegram.privateChatId) return;
     const errors = store.errorEventsAfter(store.setting<number>('telegram:error_offset', 0), 5);
     if (!errors.length) return;
@@ -204,7 +198,7 @@ export class TelegramNotifications {
       return safeError(new Error(text));
     };
     try {
-      await telegram.sendPlain(`⚠️ Wherry 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, audience);
+      await telegram.sendPlain(`⚠️ Wherry 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, 'private');
       store.setSetting('telegram:error_offset', errors.at(-1)!.id);
       store.setSetting('telegram:error_retry_at', '');
     } catch (error) {

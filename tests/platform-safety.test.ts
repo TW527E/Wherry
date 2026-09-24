@@ -85,7 +85,6 @@ test('several images from one post go out as a single Telegram album with the ca
       const result = [{ message_id: 41 }, { message_id: 42 }, { message_id: 43 }];
       return { status: 200, headers: {}, body: new TextEncoder().encode(JSON.stringify({ ok: true, result })) };
     },
-    async json<T>() { throw new Error('unused') as T; },
   };
   const client = new TelegramClient(
     { enabled: true, token: '123:abc', ownerId: '1', privateChatId: '1', opsChatId: '', publicChatId: '555', pollCommands: false },
@@ -125,7 +124,6 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
       if (method === 'notes/create') return json({ createdNote: { id: 'note1', uri: null } });
       throw new Error(`unexpected Sharkey call: ${method}`);
     },
-    async json<T>() { throw new Error('unused') as T; },
   };
   const config = {
     enabled: true, baseUrl: 'https://sharkey.example', token: 'tok', userId: 'user1', username: 'owner',
@@ -170,7 +168,6 @@ test('an empty SHARKEY_DRIVE_FOLDER uploads to the drive root with no folder loo
       if (method === 'notes/create') return json({ createdNote: { id: 'note1', uri: null } });
       throw new Error(`unexpected Sharkey call: ${method}`);
     },
-    async json<T>() { throw new Error('unused') as T; },
   };
   const config = {
     enabled: true, baseUrl: 'https://sharkey.example', token: 'tok', userId: 'user1', username: 'owner',

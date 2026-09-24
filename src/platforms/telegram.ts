@@ -80,7 +80,7 @@ export class TelegramClient implements Publisher {
       const files = part.images.map((image, index) => ({
         field: `photo${index}`, filename: `crosspost-${index}.${image.mimeType === 'image/png' ? 'png' : 'jpg'}`, mimeType: image.mimeType, bytes: image.bytes,
       }));
-      const media = part.images.map((image, index) => ({
+      const media = part.images.map((_image, index) => ({
         type: 'photo', media: `attach://photo${index}`,
         ...(sensitive ? { has_spoiler: true } : {}),
         ...(index === 0 ? { caption, parse_mode: 'HTML' } : {}),

@@ -86,7 +86,7 @@ Web 頁面可輸入 token；目前 UI 會把它保存在該瀏覽器來源的 `l
 X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，或 X 改版／語言不受支援，仍可能漏偵測；這不是對未標記內容的自動分類器。
 
 <a id="sharkey"></a>
-## Sharkey（5 個）
+## Sharkey（8 個）
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
@@ -95,6 +95,9 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 | `SHARKEY_TOKEN` | 空字串 | 實例 API 存取權杖。發文需 `write:notes`，上傳圖需 `write:drive`；若兩個帳戶識別欄位都沒填，帳戶探索還需 `read:account`。 | 由自己的實例「設定 → API／存取權杖」建立；不同版本標籤可能不同，詳見下方步驟。 |
 | `SHARKEY_USER_ID` | 空字串 | 選填的本機 user ID；有值時優先用 `users/show` 查詢。ID 是平台識別碼，不一定是數字。 | 從實例官方 API 的 `users/show` 回應 `id` 取得，不是貼文 ID。與 username 同填時必須一致。 |
 | `SHARKEY_USERNAME` | 空字串 | 本機帳號名，不含 `@` 或 `@實例網域`；未填 user ID 時用它查詢。不是顯示名稱，也不是遠端聯邦帳號。 | 從自己的實例個人頁取得；建議填它，避免僅為帳戶探索額外授予 `read:account`。 |
+| `SHARKEY_SIGNATURE` | 內建 Wherry MFM 署名 | 附在 X 同步貼文內文底部，`{url}` 換成該則原文連結；空字串停用。 | 自訂 MFM／Markdown，或留空不署名。 |
+| `SHARKEY_DRIVE_FOLDER` | `Wherry` | 在 Drive 根目錄依名稱尋找／建立資料夾，並快取其 ID；空字串直接上傳至根目錄。 | 啟用資料夾時另需 `read:drive` 與 `write:drive`。 |
+| `SHARKEY_UPLOAD_NAME` | `Wherry_{timestamp}-{index}.{ext}` | 上傳檔名樣板；替換後只允許英數字、`_`、`.`、`-`。 | 可使用 `{timestamp}`、`{index}`、`{ext}`，同一預留位置可重複。 |
 
 欄位、token 及實例必須屬於**同一個自己擁有的帳戶**。不要假設填入公開 username 就能證明 token 所屬帳戶正確。實例／角色／反向代理的文字、容量與發文限制仍可能拒絕請求；程式沒有「解除可見性限制」的 env 設定，也不會替你修改帳戶的可見性選項。
 
@@ -107,9 +110,9 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 | `TELEGRAM_BOT_TOKEN` | 空字串 | Bot API 憑證；持有者可控制 bot，也可能接觸 bot 收到的檔案。 | 透過 [官方 BotFather](https://t.me/BotFather) 建立／管理 bot，不向第三方索取。 |
 | `TELEGRAM_OWNER_ID` | 空字串 | 唯一允許下指令、點按提醒與上傳 session 的本人數字 user ID。 | 從自己與 bot 私聊的 `message.from.id` 取得；不能填 bot ID 或 `@username`。 |
 | `TELEGRAM_PRIVATE_CHAT_ID` | `TELEGRAM_OWNER_ID`；兩者皆空則空 | 手動 X 提醒、命令回覆與 session 管理的私人 chat。只接受 owner 在指定私人 chat 的操作。 | 從 `message.chat.id` 核對，並確認 `message.chat.type` 為 `private`。先向 bot 送出 `/start`。 |
-| `TELEGRAM_OPS_CHAT_ID` | 空字串 | `live` 中新 `error` 事件的告警目的地。未設定時回退 private chat；不受 `TELEGRAM_POLL_COMMANDS` 控制。 | 從自己維運頻道的 `channel_post.chat.id` 或 `my_chat_member.chat.id` 取得。頻道須給 bot 發文權；避免放到公開頻道洩露運作資訊。 |
+| `TELEGRAM_OPS_CHAT_ID` | 空字串 | 保留給明確指定 ops audience 的呼叫；目前自動錯誤告警一律送到 private chat。 | 日常通知不需設定；不要把此欄位當成錯誤轉發目的地開關。 |
 | `TELEGRAM_PUBLIC_CHAT_ID` | 空字串 | 對外同步的目的地；還需 `live`、Telegram enabled/token，且 `DESTINATIONS` **包含 `telegram`**。 | 從自己要發文的頻道取得數字 ID，並給 bot 最小必要發文權。僅填此值不會啟用對外同步。 |
-| `TELEGRAM_POLL_COMMANDS` | `false` | `live` 下設 true 才登記 `/` 指令選單並每 5 秒收取指令、按鈕、回覆與 session 檔案。preview 不啟動輪詢。 | 要透過 bot 管理時才開；false 仍可在 live 發送提醒與告警，但提醒按鈕／回覆不會被處理。 |
+| `TELEGRAM_POLL_COMMANDS` | `false` | `live` 下設 true 才登記 `/` 指令選單，以 25 秒長輪詢接收指令、按鈕、回覆與 session 檔案；回應後稍候 0.5 秒再輪詢。preview 不啟動輪詢。 | 要透過 bot 管理時才開；false 仍可在 live 發送提醒與告警，但提醒按鈕／回覆不會被處理。 |
 
 所有非空 Telegram ID 均須為數字字串（驗證格式為 `^-?\d+$`）；頻道 ID 常以 `-100` 開頭，**保留負號**。Owner 使用自己的正數 user ID，不是電話號碼。格式驗證不會替你檢查 chat 是否存在、是否屬於你或 bot 是否有權限。
 
@@ -122,7 +125,7 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何選擇 |
 |---|---|---|---|
-| `POLL_SECONDS` | `120` | 常駐收集／worker 週期，整數 **30–86400**。固定間隔，不是保證有隨機抖動的排程。 | 保守低頻開始；週期過长可能造成讀取積壓。它不改變 Telegram 的 5 秒命令週期。 |
+| `POLL_SECONDS` | `120` | 常駐收集／worker 週期，整數 **30–86400**。固定間隔，不是保證有隨機抖動的排程。 | 保守低頻開始；週期過長可能造成讀取積壓。它不改變 Telegram 的獨立長輪詢。 |
 | `THREAD_WINDOW_SECONDS` | `600` | 從 X root **發布時間**起算的固定自串文窗口，整數 **30–3600**。後續回覆不會延長窗口。 | 依自己通常完成串文所需時間調整，不是允許無限追加舊推文。 |
 | `THREAD_SETTLE_SECONDS` | `180` | 窗口結束與 root 首次收集時間兩者中較晚者，再加的等待時間，整數 **30–1800**。 | 保留緩衝以等待可收集的後續內容。不是從最後一則回覆重新計時。 |
 | `SOURCE_FRESHNESS_SECONDS` | `300` | 封存批次時，所需來源的成功掃描距今最多幾秒，整數 **30–3600**；X 掃描還必須不早於串文窗口結束。 | 宜大於 `POLL_SECONDS`，並預留網路／瀏覽器時間。設定得太小會一直等待新鮮資料。 |
@@ -134,15 +137,15 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 固定而非 env 的限制包括：每篇最多 4 張靜態圖、每張輸出最多 **2000000 bytes**、圖片解碼最多 4000 萬像素、pending mirror 初始有效期 72 小時、Telegram session 上傳上限 256 KiB。Bluesky／Sharkey collector 目前各最多讀 3 頁、每頁最多 100 筆；沒有對應 env 可調整。
 
 <a id="video"></a>
-## 尚未接入發布流程的影片模組（3 個）
+## 選用影片轉碼（3 個）
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
-| `VIDEO_ENABLED` | `false` | 設定中保留的布林值；**目前不會改變發布管線的靜態圖片限制**。設 true 也不會同步影片或 GIF。 | 保持 false。不要以它作為「影片功能已完成」的判定。 |
-| `FFMPEG_PATH` | `ffmpeg` | 獨立影片模組使用的程式名（由 `PATH` 搜尋）或執行檔路徑；不是 shell 命令或額外參數欄位。 | 只有開發／單獨使用該模組時才從系統套件管理器安裝 FFmpeg。 |
-| `FFPROBE_PATH` | `ffprobe` | 同上，用於取得影片資訊。一般文字與靜態圖片同步不會呼叫。 | 通常隨 FFmpeg 套件提供；自行確認實際安裝路徑。 |
+| `VIDEO_ENABLED` | `false` | 設 true 後，單一且有可讀取來源的影片會轉成 MP4，再交給下游 publisher。GIF、混合附件與無直接來源的 X 影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
+| `FFMPEG_PATH` | `ffmpeg` | 轉碼程式名（由 `PATH` 搜尋）或執行檔路徑；不是 shell 命令或額外參數欄位。 | 從系統套件管理器安裝 FFmpeg，確認包含 H.264／AAC 編碼器。 |
+| `FFPROBE_PATH` | `ffprobe` | 探測影片資訊的程式名或執行檔路徑。一般文字與靜態圖片同步不會呼叫。 | 通常隨 FFmpeg 套件提供；自行確認實際安裝路徑。 |
 
-[`src/video.ts`](../src/video.ts) 有獨立的探測／轉碼函式及測試，但 Engine／各平台的正式發布流程尚未接入。它不是已可使用的跨平台影片同步功能，亦不代表支援 Bluesky 專用影片服務。
+影片管線已接入 Engine 與 Bluesky／Sharkey／Telegram。輸入必須是可下載的自含媒體檔，或位於 `DATA_DIR/media` 內的本機檔案，並受 `MAX_DOWNLOAD_BYTES` 限制；不接受播放清單另開網路或其他本機檔案。輸出保留比例、最長邊不超過 1280、30 fps、H.264／AAC、最長 140 秒。Bluesky 使用專用影片服務。X collector 目前不提供直接影片來源，因此 X 影片仍會被保留；真實平台配額與上傳能力需另行驗證。
 
 <a id="credentials"></a>
 ## 官方憑證與帳號資料取得
@@ -167,7 +170,7 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 ### Sharkey
 
 1. 登入**自己所屬實例**，在設定尋找 **API／存取權杖（Access token）**，新增本工具專用權杖；介面名稱依版本而異。以實例提供的 API 說明與 [Sharkey 官方文件](https://docs.joinsharkey.org/) 為準。
-2. 對需要發布文字與圖片的用途，只授予 `write:notes`、`write:drive`。不要為了方便直接開所有權限。
+2. 對需要發布文字與圖片的用途，授予 `write:notes`、`write:drive`；預設啟用的 Drive 資料夾另需 `read:drive`。若不授予讀取權，將 `SHARKEY_DRIVE_FOLDER` 設為空字串。不要直接開所有權限。
 3. 建議填自己的 `SHARKEY_USERNAME`；若要用 ID，透過實例官方 API console 的 `users/show`，以自己的本機 username、`host: null` 查詢，取回應的 `id`。不要把整份回應公開。
 4. 若 `SHARKEY_USER_ID` 與 `SHARKEY_USERNAME` 都留空，程式改用 `/api/i` 探索自己的帳戶，權杖還需 `read:account`。這是額外權限，不是填 username 後仍必需的權限。
 5. `SHARKEY_URL` 設為同一實例，token 與識別值也必須是同一帳戶。更換實例／帳戶應按 [維運方式](#maintenance) 使用新的狀態目錄，避免混淆既有對映。
@@ -176,7 +179,7 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 
 1. 在 Telegram 開啟經核對的 [官方 `@BotFather`](https://t.me/BotFather)，用 `/newbot` 建立專用 bot，依指示命名。將取得的 token 保存在私密設定中；若外洩，用 BotFather 撤銷／重新產生 token。
 2. 使用你自己的 Telegram 帳號與新 bot **私人聊天**，送出 `/start`。Bot 不能無緣無故先向從未啟動對話的使用者發私訊。
-3. 若需要維運或對外頻道，把 bot 加入**自己的對應頻道**並授予發文的最小必要權限。不要把私人 session 檔傳到頻道。
+3. 若需要對外頻道，把 bot 加入**自己的對應頻道**並授予發文的最小必要權限。自動錯誤告警仍走私人聊天；不要把私人 session 檔傳到頻道。
 4. 由本機受信任、可遮蔽秘密且不記錄完整請求的 API 用戶端，呼叫官方 Bot API 的 **`getUpdates`**。Token 從私密設定／secret 欄位載入，在記憶體中組合請求；**不要把含 token 的完整 URL 放到 `curl` 參數、shell history、瀏覽器網址列或雲端 API 測試器**。本文件不提供會把 token 暴露在命令列的範例。
 5. 取得 ID 時先停用本工具及其他 `getUpdates` 輪詢者，避免消耗或競爭更新。官方 API 接收哪些事件受 `allowed_updates` 影響；用於設定時可要求 `message`、`channel_post`、`my_chat_member`，再自行發一則新的私人／頻道測試訊息。程式日常命令輪詢只收 `message` 與 `callback_query`，不應拿它的結果當成所有頻道資料。
 6. 只在自己的本機查看必要 JSON 欄位，不公開整份回應：
@@ -296,17 +299,17 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | X 找不到瀏覽器／profile 被鎖 | 核對執行檔、CPU 架構、目錄所有者；停止使用相同 profile 的程式。`npm ci` 不會下載 Chromium。 |
 | Linux root 或服務環境無法啟動 sandbox | 改用專用非 root 使用者，檢查系統支援與部署文件。`X_SANDBOX` 的自動預設見設定表；不要先關閉 sandbox 當万能解法。 |
 | X 出現登入牆、challenge、零推文或解析失敗 | 在本機自行重新驗證，匯出新 session 後安全匯入；不要自動繞過驗證。也可能是 X 前端改版，保留檢查點並查看錯誤。 |
-| `Incomplete snapshot`／backlog 超出預算 | 該輪不推進來源檢查點；X 可在上限內調整 `X_MAX_PAGES`，降低合理輪詢間隔。B/S 頁數並無 env 可任意放大。不要清除 checkpoint 來假裝沒有缺口。 |
-| X 批次停在 `open` | 檢查窗口、settle 時間與所需來源的新鮮度；Bluesky／Sharkey 若被列為 destination 卻缺憑證或持續讀取失敗，會阻止正常封存。 |
+| `Incomplete snapshot`／backlog 超出預算 | 結構性失敗不推進檢查點。X 若提供已解析的最舊時間，會推進至該時間並警告可能漏掉更早内容；可在上限內調整 `X_MAX_PAGES`。B/S 超出頁數仍保留檢查點。不要清空狀態來隱藏缺口。 |
+| X 批次停在 `open` | 檢查窗口、settle 時間與來源新鮮度。從未成功觀察的來源仍會阻止封存；下游連續失敗三次後可使用舊鏡像資料並記警告，X 本身的新鮮度不放寬。 |
 | 批次或工作停在 `review` | 先看原因；疑似鏡像或長文要人工決定，非公開／不完整或不支援媒體不能用 approve 強行放行。敏感標記本身不再保留；無其他問題時會帶警告同步。 |
 | 401／403／Sharkey `read:account` 不足 | 核對同帳戶的憑證與實例；Sharkey 優先填自己的 username 或 user ID，若採 `/api/i` 才另外需要 read scope。不要把 token 或完整回應貼到 issue。 |
 | Telegram 不回指令／按鈕沒反應 | 需 live、enabled、token、`TELEGRAM_POLL_COMMANDS=true`，且 owner/private chat 都正確；先 `/start`，檢查是否另有 poller／webhook。preview 不會回應。 |
-| Telegram 沒有告警 | 需 live 及可用 Telegram 設定；ops 空白時才回退 private。只轉送新 `error` 事件，並非所有訊息。即使 pollCommands=false 仍應可發告警。 |
+| Telegram 沒有告警 | 需 live 及可用 Telegram 設定；自動告警一律送 private chat。只轉送新 `error` 事件，並非所有訊息；pollCommands=false 仍可發告警。 |
 | Telegram 私聊可用，但對外頻道沒內容 | 確認 `DESTINATIONS` 含 `telegram`、public chat 數字 ID 正確及 bot 可發文。只設 enabled 或 public chat 不會建立對外發布工作。 |
 | `/session` 被拒絕 | 核對 owner/private chat、live、輪詢、X enabled、明確的 `/session` 指令／caption、本工具匯出格式與 256 KiB 上限；勿反覆把登入檔傳到其他 chat。 |
 | `unknown` 或送出後連線中斷 | 先人工確認遠端是否已有內容並處理對帳。`/retry`、`/resync`、CLI retry 都不是強制重送 unknown 的後門，不能靠重啟解決。 |
 | 429／暫時失敗 | 已確認安全重試的工作會按伺服器延遲／退避處理，至 `MAX_ATTEMPTS` 上限；不要密集手動重試。送出結果不明則另走對帳。 |
-| 影片／GIF／超過四張圖不發布 | 目前只支援最多四張靜態圖；`VIDEO_ENABLED=true` 或安裝 FFmpeg 不會解除限制。 |
+| 影片／GIF／超過四張圖不發布 | 靜態圖片最多四張。影片需 `VIDEO_ENABLED=true`、FFmpeg 與直接媒體來源；X 影片無直接來源時仍保留，GIF 不支援。 |
 | 外部 URL 被拒絕 | API／媒體通道會拒絕私有、loopback、保留／metadata 位址、不允許的埠與不安全重導向。先核對服務 URL，不要停用防護或嵌入帳密。 |
 | Web 寫入回 401 | 設 token 後須在 UI 填入相同值；未設 token 的 loopback 仍要求 JSON／同來源。不要為了方便把服務直接公開。 |
 | 已有服務時 CLI 回報資料目錄正在使用 | 這是避免兩個 worker／recovery 同時改寫狀態的保護。用現有 Web／Telegram 介面，或停止服務後再執行維護命令；不要刪鎖硬闖。 |

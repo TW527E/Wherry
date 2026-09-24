@@ -298,7 +298,7 @@ export class Engine {
     this.store.enqueue('ops', batchId, 'telegram', now);
   }
 
-  sealReady(now = new Date().toISOString()): number {
+  sealReady(now: string = new Date().toISOString()): number {
     if (this.store.setting('paused', false)) return 0;
     let count = 0;
     for (const batch of this.store.openBatches()) {
@@ -333,12 +333,7 @@ export class Engine {
           for (const post of posts) this.store.updatePost(Store.postKey(post.platform, post.id), mirror.state === 'match' ? 'manual_mirror' : 'mirror_review', mirror.reason);
           if (mirror.mirrorId) this.store.matchMirror(mirror.mirrorId, batch.rootId);
           this.store.event('warn', `X batch held: ${mirror.reason}`, batch.id);
-          // An ambiguous (review) batch is a decision only the owner can make: surface it as one
-          // interactive Telegram notice. hasReviewNotice guards against re-notifying the same batch
-          // across cycles, and the ops job is enqueued only when Telegram is configured to deliver it.
-          if (mirror.state === 'review' && this.canNotifyOwner() && !this.store.hasReviewNotice(batch.id)) {
-            this.store.enqueue('ops', batch.id, 'telegram', now);
-          }
+          if (mirror.state === 'review') this.notifyHeldBatch(batch.id, now);
         } else {
           this.store.updateBatch(batch.id, 'sealed', 'thread_closed');
           for (const post of posts) this.store.updatePost(Store.postKey(post.platform, post.id), 'ready', 'thread_closed');
@@ -350,7 +345,7 @@ export class Engine {
     return count;
   }
 
-  schedule(input: { text: string; attachments?: Attachment[]; dueAt: string }, now = new Date().toISOString()): string {
+  schedule(input: { text: string; attachments?: Attachment[]; dueAt: string }, now: string = new Date().toISOString()): string {
     const due = new Date(input.dueAt).toISOString();
     if (due < now) throw new Error('Schedule must be in the future');
     const post = sourcePostSchema.parse({ platform: 'local', id: randomUUID(), authorId: 'owner', text: input.text,
@@ -374,7 +369,7 @@ export class Engine {
     return jobs.some(job => ['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id));
   }
 
-  registerManualMirror(aggregateId: string, xId: string, now = new Date().toISOString()): { alreadyDelivered: boolean } {
+  registerManualMirror(aggregateId: string, xId: string, now: string = new Date().toISOString()): { alreadyDelivered: boolean } {
     if (!/^[1-9]\d{0,24}$/.test(xId)) throw new Error('Invalid X post ID');
     const source = this.store.postByKey(aggregateId);
     if (!source || source.post.platform === 'x') throw new Error('Native reminder source not found');
@@ -401,7 +396,7 @@ export class Engine {
     return { alreadyDelivered };
   }
 
-  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile', id: string, now = new Date().toISOString()): void {
+  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile', id: string, now: string = new Date().toISOString()): void {
     // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
     // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
     if (!['skip', 'mirror', 'approve', 'retry', 'reconcile'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile');
@@ -450,7 +445,7 @@ export class Engine {
    * plus the matching downstream URL to confirm the manual mirror. Only genuine, unexpired
    * candidates are listed so a code always resolves to a real downstream post.
    */
-  mirrorCandidates(now = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string }> {
+  mirrorCandidates(now: string = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string }> {
     return this.store.mirrors(now)
       .filter(candidate => !candidate.expired && candidate.state === 'pending')
       .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id }));
@@ -463,7 +458,7 @@ export class Engine {
    * echo jobs are cancelled. Returns how many codes matched: zero means the reply carried no usable
    * code, so the caller re-prompts instead of silently closing the batch.
    */
-  confirmReviewMirror(batchId: string, replyText: string, now = new Date().toISOString()): { matched: number } {
+  confirmReviewMirror(batchId: string, replyText: string, now: string = new Date().toISOString()): { matched: number } {
     const batch = this.store.getBatch(batchId);
     if (!batch || batch.platform !== 'x') throw new Error('Review batch not found');
     if (!['review', 'open'].includes(batch.state)) throw new Error('This batch is no longer awaiting a decision');
@@ -487,7 +482,7 @@ export class Engine {
    * suspected-mirror reason, and the downstream mirror codes to reply with. Kept as a string so the
    * worker delivers it through the same durable step as any other Telegram part.
    */
-  reviewNoticeText(batch: Batch, now = new Date().toISOString()): string {
+  reviewNoticeText(batch: Batch, now: string = new Date().toISOString()): string {
     const posts = this.store.batchPosts(batch.id).map(p => p.post);
     const root = posts[0];
     const url = root ? fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`) : undefined;
@@ -526,7 +521,7 @@ export class Engine {
     return lines.filter((line, index) => line !== '' || lines[index - 1] !== '').join('\n');
   }
 
-  async parts(job: Job, now = new Date().toISOString()): Promise<PublishPart[]> {
+  async parts(job: Job, now: string = new Date().toISOString()): Promise<PublishPart[]> {
     if (job.kind === 'ops') {
       const batch = this.store.getBatch(job.aggregateId);
       if (!batch) throw new Error('Job source not found');
@@ -536,9 +531,9 @@ export class Engine {
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
         images: [], buttons: [
           // Incomplete polls and unsupported media have no publish path, even with owner approval.
-          ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: `rev:a:${batch.id}` }] : []),
-          { text: '🚫 略過', data: `rev:s:${batch.id}` },
-          { text: '🪞 這是我手動鏡像的', data: `rev:m:${batch.id}` },
+          ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: 'rev:a' }] : []),
+          { text: '🚫 略過', data: 'rev:s' },
+          { text: '🪞 這是我手動鏡像的', data: 'rev:m' },
         ],
       }];
     }
@@ -638,8 +633,8 @@ export class Worker {
   private stopping = false;
   private active?: Promise<number>;
   constructor(readonly engine: Engine, readonly publishers: Map<Destination, Publisher>) {}
-  stop(): void { this.stopping = true; }
-  run(now = new Date().toISOString()): Promise<number> {
+  async stop(): Promise<void> { this.stopping = true; await this.active; }
+  run(now: string = new Date().toISOString()): Promise<number> {
     if (this.stopping) return Promise.resolve(0);
     if (this.active) return this.active;
     this.active = this.deliver(now).finally(() => { this.active = undefined; });

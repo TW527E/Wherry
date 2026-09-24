@@ -101,7 +101,7 @@ async function main(): Promise<number> {
         const target = config.x.sessionFile;
         const file = await exportSession(config.x);
         await writeFile(target, JSON.stringify(file), { encoding: 'utf8', mode: 0o600 });
-        await chmod(target, 0o600).catch(() => {});
+        await chmod(target, 0o600);
         console.log(`已匯出 X session 到 ${target}（權限 600）。這是帳號登入憑證，請妥善保管、勿加入版控。`);
         console.log('用法：把這個檔案傳給 Telegram 機器人的「私人聊天」，或用 import-session 在伺服器安裝。');
         console.log('要改輸出位置請設定 X_SESSION_FILE 環境變數。');

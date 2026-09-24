@@ -1,14 +1,14 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { Attachment, PreparedVideo, Transport } from './types.js';
-import { UnsupportedMediaError } from './media.js';
+import { sourceBytes, UnsupportedMediaError } from './media.js';
 
 /**
- * Phase 2 video spec (§8.4): MP4 / H.264 / AAC-LC / YUV 4:2:0 / 30 fps, aspect 16:9 | 9:16 | 1:1,
- * ≤140 s (X non-Premium baseline). Bluesky only accepts MP4 and routes >50 MB through its video
- * service. We transcode every source to that safe profile with ffmpeg so all three platforms accept it.
+ * Phase 2 video profile: MP4 / H.264 / AAC-LC / YUV 4:2:0 / 30 fps, preserving aspect,
+ * ≤140 s (X non-Premium baseline). Bluesky uploads through its dedicated video service.
  */
 export interface VideoConfig { dataDir: string; maxDownloadBytes: number; ffmpegPath: string; ffprobePath: string }
 
@@ -37,26 +37,27 @@ export function planTranscode(probe: VideoProbe, maxEdge = 1280): TranscodePlan 
   return { width: even(srcW), height: even(srcH), fps: 30, tooLong: probe.durationSeconds > MAX_VIDEO_SECONDS };
 }
 
-function run(cmd: string, args: string[], timeoutMs = 300_000): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new UnsupportedMediaError('Video processing timed out')); }, timeoutMs);
-    timer.unref();
-    child.stdout.on('data', d => { stdout += d; if (stdout.length > 2_000_000) stdout = stdout.slice(-1_000_000); });
-    child.stderr.on('data', d => { stderr += d; if (stderr.length > 2_000_000) stderr = stderr.slice(-1_000_000); });
-    child.on('error', err => { clearTimeout(timer); reject(new UnsupportedMediaError(`Video tool not available: ${err.message}`)); });
-    child.on('close', code => { clearTimeout(timer); resolvePromise({ code: code ?? -1, stdout, stderr }); });
-  });
+const execFileAsync = promisify(execFile);
+
+async function run(cmd: string, args: string[], timeout = 300_000): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(cmd, args, { shell: false, timeout, killSignal: 'SIGKILL', maxBuffer: 2_000_000, encoding: 'utf8' });
+    return stdout;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new UnsupportedMediaError(code === 'ENOENT' ? 'Video tool not available' : 'Video processing failed or exceeded its limits');
+  }
 }
 
+// Playlists must not open network or sibling-file inputs outside the guarded media loader.
+const inputOptions = ['-protocol_whitelist', 'file', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,ogg'];
+
 export async function probeVideo(path: string, config: VideoConfig): Promise<VideoProbe> {
-  const { code, stdout } = await run(config.ffprobePath, [
-    '-v', 'error', '-select_streams', 'v:0',
+  const stdout = await run(config.ffprobePath, [
+    '-v', 'error', ...inputOptions, '-select_streams', 'v:0',
     '-show_entries', 'stream=width,height:format=duration',
     '-of', 'json', path,
   ], 60_000);
-  if (code !== 0) throw new UnsupportedMediaError('Could not probe video (is it a valid media file?)');
   let parsed: { streams?: Array<{ width?: number; height?: number }>; format?: { duration?: string } };
   try { parsed = JSON.parse(stdout); } catch { throw new UnsupportedMediaError('ffprobe returned invalid output'); }
   const stream = parsed.streams?.[0];
@@ -74,7 +75,7 @@ const hash = (data: Uint8Array): string => createHash('sha256').update(data).dig
 /**
  * Download (or read) the source, transcode it to the safe MP4 profile, and return the prepared
  * video. Rejects sources longer than the ceiling rather than truncating them. The output stays on
- * disk (video can be large); callers stream it from `path`.
+ * disk (video can be large); publishers read it from `path`.
  */
 export async function prepareVideo(attachment: Attachment, config: VideoConfig, transport: Transport): Promise<PreparedVideo> {
   if (attachment.kind !== 'video') throw new UnsupportedMediaError('prepareVideo requires a video attachment');
@@ -82,41 +83,37 @@ export async function prepareVideo(attachment: Attachment, config: VideoConfig, 
   const directory = resolve(config.dataDir, 'media');
   await mkdir(directory, { recursive: true, mode: 0o700 });
 
-  // Materialize the source to disk so ffmpeg/ffprobe can seek it.
-  let sourcePath: string;
-  let temp = false;
-  if (attachment.path) {
-    sourcePath = attachment.path;
-  } else {
-    const response = await transport.request(attachment.url!, { maxBytes: config.maxDownloadBytes });
-    if (response.status !== 200) throw new UnsupportedMediaError(`Video download returned HTTP ${response.status}`);
-    sourcePath = resolve(directory, `${hash(response.body)}.src`);
-    await writeFile(sourcePath, response.body, { mode: 0o600 });
-    temp = true;
-  }
-
+  const workspace = await mkdtemp(resolve(directory, 'video-'));
+  const sourcePath = resolve(workspace, 'source');
   try {
+    const bytes = await sourceBytes(attachment, config, transport);
+    await writeFile(sourcePath, bytes, { mode: 0o600 });
     const probe = await probeVideo(sourcePath, config);
     if (!probe.hasVideo) throw new UnsupportedMediaError('File has no video stream');
     const plan = planTranscode(probe);
     if (plan.tooLong) throw new UnsupportedMediaError(`Video is ${Math.round(probe.durationSeconds)}s, over the ${MAX_VIDEO_SECONDS}s limit; trim it before syncing`);
-    const outPath = resolve(directory, `${hash(Buffer.from(sourcePath + probe.durationSeconds))}.mp4`);
-    const { code } = await run(config.ffmpegPath, [
-      '-y', '-i', sourcePath,
+    const outPath = resolve(workspace, 'output.mp4');
+    await run(config.ffmpegPath, [
+      '-v', 'error', ...inputOptions, '-y', '-i', sourcePath,
       '-vf', `scale=${plan.width}:${plan.height},fps=${plan.fps},format=yuv420p`,
       '-c:v', 'libx264', '-profile:v', 'high', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '23',
       '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
       outPath,
     ]);
-    if (code !== 0) throw new UnsupportedMediaError('Video transcode failed');
-    const size = (await stat(outPath)).size;
     const outBytes = await readFile(outPath);
+    const sha256 = hash(outBytes);
+    const target = resolve(directory, `${sha256}.mp4`);
+    await writeFile(target, outBytes, { mode: 0o600, flag: 'wx' }).catch(async error => {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const cached = await sourceBytes({ kind: 'video', path: target, alt: '' }, { ...config, maxDownloadBytes: outBytes.length }, transport);
+      if (!cached.equals(outBytes)) throw new UnsupportedMediaError('Cached video content does not match its filename');
+    });
     return {
-      path: outPath, mimeType: 'video/mp4', alt: attachment.alt || '',
+      path: target, mimeType: 'video/mp4', alt: attachment.alt || '',
       width: plan.width, height: plan.height, durationSeconds: Math.round(probe.durationSeconds),
-      size, sha256: hash(outBytes),
+      size: outBytes.length, sha256,
     };
   } finally {
-    if (temp) await rm(sourcePath, { force: true }).catch(() => undefined);
+    await rm(workspace, { recursive: true, force: true });
   }
 }

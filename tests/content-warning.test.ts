@@ -24,7 +24,7 @@ const requestBody = (options?: HttpOptions): Record<string, any> => JSON.parse(b
 const field = (body: string, name: string): string | undefined => body.match(new RegExp(`name="${name}"\\r\\n\\r\\n([\\s\\S]*?)\\r\\n--`))?.[1];
 const image = (index = 1): PreparedImage => ({ bytes: new Uint8Array([index]), mimeType: 'image/jpeg', alt: `alt ${index}`, width: 4, height: 4, sha256: String(index) });
 const part = (overrides: Partial<PublishPart> = {}): PublishPart => ({ key: 'part', sourcePostId: '123', text: 'example body', images: [], ...overrides });
-const mock = (request: Transport['request']): Transport => ({ request, async json() { throw new Error('Unexpected JSON transport call'); } });
+const mock = (request: Transport['request']): Transport => ({ request });
 const noNetwork = mock(async () => { throw new Error('Network is not available in this test'); });
 
 function videoFixture(path: string): PreparedVideo {

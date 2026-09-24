@@ -7,19 +7,9 @@
  * a way to post; it only grants the same read access the interactive login would.
  */
 
-export interface SessionCookie {
-  name: string;
-  value: string;
-  domain: string;
-  path: string;
-  expires: number;
-  httpOnly: boolean;
-  secure: boolean;
-  sameSite: 'Strict' | 'Lax' | 'None';
-}
+import type { BrowserContext } from 'playwright-core';
 
-export interface SessionOrigin { origin: string; localStorage: Array<{ name: string; value: string }> }
-export interface StorageState { cookies: SessionCookie[]; origins: SessionOrigin[] }
+export type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
 
 /** Serialized session file: the storage state plus a small self-describing envelope. */
 export interface SessionFile {
@@ -53,7 +43,7 @@ export function filterXState(state: StorageState): StorageState {
 
 export function buildSessionFile(state: StorageState, handle: string): SessionFile {
   const filtered = filterXState(state);
-  if (!filtered.cookies.some(cookie => cookie.name === REQUIRED_COOKIE)) {
+  if (!filtered.cookies.some(cookie => cookie.name === REQUIRED_COOKIE && cookie.value.trim())) {
     throw new Error('This profile has no X auth cookie (auth_token). Log in first with `login`, then export.');
   }
   return { kind: 'crosspost-x-session', version: 1, handle, exportedAt: new Date().toISOString(), state: filtered };
@@ -73,14 +63,23 @@ export function parseSessionFile(bytes: Uint8Array): SessionFile {
   if (file.version !== 1) throw new Error(`Unsupported session file version: ${String(file.version)}`);
   const state = file.state;
   if (!state || !Array.isArray(state.cookies)) throw new Error('Session file has no cookies');
-  const cookies = state.cookies.filter(cookie => cookie && typeof cookie.name === 'string' && typeof cookie.value === 'string' && typeof cookie.domain === 'string');
-  if (!cookies.some(cookie => cookie.name === REQUIRED_COOKIE && isXCookieDomain(cookie.domain))) {
+  const cookies: StorageState['cookies'] = state.cookies
+    .filter(cookie => cookie && typeof cookie.name === 'string' && typeof cookie.value === 'string'
+      && typeof cookie.domain === 'string' && isXCookieDomain(cookie.domain))
+    .map(cookie => ({
+      name: cookie.name, value: cookie.value, domain: cookie.domain,
+      path: typeof cookie.path === 'string' && cookie.path.startsWith('/') ? cookie.path : '/',
+      expires: typeof cookie.expires === 'number' && Number.isFinite(cookie.expires) ? cookie.expires : -1,
+      httpOnly: cookie.httpOnly === true, secure: cookie.secure !== false,
+      sameSite: (['Strict', 'Lax', 'None'] as const).includes(cookie.sameSite) ? cookie.sameSite : 'Lax',
+    }));
+  if (!cookies.some(cookie => cookie.name === REQUIRED_COOKIE && cookie.value.trim())) {
     throw new Error('Session file has no X auth cookie (auth_token); refusing to install');
   }
   return {
     kind: 'crosspost-x-session', version: 1,
     handle: typeof file.handle === 'string' ? file.handle : '',
     exportedAt: typeof file.exportedAt === 'string' ? file.exportedAt : '',
-    state: { cookies: cookies as SessionCookie[], origins: Array.isArray(state.origins) ? state.origins as SessionOrigin[] : [] },
+    state: { cookies, origins: [] },
   };
 }

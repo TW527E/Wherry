@@ -2,7 +2,7 @@ import { chromium, type BrowserContext, type Locator, type Page } from 'playwrig
 import type { AppConfig } from '../config.js';
 import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
-import { resolveBrowserPlan, verifyBrowserPlan, type BrowserPlan } from './browser.js';
+import { resolveBrowserPlan, verifyBrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
 
 function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters<typeof chromium.launchPersistentContext>[1] {
@@ -148,7 +148,6 @@ export class XCollector implements Collector {
   readonly platform = 'x' as const;
   private context?: BrowserContext;
   private page?: Page;
-  private plan?: BrowserPlan;
   // Resolved t.co → real URL, kept for the collector's lifetime: the same short link appears across
   // many tweets (and re-appears every scan), so resolve each destination at most once.
   private readonly shortLinks = new Map<string, string | null>();
@@ -195,9 +194,6 @@ export class XCollector implements Collector {
     return null;
   }
 
-  /** Resolved browser plan; available after the first collect or an explicit `browserPlan()` call. */
-  browserPlan(): BrowserPlan | undefined { return this.plan; }
-
   /**
    * True when this timeline article draws the vertical thread connector below its avatar — X's visual
    * marker that a reply is shown directly beneath it. On a profile's Posts timeline only the author's
@@ -232,9 +228,6 @@ export class XCollector implements Collector {
     // The previous context died (Chromium crash, OOM kill, external close). A stale cached
     // reference would fail every scan forever, so clear the remnants and relaunch below.
     if (this.context || this.page) await this.close().catch(() => undefined);
-    // Resolve once per collector lifetime so `doctor` and the collector agree on the browser.
-    this.plan = resolveBrowserPlan({ choice: this.config.browser, executablePath: this.config.executablePath });
-    verifyBrowserPlan(this.plan);
     const launchOptions = launchOptionsFor(this.config, this.config.headless);
     this.context = await chromium.launchPersistentContext(this.config.profileDir, launchOptions);
     this.page = this.context.pages()[0] || await this.context.newPage();
@@ -527,14 +520,11 @@ export async function exportSession(config: AppConfig['x']): Promise<SessionFile
  * session actually reads the profile without hitting a login wall.
  */
 export async function installSession(config: AppConfig['x'], file: SessionFile): Promise<{ authenticated: boolean }> {
+  if (!config.enabled) throw new Error('X_ENABLED is false; enable X before importing');
+  if (file.handle && file.handle.toLowerCase() !== config.handle.toLowerCase()) throw new Error('Session belongs to a different configured X handle');
   const context = await chromium.launchPersistentContext(config.profileDir, launchOptionsFor(config, true));
   try {
-    await context.addCookies(file.state.cookies.map(cookie => ({
-      name: cookie.name, value: cookie.value, domain: cookie.domain, path: cookie.path || '/',
-      expires: typeof cookie.expires === 'number' ? cookie.expires : -1,
-      httpOnly: Boolean(cookie.httpOnly), secure: cookie.secure !== false,
-      sameSite: (['Strict', 'Lax', 'None'] as const).includes(cookie.sameSite) ? cookie.sameSite : 'Lax',
-    })));
+    await context.addCookies(file.state.cookies);
     const page = context.pages()[0] || await context.newPage();
     const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
     await page.route('**/*', async route => {

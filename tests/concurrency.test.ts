@@ -55,7 +55,6 @@ test('getUpdates long-polls with an HTTP timeout wider than the poll window', as
       seen = { url, options };
       return { status: 200, headers: {}, body: Buffer.from(JSON.stringify({ ok: true, result: [] })) };
     },
-    async json<T>() { throw new Error('unused') as T; },
   };
   const client = new TelegramClient(telegramConfig(), transport);
   const updates = await client.getUpdates(42);

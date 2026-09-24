@@ -10,10 +10,6 @@ import {
 
 export type SharkeyConfig = AppConfig['sharkey'];
 export interface SharkeyOptions {
-  maxPages?: number;
-  /** Optional caller-owned collection window; no hidden watermark is advanced after a partial scan. */
-  sinceId?: string;
-  untilId?: string;
   now?: () => Date;
 }
 export interface SharkeyLimits {
@@ -121,7 +117,6 @@ export class SharkeyClient implements Publisher, Collector {
   readonly destination = 'sharkey' as const;
   readonly platform = 'sharkey' as const;
   private readonly baseUrl: string;
-  private readonly maxPages: number;
   private readonly now: () => Date;
   private account?: SharkeyAccount;
   private accountPromise?: Promise<SharkeyAccount>;
@@ -132,13 +127,8 @@ export class SharkeyClient implements Publisher, Collector {
   private folderId?: string | null;
   private folderPromise?: Promise<string | null>;
 
-  constructor(private readonly config: SharkeyConfig, private readonly transport: Transport, private readonly options: SharkeyOptions = {}) {
+  constructor(private readonly config: SharkeyConfig, private readonly transport: Transport, options: SharkeyOptions = {}) {
     this.baseUrl = httpsBase(config.baseUrl, 'Sharkey instance');
-    this.maxPages = options.maxPages ?? 3;
-    if (!positiveInteger(this.maxPages) || this.maxPages > 3) throw new PlatformError('Sharkey maxPages must be between 1 and 3', { code: 'InvalidPagination' });
-    if ((options.sinceId !== undefined && !noteId(options.sinceId)) || (options.untilId !== undefined && !noteId(options.untilId))) {
-      throw new PlatformError('Sharkey collection cursors must be note IDs', { code: 'InvalidPagination' });
-    }
     this.now = options.now ?? (() => new Date());
   }
 
@@ -327,17 +317,16 @@ export class SharkeyClient implements Publisher, Collector {
     const warnings: string[] = [];
     const posts = new Map<string, SourcePost>();
     let oldest: string | undefined;
-    // A caller-supplied window (options.untilId) means a bounded manual scan, not gap-closing.
-    let reachedWatermark = !since || Boolean(this.options.untilId);
+    let reachedWatermark = !since;
     try {
       const account = await this.discover();
       accountId = account.id;
-      let untilId = this.options.untilId;
-      const cursors = new Set<string>(untilId ? [untilId] : []);
-      for (let page = 0; page < this.maxPages; page++) {
+      let untilId: string | undefined;
+      const cursors = new Set<string>();
+      for (let page = 0; page < 3; page++) {
         const result = await this.api('users/notes', {
           userId: account.id, limit: 100, withReplies: true, withRenotes: true, withChannelNotes: true,
-          ...(this.options.sinceId ? { sinceId: this.options.sinceId } : {}), ...(untilId ? { untilId } : {}),
+          ...(untilId ? { untilId } : {}),
         });
         if (!Array.isArray(result) || result.length > 100) { complete = false; warnings.push('Sharkey notes response is not a bounded note array'); break; }
         let progress = 0;

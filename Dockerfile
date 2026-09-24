@@ -10,8 +10,7 @@ RUN npm run build && npm prune --omit=dev
 FROM node:24-bookworm-slim
 ENV NODE_ENV=production \
     DATA_DIR=/app/data \
-    CHROMIUM_PATH=/usr/bin/chromium \
-    CHROMIUM_FLAGS="--no-sandbox"
+    CHROMIUM_PATH=/usr/bin/chromium
 # The X collector reads with a local browser; chromium is installed by default and
 # a host Chrome can be selected instead via X_BROWSER on non-container deployments.
 RUN apt-get update \

@@ -99,8 +99,8 @@ export class Store {
     const row = this.db.prepare('SELECT * FROM posts WHERE key=?').get(key);
     return row ? this.postRow(row) : undefined;
   }
-  updatePost(key: string, classification: Classification, reason: string, post?: SourcePost): void {
-    this.db.prepare('UPDATE posts SET classification=?,reason=?,payload=COALESCE(?,payload) WHERE key=?').run(classification, reason, post ? JSON.stringify(post) : null, key);
+  updatePost(key: string, classification: Classification, reason: string): void {
+    this.db.prepare('UPDATE posts SET classification=?,reason=? WHERE key=?').run(classification, reason, key);
   }
   posts(limit = 100): StoredPost[] { return this.db.prepare('SELECT * FROM posts ORDER BY first_seen_at DESC, key DESC LIMIT ?').all(limit).map(r => this.postRow(r)); }
   batchPosts(id: string): StoredPost[] {
@@ -170,7 +170,7 @@ export class Store {
   }
   private reviewNoticeRow(row: Row): ReviewNotice {
     return { batchId: String(row.batch_id), chatId: String(row.chat_id), messageId: Number(row.message_id), state: row.state as ReviewNoticeState,
-      syncedSig: String(row.synced_sig ?? ''), editAfter: row.edit_after ? String(row.edit_after) : undefined, at: String(row.at) };
+      editAfter: row.edit_after ? String(row.edit_after) : undefined, at: String(row.at) };
   }
   /** True once a review batch already has (or is queued to get) a notice — guards against re-notifying. */
   hasReviewNotice(batchId: string): boolean {
@@ -182,22 +182,17 @@ export class Store {
     return row ? this.reviewNoticeRow(row) : undefined;
   }
   setReviewNoticeState(batchId: string, state: ReviewNoticeState): void {
-    this.db.prepare('UPDATE review_notices SET state=? WHERE batch_id=?').run(state, batchId);
+    this.db.prepare("UPDATE review_notices SET state=?,synced_sig='',edit_after=NULL WHERE batch_id=? AND state<>?").run(state, batchId, state);
   }
-  /** Mark the message body actually written to Telegram, so flush only edits again on a real change. */
-  reviewNoticeSynced(batchId: string, signature: string): void {
-    this.db.prepare('UPDATE review_notices SET synced_sig=?,edit_after=NULL WHERE batch_id=?').run(signature, batchId);
+  // Keep the legacy column; the notice body is now determined solely by its state.
+  reviewNoticeSynced(notice: ReviewNotice): void {
+    this.db.prepare('UPDATE review_notices SET synced_sig=?,edit_after=NULL WHERE batch_id=? AND state=?').run(notice.state, notice.batchId, notice.state);
   }
-  deferReviewNoticeEdit(batchId: string, after: string): void {
-    this.db.prepare('UPDATE review_notices SET edit_after=? WHERE batch_id=?').run(after, batchId);
+  deferReviewNoticeEdit(notice: ReviewNotice, after: string): void {
+    this.db.prepare('UPDATE review_notices SET edit_after=? WHERE batch_id=? AND state=?').run(after, notice.batchId, notice.state);
   }
-  /**
-   * Notices whose owner-facing text may have changed (state moved off `offered`) and whose 429
-   * back-off, if any, has elapsed. The caller renders the current text and only edits Telegram when
-   * it differs from `syncedSig`, so this over-selects on purpose rather than tracking a revision.
-   */
   reviewNoticesNeedingEdit(now: string): ReviewNotice[] {
-    return this.db.prepare("SELECT * FROM review_notices WHERE state<>'offered' AND (edit_after IS NULL OR edit_after<=?) ORDER BY at LIMIT 20").all(now).map(row => this.reviewNoticeRow(row));
+    return this.db.prepare("SELECT * FROM review_notices WHERE state<>'offered' AND synced_sig<>state AND (edit_after IS NULL OR edit_after<=?) ORDER BY at LIMIT 20").all(now).map(row => this.reviewNoticeRow(row));
   }
   enqueue(kind: Job['kind'], aggregateId: string, destination: Destination, now: string, dueAt = now): string {
     const existing = this.db.prepare('SELECT id FROM jobs WHERE kind=? AND aggregate_id=? AND destination=?').get(kind, aggregateId, destination);

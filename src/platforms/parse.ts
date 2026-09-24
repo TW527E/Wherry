@@ -30,7 +30,7 @@ export class PlatformError extends Error {
 export const object = (value: unknown): JsonObject | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : undefined;
 export const nonempty = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
-export const own = (value: JsonObject, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
+export const own = Object.hasOwn;
 export const positiveInteger = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0;
 export const isoDate = (value: unknown): value is string =>
   typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
@@ -200,10 +200,6 @@ export function multipart(fields: Record<string, string>, files: MultipartFile[]
   }
   chunks.push(Buffer.from(`--${boundary}--\r\n`));
   return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
-}
-
-export function htmlEscape(text: string): string {
-  return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 }
 
 export function canonicalJson(value: unknown): string {

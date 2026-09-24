@@ -23,7 +23,7 @@ const source: SourcePost = { platform: 'x', id: '123', authorId: 'owner', create
   relationKnown: true, replyToId: null, visibility: 'public', metadataComplete: true, attachments: [], poll: true, pollData: poll };
 const json = (value: unknown): HttpResponse => ({ status: 200, headers: {}, body: Buffer.from(JSON.stringify(value)) });
 const body = (options?: HttpOptions): Record<string, any> => JSON.parse(String(options?.body));
-const mock = (request: Transport['request']): Transport => ({ request, async json() { throw new Error('Unexpected JSON request'); } });
+const mock = (request: Transport['request']): Transport => ({ request });
 const noNetwork = mock(async () => { throw new Error('Network is unavailable in tests'); });
 const part = (overrides: Partial<PublishPart> = {}): PublishPart => ({ key: 'poll', sourcePostId: '123', text: source.text,
   images: [], poll, sourceUrl: 'https://x.com/owner/status/123', ...overrides });

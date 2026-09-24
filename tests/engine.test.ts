@@ -25,7 +25,6 @@ function makeConfig(destinations: Destination[] = ['bluesky', 'sharkey', 'telegr
 
 const transport: Transport = {
   async request() { throw new Error('network is not available in tests'); },
-  async json<T>() { throw new Error('network is not available in tests') as T; },
 };
 
 function post(overrides: Partial<SourcePost> & { id: string; createdAt: string }): SourcePost {
@@ -186,6 +185,7 @@ test('an unsafe SHARKEY_UPLOAD_NAME template is rejected at configuration time',
   // The default template and a plain custom one both resolve to safe names.
   assert.equal(loadConfig({ ...sharkey }).sharkey.uploadName, 'Wherry_{timestamp}-{index}.{ext}');
   assert.doesNotThrow(() => loadConfig({ ...sharkey, SHARKEY_UPLOAD_NAME: 'photo-{index}.{ext}' }));
+  assert.doesNotThrow(() => loadConfig({ ...sharkey, SHARKEY_UPLOAD_NAME: '{index}-photo-{index}.{ext}' }));
 });
 
 test('a root opens a collecting batch and nothing publishes before it settles', () => {
@@ -475,7 +475,7 @@ test('a suspected-mirror X batch is surfaced as one ops notice, and a reply conf
   // The ops job renders exactly one interactive notice with the three decision buttons, in plain text.
   const parts = await engine.parts(ops[0]!);
   assert.equal(parts.length, 1);
-  assert.deepEqual(parts[0]!.buttons?.map(b => b.data), ['rev:a:x:950', 'rev:s:x:950', 'rev:m:x:950']);
+  assert.deepEqual(parts[0]!.buttons?.map(b => b.data), ['rev:a', 'rev:s', 'rev:m']);
   assert.ok(!/<code>|&lt;/.test(parts[0]!.text), 'notice text is plain; the Telegram path escapes it before sending');
 
   // The owner confirms the manual mirror by replying with the candidate code: an unknown code matches
@@ -537,7 +537,7 @@ test('a long X post is announced and can be released instead of stalling as a si
   assert.equal(ops.length, 1, 'a held batch is announced once');
   assert.equal(ops[0]!.aggregateId, 'x:970');
   const notice = (await engine.parts(ops[0]!))[0]!;
-  assert.deepEqual(notice.buttons?.map(b => b.data), ['rev:a:x:970', 'rev:s:x:970', 'rev:m:x:970'], 'a long post offers the release button');
+  assert.deepEqual(notice.buttons?.map(b => b.data), ['rev:a', 'rev:s', 'rev:m'], 'a long post offers the release button');
   assert.match(notice.text, /不會自動同步/, 'the notice explains why it is held');
 
   // Approving must genuinely publish it — not park it in another failing state.
@@ -567,7 +567,7 @@ test('a hard content hold is announced but offers no publish button', async () =
   const ops = store.jobs(100).filter(j => j.kind === 'ops');
   assert.equal(ops.length, 1, 'a poll hold is announced too, instead of only showing up in /pending');
   const notice = (await engine.parts(ops[0]!))[0]!;
-  assert.deepEqual(notice.buttons?.map(b => b.data), ['rev:s:x:990', 'rev:m:x:990'], 'no publish button for content that cannot be published');
+  assert.deepEqual(notice.buttons?.map(b => b.data), ['rev:s', 'rev:m'], 'no publish button for content that cannot be published');
   assert.match(notice.text, /無法自動同步/);
   // Even if the verb is called directly, a poll cannot be force-published.
   assert.throws(() => engine.action('approve', 'x:990'), /cannot be force-published/i);

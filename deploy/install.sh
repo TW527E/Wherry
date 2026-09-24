@@ -169,7 +169,7 @@ parse_args() {
   [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "--service 只允許英數字與 _ . @ -（目前：$SERVICE_NAME）"
   [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "--user 不是合法的 Linux 帳號名稱（目前：$SERVICE_USER）"
   [[ "$SERVICE_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "--group 不是合法的 Linux 群組名稱（目前：$SERVICE_GROUP）"
-  if (( BUILD_USER )) && [[ ! "$BUILD_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  if [[ -n "$BUILD_USER" && ! "$BUILD_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
     die "--build-user 不是合法的 Linux 帳號名稱（目前：$BUILD_USER）"
   fi
 }
@@ -186,7 +186,7 @@ require_node() {
 
 check_source() {
   [[ -f "$SOURCE_DIR/package.json" ]] || die "在 $SOURCE_DIR 找不到 package.json；用 --source 指定程式碼目錄。"
-  UNIT_TEMPLATE="$SOURCE_DIR/deploy/$SERVICE_NAME.service"
+  UNIT_TEMPLATE="$SOURCE_DIR/deploy/crosspost-bridge.service"
   [[ -f "$UNIT_TEMPLATE" ]] || die "找不到 unit 樣板 $UNIT_TEMPLATE"
   [[ -f "$SOURCE_DIR/.env.example" ]] || die "找不到 $SOURCE_DIR/.env.example，無法產生環境檔範本。"
   if (( ! DO_BUILD )) && [[ ! -f "$SOURCE_DIR/dist/cli.js" ]]; then
@@ -244,22 +244,26 @@ sync_source() {
     return 0
   fi
   log "同步程式碼：$SOURCE_DIR → $PREFIX"
-  # 只複製程式碼；資料、設定與秘密一律不進安裝目錄。
+  local -a excluded=(.git data node_modules .env '.env.*' x-session.json '*.session.json')
+  (( DO_BUILD )) && excluded+=(dist)
+  local name rsync_excludes=() tar_excludes=()
+  for name in "${excluded[@]}"; do
+    rsync_excludes+=("--exclude=$name")
+    tar_excludes+=("--exclude=./$name")
+  done
   if (( DRY_RUN )); then
-    dry_note "rsync -a --delete（排除 .git data node_modules .env dist x-session.json） $SOURCE_DIR/ $PREFIX/"
+    dry_note "rsync -a --delete ${rsync_excludes[*]} $SOURCE_DIR/ $PREFIX/"
+    dry_note "install -m 0644 $SOURCE_DIR/.env.example $PREFIX/.env.example"
     return 0
   fi
   if command -v rsync >/dev/null 2>&1; then
-    run rsync -a --delete --exclude=.git --exclude=data --exclude=node_modules \
-      --exclude=.env --exclude=dist --exclude=x-session.json "$SOURCE_DIR/" "$PREFIX/"
+    run rsync -a --delete "${rsync_excludes[@]}" "$SOURCE_DIR/" "$PREFIX/"
   else
-    # 沒有 rsync 時用 tar 管線。這裡不能用 run()：它會把命令列印到 stdout，破壞管線內容。
+    # 沒有 rsync 時用 tar 管線。run() 的 stdout 會破壞 tar 資料。
     printf '  \033[2m$ tar 管線複製程式碼\033[0m\n'
-    tar -C "$SOURCE_DIR" \
-      --exclude=./.git --exclude=./data --exclude=./node_modules \
-      --exclude=./.env --exclude=./dist --exclude=./x-session.json \
-      -cf - . | tar -C "$PREFIX" -xf -
+    tar -C "$SOURCE_DIR" "${tar_excludes[@]}" -cf - . | tar -C "$PREFIX" -xf -
   fi
+  run install -m 0644 "$SOURCE_DIR/.env.example" "$PREFIX/.env.example"
 }
 
 build_app() {
@@ -391,12 +395,12 @@ install_unit() {
 daemon_reload() { run systemctl daemon-reload; }
 
 start_service() {
-  run systemctl enable "$SERVICE_NAME.service"
+  run systemctl enable "$SERVICE_NAME.service" || return
   if (( ! DO_START )); then
     (( DRY_RUN )) || ok "已設為開機啟動（--no-start：這次不啟動）。"
     return 0
   fi
-  run systemctl restart "$SERVICE_NAME.service"
+  run systemctl restart "$SERVICE_NAME.service" || return
   (( DRY_RUN )) && return 0
 
   local waited=0
@@ -598,7 +602,4 @@ main() {
   esac
 }
 
-# 明確保留 main 的結束碼（服務起不來時整體要回非 0），但不要在最後再觸發一次 ERR 訊息。
-exit_code=0
-main "$@" || exit_code=$?
-exit "$exit_code"
+main "$@"

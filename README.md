@@ -11,11 +11,11 @@ X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動�
 **會做**
 
 - 讀取你自己 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道。
-- 在 Bluesky／dvd.chat 同步完成後，多發一則回覆串文，附上該串文最頂端主推文的 `fixupx.com` 連結。
+- 在 Bluesky 同步完成後，多發一則回覆串文，附上該串文最頂端主推文的 `fixupx.com` 連結；Sharkey 改在各則內文附上可設定的署名與原文連結。
 - Telegram 對外頻道的每則訊息底部附 `原文連結`。
 - 偵測你在 Bluesky／dvd.chat 發的原生貼文，用 Telegram 私聊送一則**互動式提醒**：內含「1️⃣ 要發 / 2️⃣ 不發」按鈕。按「要發」後回覆該訊息貼上 X 連結，工具即登記為鏡像；按「不發」則不同步。訊息會就地更新狀態。
 - 認出你手動貼到 X 的鏡像內容（含互動提醒或 `/mirror` 登記的連結），**不再**回同步到其他平台。
-- 把系統錯誤事件自動轉發到 Telegram（有設 `TELEGRAM_OPS_CHAT_ID` 就送 ops 頻道，否則送私聊），秘密會先遮蔽。
+- 把系統錯誤事件自動轉發到 Telegram 私聊，秘密會先遮蔽。
 - 提供 CLI 與網頁介面，以及排程發布（排程只發布到下游並提醒你發 X）。
 
 **不會做**
@@ -28,6 +28,7 @@ X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動�
 
 ---
 
+<a id="x-policy"></a>
 ## ⚠️ 啟用 X 讀取前請先讀這段
 
 X 官方 Automation Rules 明文禁止 `scripting the X website`，並寫明這**可能導致帳號被永久停權**。**讀取也包含在內**，不是只有發文。
@@ -76,11 +77,11 @@ docker compose logs -f
 | `X_PROFILE_DIR` | 你手動登入一次後保留的瀏覽器 profile 目錄（請保持私密） |
 | `BLUESKY_*` | 官方 API，請用 **app password**，不要用主密碼 |
 | `BLUESKY_SENSITIVE_LABEL` | 未分類敏感內容的 self-label，預設 `graphic-media`（血腥／暴力類，不是通用警告）；依內容可選 `porn`、`sexual`、`nudity`、`graphic-media` |
-| `SHARKEY_*` | dvd.chat API token，權限只需 `write:drive`、`write:notes` |
-| `TELEGRAM_TOKEN` | bot token（BotFather 取得） |
+| `SHARKEY_*` | dvd.chat API token：發文需 `write:notes`、上傳需 `write:drive`；預設 Drive 資料夾另需 `read:drive` |
+| `TELEGRAM_BOT_TOKEN` | bot token（BotFather 取得） |
 | `TELEGRAM_PUBLIC_CHAT_ID` | 對外同步的頻道（一律用數字 ID，不是 @username） |
 | `TELEGRAM_PRIVATE_CHAT_ID` | 你的私聊：互動提醒、session 上傳、指令回覆 |
-| `TELEGRAM_OPS_CHAT_ID` | 錯誤轉發目標；留空則錯誤送私聊 |
+| `TELEGRAM_OPS_CHAT_ID` | 保留的 ops chat 設定；自動錯誤告警仍送私聊 |
 | `TELEGRAM_OWNER_ID` | 唯一可下指令、按提醒按鈕、上傳 session 的使用者 ID |
 | `TELEGRAM_POLL_COMMANDS` | `true` 才輪詢並處理指令與互動按鈕（僅 `live`） |
 
@@ -125,7 +126,7 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 
 互動提醒：偵測到 B/D 原生貼文時，私聊會收到帶「1️⃣ 要發 / 2️⃣ 不發」按鈕的訊息。按「要發」後**回覆該訊息貼上 X 連結**即完成鏡像登記；按「不發」則取消同步。訊息會就地更新狀態。
 
-另外，**直接把 `x-session.json` 檔案傳到私人聊天即可更新 X 登入**（見下方部署段的方式 A，或先打 `/session`）。
+另外，也可在 `x-session.json` 的檔案說明填 `/session` 後傳到私人聊天；未先下指令、也未加說明的檔案不會安裝。
 
 ---
 
@@ -179,7 +180,7 @@ SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取�
 | `pending` / `running` | 等待中／執行中 |
 | `succeeded` | 已送達 |
 | `failed` | 明確被拒絕，可安全重試 |
-| `unknown` | **送出結果不明**（連線中斷等）。不會自動重試，需你確認後 `action retry` |
+| `unknown` | **送出結果不明**（連線中斷等）。不會自動重試，需你確認遠端未成功後 `action reconcile` |
 | `review` | 等待你決定 |
 | `cancelled` | 被你取消 |
 
@@ -189,14 +190,14 @@ SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取�
 
 ## 媒體處理（第一版）
 
-- 只支援**靜態圖片**，每篇最多 4 張。
+- 預設只支援**靜態圖片**，每篇最多 4 張。
 - 依各平台限制自動壓縮（Bluesky 上限 2 MB），會先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
-- 動畫 GIF／APNG、影片一律不處理，保留待第二階段。
-- 下載與上傳都經過同一個受保護的 HTTP 通道。
+- 動畫 GIF／APNG 不處理。單一影片可選用轉碼管線，限制見 [設定文件](docs/configuration.md#video)；X 無直接來源的影片仍保留。
+- API、媒體下載與上傳經過受保護的 HTTP 通道；本機圖片與影片皆限於 `DATA_DIR/media`。
 
 ### 對外請求的安全邊界
 
-所有對外請求（含 API、媒體下載、X 瀏覽器流量）都經過同一個通道：
+API、媒體下載與上傳經過同一個通道；X 瀏覽器另有網域與唯讀方法限制，不具有下列全部 HTTP 防護：
 
 - 只允許 `http`／`https`；帶憑證與變更性請求**必須** HTTPS。
 - 拒絕 localhost、環回、私有、link-local、保留位址與雲端 metadata 位址，IPv4 與 IPv6 皆含。
@@ -235,7 +236,7 @@ npm run cli -- login              # 開瀏覽器登入 X 一次
 npm run cli -- export-session     # 匯出登入到 data/x-session.json
 ```
 
-然後把產生的 `data/x-session.json` 直接**傳給你的 Telegram 機器人的「私人聊天」**（就是拖檔案進去傳送）。伺服器端在 `serve` 執行時會自動收下、驗證、安裝到 X profile，並回你一則成功/失敗訊息。安裝後建議把那則上傳訊息刪掉。
+然後在 Telegram 與 bot 私聊先傳 `/session`，五分鐘內將 `x-session.json` 作為下一則訊息上傳（也可在檔案說明填 `/session`）。伺服器端在 `live` 且啟用指令輪詢時會驗證、安裝到 X profile，回報結果並嘗試刪除上傳訊息。
 
 > 只有 `TELEGRAM_OWNER_ID` 本人在私人聊天上傳才會被接受；其他來源一律忽略。檔案會嚴格驗證（必須是 export-session 產生的格式、含有效的 X 登入 cookie），大小上限 256KB。
 > 注意：session 檔＝你的 X 登入憑證。經 Telegram 傳輸代表 Telegram 伺服器與持有 bot token 者理論上能看到內容；這是為了方便換來的取捨。若不接受，用方式 B 或 C。
@@ -275,8 +276,8 @@ X_BROWSER=chrome npm run cli -- doctor   # 顯示實際偵測到的瀏覽器
 - **X 讀取的選擇器可能隨 X 前端改版失效。** 解析失敗時會保留檢查點並回報錯誤，不會誤判成「沒有新內容」。
 - **Telegram 頻道內的回覆呈現**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際外觀需在你的頻道上驗證一次。
 - **dvd.chat 的實際可用上傳上限**由實例與角色政策決定，程式不寫死數字，以伺服器回應為準。
-- 影片、GIF、純音訊、Quote 原生互動屬第二階段。`VIDEO_ENABLED`／`FFMPEG_PATH`／`FFPROBE_PATH` 與轉碼規劃已存在，但**尚未接進發布流程**；含影片的內容目前仍被保留、不會自動發布。投票已接入發布流程（Sharkey／Telegram 原生、Bluesky 文字）。
-- 第一版尚未實作：Web UI 上的排程表單與批次編輯（CLI 已可用）。
+- **影片轉碼為選用功能**：`VIDEO_ENABLED=true` 且有直接可讀取來源時，可經 FFmpeg 轉碼後交給下游；X collector 目前無直接影片來源，仍保留。GIF、純音訊、Quote 原生互動仍未支援。
+- Web UI 已提供文字排程表單；批次編輯仍未實作。
 
 ---
 
