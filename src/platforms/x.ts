@@ -1,4 +1,4 @@
-import { chromium, type BrowserContext, type Page } from 'playwright-core';
+import { chromium, type BrowserContext, type Locator, type Page } from 'playwright-core';
 import type { AppConfig } from '../config.js';
 import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, Transport } from '../types.js';
 import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
@@ -108,24 +108,31 @@ export function parseTweetFacts(input: {
   statusLinks?: string[]; replyingTo?: string; attachments?: Attachment[]; repost?: boolean; quoteUrl?: string;
   poll?: boolean;
   pollData?: PollSnapshot;
+  // The author's own tweet shown directly above this one in a grouped self-thread, detected from the
+  // timeline's visual reply connector (see hasReplyConnectorBelow). When set, this post is a known
+  // self-reply to that tweet — the strongest signal available, because the Posts timeline omits the
+  // "Replying to" header and never embeds the parent status link for in-context continuations.
+  threadParentId?: string;
+  threadParentAuthor?: string;
 }, ownerHandle: string): TweetFacts {
   const ownUrl = input.url;
   const parentLink = (input.statusLinks || []).map(value => {
     try { const url = new URL(value, 'https://x.com'); const match = url.pathname.match(statusPath); return match && match[1] !== input.id && value !== input.quoteUrl ? { url: url.href, id: match[1] } : undefined; } catch { return undefined; }
   }).find(Boolean);
   const replying = input.replyingTo?.match(/@([A-Za-z0-9_]{1,15})/);
-  const isReply = Boolean(replying || parentLink);
-  // A post with no reply markers is a known root even when the DOM did not expose its own status link.
-  // A reply is only trustworthy when the parent status link was actually parsed.
-  const relationKnown = !isReply || Boolean(parentLink);
+  const isReply = Boolean(input.threadParentId || replying || parentLink);
+  // A reply is only trustworthy when the parent is actually known: the visual thread connector gives
+  // us the parent id outright, and a parsed parent status link does too; a bare "Replying to" without
+  // either does not. A post with no reply markers is a known root even without its own status link.
+  const relationKnown = !isReply || Boolean(input.threadParentId) || Boolean(parentLink);
   return {
     id: input.id,
     url: ownUrl,
     authorId: input.authorId || ownerHandle,
     createdAt: input.createdAt,
     text: input.text || '',
-    replyToId: isReply ? parentLink?.id : null,
-    replyToAuthorId: isReply ? replying?.[1] ?? null : null,
+    replyToId: input.threadParentId ?? (isReply ? parentLink?.id : null),
+    replyToAuthorId: input.threadParentId ? (input.threadParentAuthor ?? input.authorId ?? ownerHandle) : (isReply ? replying?.[1] ?? null : null),
     relationKnown,
     repost: input.repost ?? false,
     quoteUrl: validMediaUrl(input.quoteUrl),
@@ -191,6 +198,35 @@ export class XCollector implements Collector {
   /** Resolved browser plan; available after the first collect or an explicit `browserPlan()` call. */
   browserPlan(): BrowserPlan | undefined { return this.plan; }
 
+  /**
+   * True when this timeline article draws the vertical thread connector below its avatar — X's visual
+   * marker that a reply is shown directly beneath it. On a profile's Posts timeline only the author's
+   * own self-threads are grouped this way, so a connector-below means the very next tweet is this
+   * post's self-reply. That adjacency is how a self-thread continuation is linked to its parent: the
+   * Posts timeline omits the "Replying to" header and never embeds the parent's status link for these
+   * in-context continuations, so without this connector every self-reply looks like a fresh root and
+   * syncs to the other platforms as a separate, unthreaded post.
+   */
+  private async hasReplyConnectorBelow(article: Locator): Promise<boolean> {
+    return article.evaluate((node: Element) => {
+      const avatar = node.querySelector('[data-testid="Tweet-User-Avatar"]');
+      if (!avatar) return false;
+      const scope = node.closest('[data-testid="cellInnerDiv"]') ?? node;
+      const ar = avatar.getBoundingClientRect();
+      // The connector is a thin, childless styled <div>. Measure only leaf divs (a full-DOM
+      // getBoundingClientRect sweep on X's heavy tweet markup is what made the scan crawl), and only
+      // those in the avatar's column that run on below it — the marker that a reply sits beneath.
+      for (const div of Array.from(scope.querySelectorAll('div'))) {
+        if (div.childElementCount) continue;
+        const r = div.getBoundingClientRect();
+        if (r.width > 0 && r.width <= 4 && r.height >= 20
+          && r.left >= ar.left - 8 && r.right <= ar.right + 8
+          && r.bottom >= ar.bottom + 8) return true;
+      }
+      return false;
+    }).catch(() => false);
+  }
+
   private async browserPage(): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
     // The previous context died (Chromium crash, OOM kill, external close). A stale cached
@@ -236,8 +272,9 @@ export class XCollector implements Collector {
     // Read the main profile timeline, NOT /with_replies. Verified against the live account: the
     // main timeline reliably renders the newest top-level tweets (today's posts appeared at once),
     // while /with_replies served a stale, days-old view that never surfaced recent posts — which
-    // is exactly why collection kept reporting an old `newest`. The main timeline covers thread
-    // roots (what we sync); self-reply continuations are not read from here.
+    // is exactly why collection kept reporting an old `newest`. The Posts timeline also groups the
+    // author's own self-threads (root + continuations); hasReplyConnectorBelow links each
+    // continuation to its parent so they sync as a thread, not as separate posts.
     const url = `https://x.com/${encodeURIComponent(this.config.handle)}`;
     // The collector reuses one long-lived page. X is an SPA that does not auto-refresh, and a goto
     // to the URL it is already on can serve a stale cached timeline, so force a reload when we are
@@ -279,14 +316,36 @@ export class XCollector implements Collector {
     let stableRounds = 0; let previousCount = 0;
     let oldest: string | undefined;
     let reachedWatermark = !since; // first scan (no watermark): the scroll budget is the natural bound
+    // A tweet's connector state does not change within one scan, but every round re-reads the whole
+    // timeline from the top, so cache the geometry probe per tweet-id and pay for it once instead of
+    // once-per-round — the repeated layout sweeps were what stalled a live scan for minutes.
+    const connector = new Map<string, boolean>();
     for (let round = 0; round < this.config.maxPages; round++) {
       const articles = await page.locator('article[data-testid="tweet"]').all();
+      // The author's own tweet immediately above the current one in DOM order, carrying whether it
+      // renders a reply connector below it. Reset each round because every round re-reads the whole
+      // rendered timeline from the top, so this always reflects true visual adjacency — even when the
+      // article above was parsed in an earlier round (and is skipped as `seen` this round).
+      let prev: { id: string; author: string; replyBelow: boolean } | undefined;
       for (const article of articles) {
         const links = await article.locator('a[href*="/status/"]').evaluateAll(nodes => nodes.map(node => (node as HTMLAnchorElement).href));
         const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
         const ownPath = permalink ? new URL(permalink, 'https://x.com').pathname : '';
         const own = ownPath.match(statusPath)?.[1];
         const authorId = ownPath.split('/')[1] || '';
+        // A self-thread continuation is the tweet directly under a same-author tweet that draws the
+        // reply connector below it. Compute this before the `seen` short-circuit so `prev` tracks true
+        // DOM adjacency across rounds; only the same author threads (a reply to someone else never
+        // reaches the Posts timeline).
+        let replyBelow = false;
+        if (own) {
+          const cached = connector.get(own);
+          replyBelow = cached ?? await this.hasReplyConnectorBelow(article);
+          if (cached === undefined) connector.set(own, replyBelow);
+        }
+        const threadParent = own && prev?.replyBelow && prev.author.toLowerCase() === authorId.toLowerCase()
+          ? { id: prev.id, author: prev.author } : undefined;
+        if (own) prev = { id: own, author: authorId, replyBelow };
         if (!own || seen.has(own)) continue;
         seen.add(own);
         const time = await article.locator('time').getAttribute('datetime').catch(() => null);
@@ -372,7 +431,7 @@ export class XCollector implements Collector {
         // Expand any t.co short link the DOM left in the text to its real destination before the
         // post is handed downstream, so other platforms show the real URL, not a t.co short link.
         bodyText = await this.resolveShortLinks(bodyText, signal);
-        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined }, this.config.handle);
+        const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: threadParent?.id, threadParentAuthor: threadParent?.author }, this.config.handle);
         if (!/pinned|置頂/i.test(articleText) && parsed.createdAt && (!oldest || parsed.createdAt < oldest)) oldest = parsed.createdAt;
         facts.push(parsed);
       }

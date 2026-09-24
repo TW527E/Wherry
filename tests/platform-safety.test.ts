@@ -213,6 +213,25 @@ test('the poll flag and sensitive label survive parsing into post facts', () => 
   assert.equal(plain.sensitive, false, 'a post with no warning is not sensitive');
 });
 
+test('a timeline self-thread continuation is parsed as a self-reply to the tweet above it', () => {
+  const base = { authorId: 'owner', createdAt: '2026-09-19T00:00:00.000Z' };
+  // The Posts timeline shows no "Replying to" header and embeds no parent status link for an
+  // in-context continuation, so before the visual thread connector was read this parsed as a fresh
+  // root (replyToId null) and synced as a separate, unthreaded post. threadParentId is the connector.
+  const cont = parseTweetFacts({ ...base, id: '101', text: 'part 2', threadParentId: '100', threadParentAuthor: 'owner' }, 'owner');
+  assert.equal(cont.replyToId, '100', 'continuation links to the tweet above it');
+  assert.equal(cont.replyToAuthorId, 'owner', 'a self-thread reply is authored by the same account');
+  assert.equal(cont.relationKnown, true, 'the parent is known outright, so the relationship is trusted');
+  assert.equal(cont.metadataComplete, true);
+  // The engine's self-reply test compares replyToAuthorId to authorId case-insensitively; they match.
+  assert.equal(cont.replyToAuthorId?.toLowerCase(), cont.authorId.toLowerCase());
+  // Without the connector (no reply markers at all) the same tweet is a root, exactly as before.
+  const root = parseTweetFacts({ ...base, id: '100', text: 'part 1' }, 'owner');
+  assert.equal(root.replyToId, null);
+  assert.equal(root.replyToAuthorId, null);
+  assert.equal(root.relationKnown, true);
+});
+
 test('link cleaning rewrites X URLs but preserves other links and punctuation', () => {
   const input = 'see https://x.com/a/status/99?s=20 and https://example.com/p?q=1, ok';
   const output = cleanXLinks(input);
