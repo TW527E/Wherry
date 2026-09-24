@@ -543,7 +543,3 @@ export class BlueskyClient implements Publisher, Collector {
 
   async close(): Promise<void> { this.session = undefined; this.identity = undefined; }
 }
-
-export { BlueskyClient as BlueskyPublisher, BlueskyClient as BlueskyCollector };
-export const createBlueskyPublisher = (config: BlueskyConfig, transport: Transport, options?: BlueskyOptions): BlueskyClient => new BlueskyClient(config, transport, options);
-export const createBlueskyCollector = createBlueskyPublisher;

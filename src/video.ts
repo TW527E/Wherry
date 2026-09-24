@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Attachment, PreparedVideo, Transport } from './types.js';
@@ -13,7 +13,6 @@ import { UnsupportedMediaError } from './media.js';
 export interface VideoConfig { dataDir: string; maxDownloadBytes: number; ffmpegPath: string; ffprobePath: string }
 
 export const MAX_VIDEO_SECONDS = 140;
-export const BLUESKY_VIDEO_MAX_BYTES = 50_000_000; // above this, Bluesky requires its video service
 
 export interface VideoProbe { durationSeconds: number; width: number; height: number; hasVideo: boolean }
 
@@ -92,7 +91,7 @@ export async function prepareVideo(attachment: Attachment, config: VideoConfig, 
     const response = await transport.request(attachment.url!, { maxBytes: config.maxDownloadBytes });
     if (response.status !== 200) throw new UnsupportedMediaError(`Video download returned HTTP ${response.status}`);
     sourcePath = resolve(directory, `${hash(response.body)}.src`);
-    await (await import('node:fs/promises')).writeFile(sourcePath, response.body, { mode: 0o600 });
+    await writeFile(sourcePath, response.body, { mode: 0o600 });
     temp = true;
   }
 

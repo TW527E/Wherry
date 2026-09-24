@@ -369,6 +369,3 @@ export class SharkeyClient implements Publisher, Collector {
   }
 }
 
-export { SharkeyClient as SharkeyPublisher, SharkeyClient as SharkeyCollector };
-export const createSharkeyPublisher = (config: SharkeyConfig, transport: Transport, options?: SharkeyOptions): SharkeyClient => new SharkeyClient(config, transport, options);
-export const createSharkeyCollector = createSharkeyPublisher;

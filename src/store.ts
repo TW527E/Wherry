@@ -18,7 +18,6 @@ const schema = [
   'CREATE TABLE IF NOT EXISTS steps (job_id TEXT NOT NULL REFERENCES jobs(id), step_key TEXT NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL, result TEXT, started_at TEXT NOT NULL, PRIMARY KEY(job_id,step_key))',
   'CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, entity_id TEXT)',
   'CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL)',
-  'CREATE TABLE IF NOT EXISTS command_receipts (update_id INTEGER PRIMARY KEY, at TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS manual_x_links (mirror_id TEXT NOT NULL REFERENCES mirrors(id), x_id TEXT NOT NULL, PRIMARY KEY(mirror_id,x_id))',
   "CREATE TABLE IF NOT EXISTS reminders (message_id INTEGER NOT NULL, chat_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, mirror_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', x_url TEXT, at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, synced_revision INTEGER NOT NULL DEFAULT 0, edit_after TEXT, PRIMARY KEY(chat_id,message_id))",
   "CREATE TABLE IF NOT EXISTS review_notices (batch_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'offered', synced_sig TEXT NOT NULL DEFAULT '', edit_after TEXT, at TEXT NOT NULL)",
@@ -182,13 +181,6 @@ export class Store {
     const row = this.db.prepare('SELECT * FROM review_notices WHERE message_id=? AND chat_id=?').get(messageId, chatId);
     return row ? this.reviewNoticeRow(row) : undefined;
   }
-  getReviewNoticeByBatch(batchId: string): ReviewNotice | undefined {
-    const row = this.db.prepare('SELECT * FROM review_notices WHERE batch_id=?').get(batchId);
-    return row ? this.reviewNoticeRow(row) : undefined;
-  }
-  reviewNotices(): ReviewNotice[] {
-    return this.db.prepare('SELECT * FROM review_notices ORDER BY at').all().map(row => this.reviewNoticeRow(row));
-  }
   setReviewNoticeState(batchId: string, state: ReviewNoticeState): void {
     this.db.prepare('UPDATE review_notices SET state=? WHERE batch_id=?').run(state, batchId);
   }
@@ -250,5 +242,4 @@ export class Store {
     }
     return undefined;
   }
-  commandOnce(id: number, now: string): boolean { return Number(this.db.prepare('INSERT OR IGNORE INTO command_receipts VALUES(?,?)').run(id, now).changes) === 1; }
 }

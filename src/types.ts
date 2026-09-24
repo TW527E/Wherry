@@ -11,7 +11,6 @@ export interface Attachment {
   mimeType?: string;
   alt: string;
   sha256?: string;
-  perceptualHash?: string;
   width?: number;
   height?: number;
   size?: number;

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, realpath, writeFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import sharp, { type Metadata } from 'sharp';
 import type { Attachment, PreparedImage, Transport } from './types.js';
@@ -34,31 +34,6 @@ async function inspect(bytes: Buffer): Promise<Metadata> {
   }
   if ((metadata.pages || 1) > 1) throw new UnsupportedMediaError('Animated images are deferred to phase 2');
   return metadata;
-}
-
-async function perceptual(bytes: Buffer): Promise<string> {
-  const pixels = await sharp(bytes, { limitInputPixels: 40_000_000 }).rotate().resize(9, 8, { fit: 'fill' }).greyscale().raw().toBuffer();
-  let bits = 0n;
-  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
-    bits = (bits << 1n) | BigInt(pixels[y * 9 + x]! > pixels[y * 9 + x + 1]! ? 1 : 0);
-  }
-  return bits.toString(16).padStart(16, '0');
-}
-
-export async function fingerprintAttachments(attachments: Attachment[], config: MediaConfig, transport: Transport): Promise<Attachment[]> {
-  if (attachments.length > 4) throw new UnsupportedMediaError('Phase 1 supports at most four images per source post');
-  const directory = resolve(config.dataDir, 'media');
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const results: Attachment[] = [];
-  for (const attachment of attachments) {
-    const bytes = await sourceBytes(attachment, config, transport);
-    const metadata = await inspect(bytes);
-    const digest = hash(bytes);
-    const path = resolve(directory, `${digest}.original`);
-    await writeFile(path, bytes, { flag: 'wx', mode: 0o600 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
-    results.push({ ...attachment, path, sha256: digest, perceptualHash: await perceptual(bytes), width: metadata.width, height: metadata.height, size: bytes.length, animated: false });
-  }
-  return results;
 }
 
 export async function prepareImages(attachments: Attachment[], config: MediaConfig, transport: Transport): Promise<PreparedImage[]> {

@@ -35,7 +35,7 @@ export function extractXStatus(text: string, ownerHandle: string): { url: string
   return candidates.length === 1 && found.length === 1 ? found[0] : undefined;
 }
 
-export function reminderText(reminder: Reminder, store: Store): string {
+function reminderText(reminder: Reminder, store: Store): string {
   const source = store.postByKey(reminder.aggregateId)?.post;
   const label = source ? `${source.platform}：${Array.from(source.text).slice(0, 100).join('')}` : reminder.aggregateId;
   const state = reminder.state === 'awaiting_link'

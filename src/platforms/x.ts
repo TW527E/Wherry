@@ -5,7 +5,7 @@ import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
 import { resolveBrowserPlan, verifyBrowserPlan, type BrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
 
-export function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters<typeof chromium.launchPersistentContext>[1] {
+function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters<typeof chromium.launchPersistentContext>[1] {
   const plan = resolveBrowserPlan({ choice: config.browser, executablePath: config.executablePath });
   verifyBrowserPlan(plan);
   // X and Google refuse logins from browsers that advertise automation. Playwright adds

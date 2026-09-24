@@ -12,7 +12,7 @@ import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publi
 
 const attachmentSchema = z.object({
   kind: z.enum(['image', 'video', 'audio', 'unknown']), url: z.string().url().optional(), path: z.string().optional(),
-  mimeType: z.string().optional(), alt: z.string().default(''), sha256: z.string().optional(), perceptualHash: z.string().optional(),
+  mimeType: z.string().optional(), alt: z.string().default(''), sha256: z.string().optional(),
   width: z.number().positive().optional(), height: z.number().positive().optional(), size: z.number().nonnegative().optional(), animated: z.boolean().optional(),
 });
 export const sourcePostSchema = z.object({
@@ -370,6 +370,10 @@ export class Engine {
     return id;
   }
 
+  private hasInFlightDelivery(jobs: ReturnType<Store['jobsForAggregate']>): boolean {
+    return jobs.some(job => ['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id));
+  }
+
   registerManualMirror(aggregateId: string, xId: string, now = new Date().toISOString()): { alreadyDelivered: boolean } {
     if (!/^[1-9]\d{0,24}$/.test(xId)) throw new Error('Invalid X post ID');
     const source = this.store.postByKey(aggregateId);
@@ -378,7 +382,7 @@ export class Engine {
     if (existing && existing.post.replyToId !== null) throw new Error('Please register the X thread root, not a reply');
     const batchId = existing?.batchId ?? `x:${xId}`;
     const jobs = this.store.jobsForAggregate(batchId);
-    const alreadyDelivered = jobs.some(job => ['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id));
+    const alreadyDelivered = this.hasInFlightDelivery(jobs);
     this.store.transaction(() => {
       this.store.addMirror(source.post, now);
       this.store.matchMirror(`mirror:${aggregateId}`, xId);
@@ -424,7 +428,7 @@ export class Engine {
     const batch = this.store.getBatch(id);
     if (!batch) throw new Error('Batch not found');
     const jobs = this.store.jobsForAggregate(id);
-    if (jobs.some(j => ['running', 'succeeded', 'unknown'].includes(j.state) || this.store.hasDeliveryEvidence(j.id))) throw new Error('Already delivered/in-flight batch cannot be rewritten; inspect remote posts first');
+    if (this.hasInFlightDelivery(jobs)) throw new Error('Already delivered/in-flight batch cannot be rewritten; inspect remote posts first');
     if (action === 'approve') {
       if (!['open', 'review', 'sealed'].includes(batch.state)) throw new Error('Only open/review/sealed batches can be approved');
       const members = this.store.batchPosts(id);
