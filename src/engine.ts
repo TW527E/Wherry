@@ -8,7 +8,9 @@ import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity
 import { prepareImages } from './media.js';
 import { prepareVideo } from './video.js';
 import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
-import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from './types.js';
+import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
+import { resolveBlueskyMentions } from './platforms/bluesky.js';
+import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, TextRange, Transport } from './types.js';
 
 const attachmentSchema = z.object({
   kind: z.enum(['image', 'video', 'audio', 'unknown']), url: z.string().url().optional(), path: z.string().optional(),
@@ -18,12 +20,13 @@ const attachmentSchema = z.object({
 export const sourcePostSchema = z.object({
   platform: z.enum(['x', 'bluesky', 'sharkey', 'local']), id: z.string().min(1), authorId: z.string().min(1),
   createdAt: z.string().datetime(), text: z.string().max(100_000), url: z.string().url().optional(), rootId: z.string().optional(),
+  mentions: z.array(z.object({ handle: z.string().regex(/^[A-Za-z0-9_]{1,15}$/), start: z.number().int().nonnegative(), end: z.number().int().positive() })).max(1000).optional(),
   replyToId: z.string().nullable().optional(), replyToAuthorId: z.string().nullable().optional(), relationKnown: z.boolean(),
   visibility: z.enum(['public', 'restricted', 'unknown']), repost: z.boolean().optional(), quoteUrl: z.string().optional(), poll: z.boolean().optional(),
   pollData: pollSnapshotSchema.optional(),
   cw: z.string().optional(), sensitive: z.boolean().optional(), sensitiveLabels: z.array(z.enum(BLUESKY_SENSITIVE_LABELS)).max(4).optional(),
   attachments: z.array(attachmentSchema).max(100), metadataComplete: z.boolean(),
-});
+}).refine(post => !post.mentions?.length || (post.platform === 'x' && validTextMentions(post.text, post.mentions)), 'Invalid source mention ranges');
 export const snapshotSchema = z.object({
   platform: z.enum(['x', 'bluesky', 'sharkey']), accountId: z.string().min(1), posts: z.array(sourcePostSchema).max(1000),
   fetchedAt: z.string().datetime(), complete: z.boolean(), watermark: z.string().datetime().optional(), warnings: z.array(z.string()),
@@ -540,13 +543,24 @@ export class Engine {
     const batch = job.kind === 'publish' ? this.store.getBatch(job.aggregateId) : undefined;
     const members = job.kind === 'publish' ? this.store.batchPosts(job.aggregateId).map(p => p.post) : [this.store.postByKey(job.aggregateId)?.post].filter((p): p is SourcePost => Boolean(p));
     if (!members.length) throw new Error('Job source not found');
+    const planKey = `mention-plan:${job.id}`;
+    let bodies = this.store.setting<MentionText[] | undefined>(planKey, undefined);
+    if (!bodies) {
+      // Only a mention-bearing post needs a pinned plan; without mentions the rewrite is the identity.
+      // Older partial deliveries have no plan at all; keep their original splitting on retry.
+      const convert = job.kind === 'publish' && !this.store.hasDeliveryEvidence(job.id) && members.some(post => post.mentions?.length);
+      const mappings = this.store.mentionMappings();
+      bodies = members.map(post => convert ? renderXMentions(post, job.destination, mappings) : { text: cleanXLinks(post.text), mentions: [] });
+      if (job.destination === 'bluesky' && this.config.mode === 'live') await resolveBlueskyMentions(bodies, this.config.bluesky.publicUrl, this.transport);
+      if (convert) this.store.setSetting(planKey, bodies);
+    }
     const output: PublishPart[] = [];
     if (job.kind === 'reminder') output.push({
       key: 'notice', sourcePostId: members[0]!.id,
       text: `🔔 你在 ${members[0]!.platform} 發了新內容。要不要也發到 X？\n下方是可直接複製的內容。請選擇：`,
       images: [], buttons: [{ text: '1️⃣ 要發', data: 'rem:y' }, { text: '2️⃣ 不發', data: 'rem:n' }],
     });
-    for (const post of members) {
+    for (const [postIndex, post] of members.entries()) {
       const unsupported = unsupportedReason(post, this.config.media.video);
       // An owner-approved long post IS published here (its body is split into parts below). Any other
       // hold means the content is not publishable at all, so fail loudly rather than send a degraded post.
@@ -562,7 +576,9 @@ export class Engine {
         ? await prepareVideo(videoAttachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)
         : undefined;
       const images = video ? [] : await prepareImages(post.attachments, this.config, this.transport);
-      let text = cleanXLinks(post.text);
+      const body = bodies[postIndex]!;
+      let text = body.text;
+      const mentions = body.mentions;
       if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
       if (poll) {
@@ -580,14 +596,14 @@ export class Engine {
         // counts rendered HTML and caps an album caption at 1024, a text message at 4096, so the
         // caption chunk fits the album and any overflow continues as plain follow-up messages.
         const chunks = splitHtml(text, images.length || video ? 1024 : 4096,
-          (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0));
+          (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0), mentions);
         const caption = chunks[0] ?? '';
         output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking });
         for (let i = 1; i < chunks.length; i++) {
           output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl, ...marking });
         }
         if (poll) {
-          const question = cleanXLinks(post.text).trim();
+          const question = body.text.trim();
           output.push({ key: `${key}:poll`, sourcePostId: post.id,
             text: !question ? '🗳️ X 投票' : Array.from(question).length <= 300 ? question : '🗳️ 請參閱上一則貼文的投票問題',
             images: [], poll, sourceUrl: xPollUrl(post)! });
@@ -602,10 +618,14 @@ export class Engine {
         const utf16 = signature ? Math.max(1, 3000 - signature.length - 2) : 3000;
         const chunks = splitText(text, job.destination === 'bluesky'
           ? { graphemes: 300 - graphemes(prefix).length, utf8Bytes: 3000 - Buffer.byteLength(prefix, 'utf8') }
-          : { utf16 });
+          : { utf16 }, mentions);
+        let offset = 0;
         chunks.forEach((chunk, index) => {
-          const body = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
-          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: body, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
+          const rendered = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
+          const partMentions = sliceMentions(mentions, offset, offset + chunk.length);
+          offset += chunk.length;
+          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: rendered, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
+            ...(partMentions.length && job.destination === 'bluesky' ? { mentions: partMentions } : {}),
             ...(poll && job.destination === 'sharkey' && index === chunks.length - 1 ? { poll } : {}) });
         });
       }
@@ -738,10 +758,10 @@ export function safeError(error: unknown): string {
  * Splits raw text so that the HTML-escaped rendering fits the destination limit.
  * Splitting happens on the raw string, so an entity such as `&amp;` is never cut in half.
  */
-export function splitHtml(text: string, escapedLimit: number, reserve = 0): string[] {
+export function splitHtml(text: string, escapedLimit: number, reserve = 0, protectedRanges: TextRange[] = []): string[] {
   let budget = Math.max(1, escapedLimit - reserve);
   for (let attempt = 0; attempt < 12; attempt++) {
-    const chunks = splitText(text, { utf16: budget });
+    const chunks = splitText(text, { utf16: budget }, protectedRanges);
     if (chunks.every(chunk => htmlEscape(chunk).length <= escapedLimit - reserve)) return chunks;
     const longest = Math.max(...chunks.map(chunk => htmlEscape(chunk).length));
     budget = Math.max(1, Math.floor(budget * ((escapedLimit - reserve) / longest)) - 1);

@@ -1,6 +1,9 @@
 import { chromium, type BrowserContext, type Locator, type Page } from 'playwright-core';
+import { load } from 'cheerio';
+import type { AnyNode } from 'domhandler';
 import type { AppConfig } from '../config.js';
-import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import { mapMentionText, type MentionText } from '../mentions.js';
+import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, TextMention, Transport } from '../types.js';
 import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
 import { resolveBrowserPlan, verifyBrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
@@ -31,6 +34,7 @@ export interface TweetFacts {
   authorId: string;
   createdAt?: string;
   text: string;
+  mentions?: TextMention[];
   replyToId?: string | null;
   replyToAuthorId?: string | null;
   relationKnown: boolean;
@@ -104,7 +108,7 @@ export function fullSizeImageUrl(value: string | undefined): string | undefined 
 }
 
 export function parseTweetFacts(input: {
-  id: string; url?: string; authorId: string; createdAt?: string; text?: string; labels?: string[];
+  id: string; url?: string; authorId: string; createdAt?: string; text?: string; labels?: string[]; mentions?: TextMention[];
   statusLinks?: string[]; replyingTo?: string; attachments?: Attachment[]; repost?: boolean; quoteUrl?: string;
   poll?: boolean;
   pollData?: PollSnapshot;
@@ -131,6 +135,7 @@ export function parseTweetFacts(input: {
     authorId: input.authorId || ownerHandle,
     createdAt: input.createdAt,
     text: input.text || '',
+    ...(input.mentions ? { mentions: input.mentions } : {}),
     replyToId: input.threadParentId ?? (isReply ? parentLink?.id : null),
     replyToAuthorId: input.threadParentId ? (input.threadParentAuthor ?? input.authorId ?? ownerHandle) : (isReply ? replying?.[1] ?? null : null),
     relationKnown,
@@ -142,6 +147,42 @@ export function parseTweetFacts(input: {
     sensitive: Boolean(input.labels?.length),
     metadataComplete: Boolean(input.id && input.authorId && input.createdAt && relationKnown),
   };
+}
+
+/** Only a matching profile anchor inside tweetText proves a mention; its text alone does not. */
+export function parseTweetText(html: string): MentionText {
+  const $ = load(html, {}, false);
+  $('[hidden], [aria-hidden="true"], script, style, [data-testid="quoteTweet"], article').remove();
+  let text = '';
+  const mentions: TextMention[] = [];
+  const walk = (nodes: AnyNode[]): void => {
+    for (const node of nodes) {
+      if (node.type === 'text') { text += node.data; continue; }
+      if (node.type !== 'tag') continue;
+      if (node.name === 'br') { text += '\n'; continue; }
+      if (node.name === 'img') { text += node.attribs.alt || ''; continue; }
+      if (node.name === 'a') {
+        const shown = $(node).text();
+        let url: URL | undefined;
+        try { url = new URL(node.attribs.href || '', 'https://x.com'); } catch { /* Keep malformed links as text. */ }
+        const handle = shown.match(/^@([A-Za-z0-9_]{1,15})$/)?.[1];
+        const profile = url?.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/?$/)?.[1];
+        if (handle && profile?.toLowerCase() === handle.toLowerCase() && url
+          && ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && !url.port && !url.search && !url.hash
+          && ['x.com', 'www.x.com', 'mobile.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com'].includes(url.hostname)) {
+          const start = text.length;
+          text += shown;
+          mentions.push({ handle, start, end: text.length });
+        } else {
+          text += url && ['http:', 'https:'].includes(url.protocol) && shown.includes('…') ? url.href : shown;
+        }
+        continue;
+      }
+      walk(node.children);
+    }
+  };
+  walk($.root().contents().toArray());
+  return { text, mentions };
 }
 
 export class XCollector implements Collector {
@@ -160,14 +201,14 @@ export class XCollector implements Collector {
    * (without fetching the destination body), following at most a few hops in case a link chains
    * through another shortener. A link that cannot be resolved is left as-is rather than dropped.
    */
-  private async resolveShortLinks(text: string, signal?: AbortSignal): Promise<string> {
-    if (!this.transport || !shortLinkPattern.test(text)) return text;
-    const unique = new Set(text.match(shortLinkPattern) ?? []);
+  private async resolveShortLinks(body: MentionText, signal?: AbortSignal): Promise<MentionText> {
+    if (!this.transport) return body;
+    const unique = new Set(body.text.match(shortLinkPattern) ?? []);
     for (const short of unique) {
       if (this.shortLinks.has(short) || signal?.aborted) continue;
       this.shortLinks.set(short, await this.expandShortLink(short, signal));
     }
-    return text.replace(shortLinkPattern, match => this.shortLinks.get(match) || match);
+    return mapMentionText(body, text => text.replace(shortLinkPattern, match => this.shortLinks.get(match) || match));
   }
 
   /** Follow t.co redirects (Location only, never the body) up to a few hops; null if unresolvable. */
@@ -238,29 +279,13 @@ export class XCollector implements Collector {
     // anchor href. Reading innerText would sync the broken truncated string, so reconstruct the
     // text from the tweetText node: use each <a>'s href for external links, keep emoji alt text,
     // and keep visible text for everything else.
-    const text = await article.locator('[data-testid="tweetText"]').first().evaluate((node: Element) => {
-      const walk = (el: Element): string => {
-        let out = '';
-        for (const child of Array.from(el.childNodes)) {
-          if (child.nodeType === 3) { out += child.textContent || ''; continue; } // text node
-          if (!(child instanceof Element)) continue;
-          if (child.tagName === 'IMG') { out += (child as HTMLImageElement).alt || ''; continue; } // emoji
-          if (child.tagName === 'A') {
-            const href = (child as HTMLAnchorElement).href;
-            const shown = child.textContent || '';
-            // Mentions/hashtags/cashtags and t.co-expanded display links: keep the real href for
-            // external URLs (display text is truncated with an ellipsis), else keep visible text.
-            out += /^https?:\/\//.test(href) && /[…]|\/\S*…/.test(shown) ? href
-              : /^https?:\/\//.test(href) && !shown.startsWith('@') && !shown.startsWith('#') && !shown.startsWith('$') ? (shown.includes('…') ? href : shown)
-              : shown;
-            continue;
-          }
-          out += walk(child);
-        }
-        return out;
-      };
-      return walk(node);
+    const textHtml = await article.evaluate((node: Element) => {
+      const body = Array.from(node.querySelectorAll('[data-testid="tweetText"]'))
+        .find(element => element.closest('article') === node && !element.closest('[data-testid="quoteTweet"]'));
+      return body?.innerHTML || '';
     }).catch(() => '');
+    const body = parseTweetText(textHtml);
+    const text = body.text;
     const articleText = await article.innerText().catch(() => '');
     const replyMatch = articleText.match(/Replying to\s+(@[A-Za-z0-9_]{1,15})/i);
     // A link-preview card puts its destination only in the card, not the tweet text. Capture it
@@ -315,8 +340,8 @@ export class XCollector implements Collector {
     }
     // Expand any t.co short link the DOM left in the text to its real destination before the
     // post is handed downstream, so other platforms show the real URL, not a t.co short link.
-    bodyText = await this.resolveShortLinks(bodyText, signal);
-    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: bodyText, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor }, this.config.handle);
+    const resolved = await this.resolveShortLinks({ text: bodyText, mentions: body.mentions }, signal);
+    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: resolved.text, mentions: resolved.mentions, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor }, this.config.handle);
     return { parsed, articleText };
   }
 
@@ -526,7 +551,7 @@ export class XCollector implements Collector {
         ? 'X page rendered tweets but none were parseable (tweet layout may have changed); no checkpoint advanced'
         : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
     }
-    const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, poll: f.poll, pollData: f.pollData, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
+    const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, mentions: f.mentions, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, poll: f.poll, pollData: f.pollData, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
     if (reachedWatermark) return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: true, warnings: [] };
     // Budget exhausted before reaching the watermark. The posts parsed fine — we just did not
     // scroll back far enough. Report `oldest` as the watermark so the engine advances the

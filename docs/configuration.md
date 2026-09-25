@@ -6,6 +6,7 @@
 
 - [載入規則](#loading)
 - 設定表：[基本與 Web](#basics)、[X](#x)、[Bluesky](#bluesky)、[Sharkey](#sharkey)、[Telegram](#telegram)、[時間與限制](#timing)、[影片模組](#video)
+- [ID 映射（@提及）](#mentions)
 - [官方憑證與帳號資料取得](#credentials)
 - [X 登入與 session 安全](#x-session)
 - [Docker 部署](#docker)
@@ -117,6 +118,38 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 所有非空 Telegram ID 均須為數字字串（驗證格式為 `^-?\d+$`）；頻道 ID 常以 `-100` 開頭，**保留負號**。Owner 使用自己的正數 user ID，不是電話號碼。格式驗證不會替你檢查 chat 是否存在、是否屬於你或 bot 是否有權限。
 
 告警目前針對 `error` 事件，不等於每次成功、每筆 `warn` 或服務啟停都會通知。常駐程式另以約 15 秒週期處理告警，並保存處理游標；首次啟用不會把所有舊錯誤一次重播。Telegram 本身故障時，仍須看本機事件與服務日誌；告警不是保證送達的監控系統。
+
+<a id="mentions"></a>
+## ID 映射（@提及）
+
+X 貼文 tag 的 `@帳號` 到了 Bluesky／Sharkey／Telegram 不一定存在同名帳號（X 的 `@alice` 與 Bluesky 的 `@alice.bsky.social` 是不同人），照原樣送出就變成「沒有此用戶」。現在的行為：
+
+- **只有 X 頁面上真的是帳號連結的提及**才會被處理：必須是貼文本體內、顯示文字與連結路徑一致的個人頁連結。純文字裡的 `@某人`、看起來像個人頁的其他路徑（`x.com/alice/status/…`）、引用推文裡的提及都**不算**。
+- **沒有映射** → 換成該帳號的 X 個人頁連結（`https://x.com/帳號`），其他平台不會再把它當成自己站上的帳號。
+- **有映射** → 換成該平台的 ID：Bluesky 用完整 handle（`alice.bsky.social`）、Sharkey 用 `@alice` 或 `@alice@dvd.chat`、Telegram 用 `@alice_tg`。Bluesky 在發布前會先 `resolveHandle` 換成 DID 並寫入 facet，才是真正的提及。
+
+只有**你自己用指令建立**的映射才會生效；工具不會拿同名帳號去猜測。
+
+### 用 Telegram 管理
+
+跟 bot 私聊送出指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受 `TELEGRAM_OWNER_ID`）：
+
+| 指令 | 作用 |
+|---|---|
+| `/map <X_ID>` | 查看這個 X ID 目前的映射 |
+| `/map <X_ID> bluesky=alice.bsky.social sharkey=@alice@dvd.chat telegram=@alice_tg` | 設定或更新；可只填其中一個平台，未填的平台保持原值 |
+| `/map <X_ID> telegram=-` | 清除單一平台（`-` 表示移除），其餘平台不動 |
+| `/maps` | 列出全部映射 |
+| `/unmap <X_ID>` | 刪除這個 X ID 的所有映射（回到 X 連結） |
+
+`X_ID` 可寫 `@Alice` 或 `alice`，不分大小寫。指令會先驗證格式再寫入，失敗時回應原因且不改動任何映射。Telegram 的映射是公開的 `@username`，與 `TELEGRAM_OWNER_ID`／chat ID 那組數字權限無關。
+
+兩點要留意：
+
+- **映射只影響之後的發布。** 已經有送出紀錄的工作會沿用開始時的版本，不會因為改設定而重送或漏送；改完之後的新貼文才生效。
+- **格式驗證不等於帳號存在。** 工具只檢查形狀（Bluesky 要完整網域、Sharkey 是 `user@host`、Telegram 是 5–32 字元的 `@username`），不會查證那個帳號是不是對方本人。
+
+映射存在 `DATA_DIR/crosspost.sqlite` 的 settings，跟著資料庫一起備份。
 
 <a id="timing"></a>
 ## 時間與限制（6 個）
@@ -253,7 +286,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 
 ### 需要保存什麼
 
-- `DATA_DIR/crosspost.sqlite`：來源基準、批次、mirror、已送出步驟、提醒決策及 Telegram 游標；這是防止重複發布的關鍵，不是可任意清空的快取。
+- `DATA_DIR/crosspost.sqlite`：來源基準、批次、mirror、已送出步驟、提醒決策、ID 映射及 Telegram 游標；這是防止重複發布的關鍵，不是可任意清空的快取。
 - 整個 `DATA_DIR/media`、`X_PROFILE_DIR`、仍需要保留的 `X_SESSION_FILE`；若路徑移出 `DATA_DIR`，要另外納入。
 - `.env` 或服務的環境檔，與當時程式版本、`package-lock.json`、部署設定的識別資訊。憑證檔和 session 的備份必須加密並限制讀取。
 
@@ -296,6 +329,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | 設定載入即失敗 | 核對布林／整數格式、範圍、`DESTINATIONS` 拼字、對應 enabled、X handle、非 loopback 的 token 長度與 Telegram 數字 ID；空值不一定代表預設。 |
 | `doctor` 正常但沒有任何貼文 | Doctor 不是帳密／發文能力的連線測試。檢查 enabled、必要憑證、destination 與事件；首次完整快照只建基準、不補發舊貼文。 |
 | preview 工作顯示 `succeeded` 卻沒在平台看到 | 這是模擬結果，不是遠端送達。使用獨立 live 資料目錄及新基準，不要自動重播 preview 工作。 |
+| 同步後的 `@帳號` 在別的平台變成「沒有此用戶」 | 這是被 tag 的人沒有對應帳號。用 `/map <X_ID> <平台>=<ID>` 建立映射（見 [ID 映射](#mentions)）；未映射的提及應該呈現為 X 個人頁連結，若沒有 link 請回報。 |
 | X 找不到瀏覽器／profile 被鎖 | 核對執行檔、CPU 架構、目錄所有者；停止使用相同 profile 的程式。`npm ci` 不會下載 Chromium。 |
 | Linux root 或服務環境無法啟動 sandbox | 改用專用非 root 使用者，檢查系統支援與部署文件。`X_SANDBOX` 的自動預設見設定表；不要先關閉 sandbox 當万能解法。 |
 | X 出現登入牆、challenge、零推文或解析失敗 | 在本機自行重新驗證，匯出新 session 後安全匯入；不要自動繞過驗證。也可能是 X 前端改版，保留檢查點並查看錯誤。 |

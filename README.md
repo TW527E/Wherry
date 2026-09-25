@@ -13,6 +13,7 @@ X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動�
 - 讀取你自己 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道。
 - 在 Bluesky 同步完成後，多發一則回覆串文，附上該串文最頂端主推文的 `fixupx.com` 連結；Sharkey 改在各則內文附上可設定的署名與原文連結。
 - Telegram 對外頻道的每則訊息底部附 `原文連結`。
+- 貼文裡真的 tag 到的 X 帳號：有建立映射就換成該平台的原生 ID（Bluesky mention facet、Sharkey `@user@host`、Telegram `@username`），沒映射就換成該帳號的 X 個人頁連結，不會在下游變成「沒有此用戶」。純文字的 `@某人` 不受影響。
 - 偵測你在 Bluesky／dvd.chat 發的原生貼文，用 Telegram 私聊送一則**互動式提醒**：內含「1️⃣ 要發 / 2️⃣ 不發」按鈕。按「要發」後回覆該訊息貼上 X 連結，工具即登記為鏡像；按「不發」則不同步。訊息會就地更新狀態。
 - 認出你手動貼到 X 的鏡像內容（含互動提醒或 `/mirror` 登記的連結），**不再**回同步到其他平台。
 - 把系統錯誤事件自動轉發到 Telegram 私聊，秘密會先遮蔽。
@@ -116,6 +117,9 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | `/status` | 目前模式、X session 狀態、任務與近期事件 |
 | `/sync` | 立即檢查一次（X 發文仍需手動） |
 | `/pending` | 列出等待處理的批次與 X 提醒 |
+| `/map <X_ID> [平台=ID …]` | 查看或設定 X 帳號的跨平台 ID 映射（`/map alice bluesky=alice.bsky.social`） |
+| `/maps` | 列出所有 ID 映射 |
+| `/unmap <X_ID>` | 刪除這個 X 帳號的所有映射 |
 | `/approve <batchId>` | 放行被保留的批次 |
 | `/skip <batchId>` | 不同步某批次 |
 | `/mirror <id>` | 標記為手動鏡像，不再同步 |
@@ -153,6 +157,15 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | 你手動貼到 X 的鏡像 | `manual_mirror`，不同步 |
 
 敏感標記不會解除非公開或不支援媒體的限制，也不會讓敏感投票在 Telegram 發布（無法對投票題目防雷）。來源沒有 CW 時使用「來源標記為敏感內容」，各分段都預留警告長度；Bluesky 的媒體遮蔽仍依讀者設定，純文字只保留可見 CW，不保證折疊。X 偵測僅涵蓋頁面可見的警告，不能保證辨認所有敏感內容。詳見 [敏感內容同步說明](docs/configuration.md#敏感內容如何同步)。
+
+### tag 到的人（@提及）
+
+只有 X 頁面上**真的是帳號連結**的提及才處理：顯示文字與連結路徑一致、位於貼文本體內。純文字裡的 `@某人`、引用推文裡的提及都不算。
+
+- 沒設定映射 → 換成該帳號的 X 個人頁連結（`https://x.com/帳號`），下游不會再把它當成自己站上的帳號。
+- 有設定映射 → 換成該平台的 ID：Bluesky 用完整 handle（發布時另查 DID 寫入 mention facet）、Sharkey 用 `@user` 或 `@user@host`、Telegram 用 `@username`。
+
+用 `/map`、`/maps`、`/unmap` 管理（完整格式與驗證規則見 [設定文件](docs/configuration.md#mentions)）。映射只影響之後的發布：已經開始送出（有紀錄）的工作會沿用開始時的版本，不會因為改設定而漏送或重送。
 
 ### 防回音怎麼判斷
 

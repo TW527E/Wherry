@@ -3,6 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { cleanXLinks } from './text.js';
+import { normalizeMentionTarget, normalizeXHandle, type MentionTargets } from './mentions.js';
 import type { Batch, Classification, Destination, EventRecord, Job, JobState, Reminder, ReminderState, RemoteRef, ReviewNotice, ReviewNoticeState, SourcePlatform, SourcePost, StoredPost } from './types.js';
 
 type Row = Record<string, unknown>;
@@ -69,6 +70,32 @@ export class Store {
   }
   setSetting(key: string, value: unknown): void {
     this.db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value));
+  }
+  mentionMapping(handle: string): MentionTargets {
+    return this.setting<MentionTargets>(`mention:x:${normalizeXHandle(handle)}`, {});
+  }
+  mentionMappings(): Map<string, MentionTargets> {
+    return new Map(this.db.prepare("SELECT key,value FROM settings WHERE key GLOB 'mention:x:*' ORDER BY key").all()
+      .map(row => [String(row.key).slice('mention:x:'.length), decode<MentionTargets>(row.value)]));
+  }
+  setMentionMapping(handle: string, patch: Partial<Record<Destination, string | null>>): MentionTargets {
+    const key = `mention:x:${normalizeXHandle(handle)}`;
+    if (!Object.keys(patch).length) throw new Error('請至少提供一個平台 ID。');
+    return this.transaction(() => {
+      const mapping = this.setting<MentionTargets>(key, {});
+      for (const [destination, value] of Object.entries(patch)) {
+        if (!['bluesky', 'sharkey', 'telegram'].includes(destination)) throw new Error('平台只能是 bluesky、sharkey 或 telegram。');
+        if (value === null) delete mapping[destination as Destination];
+        else if (typeof value === 'string') mapping[destination as Destination] = normalizeMentionTarget(destination, value);
+        else throw new Error('平台 ID 必須是文字。');
+      }
+      if (Object.keys(mapping).length) this.setSetting(key, mapping);
+      else this.db.prepare('DELETE FROM settings WHERE key=?').run(key);
+      return mapping;
+    });
+  }
+  deleteMentionMapping(handle: string): boolean {
+    return Number(this.db.prepare('DELETE FROM settings WHERE key=?').run(`mention:x:${normalizeXHandle(handle)}`).changes) > 0;
   }
   event(level: EventRecord['level'], message: string, entityId?: string): void {
     this.db.prepare('INSERT INTO events(at,level,message,entity_id) VALUES(?,?,?,?)').run(new Date().toISOString(), level, message, entityId || null);

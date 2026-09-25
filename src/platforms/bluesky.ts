@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { graphemes } from '../text.js';
+import { validTextMentions, type MentionText } from '../mentions.js';
 import type { AppConfig } from '../config.js';
 import { BLUESKY_SENSITIVE_LABELS, isSensitiveContent, warningPrefix } from '../content-warning.js';
 import type { Attachment, Collector, HttpOptions, PreparedVideo, PublishContext, Publisher, PublishPart, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
@@ -52,9 +53,26 @@ function postUrl(uri: unknown): string | undefined {
   return parsed ? `https://bsky.app/profile/${encodeURIComponent(parsed.did)}/post/${encodeURIComponent(parsed.key)}` : undefined;
 }
 
+interface BlueskyFacet {
+  index: { byteStart: number; byteEnd: number };
+  features: Array<{ $type: 'app.bsky.richtext.facet#link'; uri: string } | { $type: 'app.bsky.richtext.facet#mention'; did: string }>;
+}
+
+/** Only owner-mapped handles are resolved, before any durable delivery begins. */
+export async function resolveBlueskyMentions(bodies: MentionText[], publicUrl: string, transport: Transport): Promise<void> {
+  const handles = new Set(bodies.flatMap(body => body.mentions.map(mention => mention.handle)));
+  for (const handle of handles) {
+    const result = object(await requestJson(transport,
+      `${httpsBase(publicUrl, 'Bluesky public AppView')}/xrpc/com.atproto.identity.resolveHandle?${new URLSearchParams({ handle })}`,
+      { method: 'GET', maxBytes: 64_000 }, 'Bluesky mention resolution'));
+    if (!didValid(result?.did)) throw schemaError('Bluesky mention resolution');
+    for (const body of bodies) for (const mention of body.mentions) if (mention.handle === handle) mention.did = result.did;
+  }
+}
+
 /** Only links are inferred. Bare @names are never resolved to a possibly unrelated account. */
-export function blueskyLinkFacets(text: string): Array<{ index: { byteStart: number; byteEnd: number }; features: Array<{ $type: 'app.bsky.richtext.facet#link'; uri: string }> }> {
-  const facets: Array<{ index: { byteStart: number; byteEnd: number }; features: Array<{ $type: 'app.bsky.richtext.facet#link'; uri: string }> }> = [];
+export function blueskyLinkFacets(text: string): BlueskyFacet[] {
+  const facets: BlueskyFacet[] = [];
   for (const match of text.matchAll(/https?:\/\/[^\s<>"'\u3000]+/giu)) {
     let raw = match[0].replace(/[.,!?;:，。！？；：]+$/u, '');
     for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']] as const) {
@@ -417,7 +435,21 @@ export class BlueskyClient implements Publisher, Collector {
     }
     const sensitive = isSensitiveContent(part);
     const labels = sensitive ? [...new Set(part.sensitiveLabels?.length ? part.sensitiveLabels : [this.config.sensitiveLabel])] : [];
-    const text = `${warningPrefix(part)}${part.text}`;
+    const prefix = warningPrefix(part);
+    const text = `${prefix}${part.text}`;
+    if (!validTextMentions(part.text, part.mentions ?? []) || part.mentions?.some(mention => !didValid(mention.did))) {
+      throw new PlatformError('Bluesky mapped mentions require valid text ranges and resolved DIDs', { code: 'InvalidMention' });
+    }
+    const facets = blueskyLinkFacets(text);
+    for (const mention of part.mentions ?? []) {
+      const byteStart = Buffer.byteLength(prefix + part.text.slice(0, mention.start));
+      const byteEnd = Buffer.byteLength(prefix + part.text.slice(0, mention.end));
+      if (facets.some(facet => byteStart < facet.index.byteEnd && byteEnd > facet.index.byteStart)) {
+        throw new PlatformError('A mapped mention overlaps a URL', { code: 'InvalidMention' });
+      }
+      facets.push({ index: { byteStart, byteEnd }, features: [{ $type: 'app.bsky.richtext.facet#mention', did: mention.did! }] });
+    }
+    facets.sort((a, b) => a.index.byteStart - b.index.byteStart);
     if (!text.trim() && !part.images.length && !part.video) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
     if (Buffer.byteLength(text) > 3000 || graphemes(text).length > 300) throw new PlatformError('Split Bluesky parts before publishing (300 graphemes / 3000 UTF-8 bytes)', { code: 'TextTooLong' });
     let reply: { root: StrongRef; parent: StrongRef } | undefined;
@@ -443,7 +475,6 @@ export class BlueskyClient implements Publisher, Collector {
       images.push({ alt: image.alt, image: uploaded, aspectRatio: { width: image.width, height: image.height } });
     }
     const videoBlob = part.video ? await this.uploadVideoBlob(part.video, session.did) : undefined;
-    const facets = blueskyLinkFacets(text);
     const embed = videoBlob
       ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: part.video!.width, height: part.video!.height }, ...(part.video!.alt ? { alt: part.video!.alt } : {}) }
       : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;

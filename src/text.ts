@@ -1,3 +1,5 @@
+import type { TextRange } from './types.js';
+
 const segmenter = new Intl.Segmenter('und', { granularity: 'grapheme' });
 const urlPattern = /https?:\/\/[^\s<>"'\u3000]+/giu;
 const xHosts = new Set(['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'mobile.x.com', 'fixupx.com', 'www.fixupx.com']);
@@ -37,17 +39,28 @@ export function fitsText(text: string, limits: TextLimits): boolean {
     && (limits.utf16 === undefined || text.length <= limits.utf16);
 }
 
-export function splitText(input: string, limits: TextLimits): string[] {
+export function splitText(input: string, limits: TextLimits, protectedRanges: TextRange[] = []): string[] {
   if (Object.values(limits).some(v => !Number.isFinite(v) || v < 1)) throw new Error('Invalid text limit');
+  if (protectedRanges.some(range => !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
+    || range.start < 0 || range.end <= range.start || range.end > input.length)) throw new Error('Invalid protected text range');
   if (fitsText(input, limits)) return [input];
+  const ranges = [...protectedRanges.map(range => ({ start: range.start, end: range.end })),
+    ...Array.from(input.matchAll(urlPattern), match => ({ start: match.index, end: match.index + match[0].length }))]
+    .sort((a, b) => a.start - b.start);
+  const merged: TextRange[] = [];
+  for (const range of ranges) {
+    const previous = merged.at(-1);
+    if (previous && range.start < previous.end) previous.end = Math.max(previous.end, range.end);
+    else merged.push(range);
+  }
   const units: string[] = [];
   let cursor = 0;
-  for (const match of input.matchAll(urlPattern)) {
-    const index = match.index;
-    units.push(...graphemes(input.slice(cursor, index)));
-    if (!fitsText(match[0], limits)) throw new Error('A URL exceeds the destination text limit; manual shortening is required');
-    units.push(match[0]);
-    cursor = index + match[0].length;
+  for (const range of merged) {
+    units.push(...graphemes(input.slice(cursor, range.start)));
+    const unit = input.slice(range.start, range.end);
+    if (!fitsText(unit, limits)) throw new Error(`A ${/^https?:\/\//i.test(unit) ? 'URL' : 'mention'} exceeds the destination text limit; manual shortening is required`);
+    units.push(unit);
+    cursor = range.end;
   }
   units.push(...graphemes(input.slice(cursor)));
   const chunks: string[] = [];

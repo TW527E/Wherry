@@ -35,12 +35,21 @@ export interface PollSnapshot {
   statusText?: string;
 }
 
+export interface TextRange { start: number; end: number }
+
+/** UTF-16 offsets in the accompanying text; source mentions come only from X profile anchors. */
+export interface TextMention extends TextRange {
+  handle: string;
+  did?: string;
+}
+
 export interface SourcePost {
   platform: SourcePlatform;
   id: string;
   authorId: string;
   createdAt: string;
   text: string;
+  mentions?: TextMention[];
   url?: string;
   rootId?: string;
   replyToId?: string | null;
@@ -106,6 +115,8 @@ export interface PublishPart {
   key: string;
   sourcePostId: string;
   text: string;
+  /** Explicit mapped mentions only; never inferred from arbitrary @text. */
+  mentions?: TextMention[];
   /** Source metadata for native creation; original votes are never seeded into the new poll. */
   poll?: PollSnapshot;
   /** Source warning, separate from the body so publishers can apply native CW or a length-budgeted prefix. */

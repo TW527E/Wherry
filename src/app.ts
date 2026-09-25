@@ -10,6 +10,7 @@ import { extractXStatus, handleCallback, handleReminderReply, handleReviewReply,
 import { SerialWork } from './lifecycle.js';
 import { XCollector, installSession } from './platforms/x.js';
 import { parseSessionFile, MAX_SESSION_BYTES } from './platforms/session.js';
+import { normalizeXHandle, type MentionTargets } from './mentions.js';
 import type { Collector, Destination, Publisher, RemoteRef } from './types.js';
 
 class PreviewPublisher implements Publisher {
@@ -214,6 +215,9 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
   { command: 'status', description: '查看目前的任務、批次與近期事件' },
   { command: 'sync', description: '立即檢查一次（X 發文仍需手動）' },
   { command: 'pending', description: '列出等待你處理的批次與其 ID' },
+  { command: 'map', args: '<X_ID> [bluesky=ID sharkey=ID telegram=ID]', description: '查看或設定 ID 映射；平台=- 可清除單一平台' },
+  { command: 'maps', description: '列出所有 X 到其他平台的 ID 映射' },
+  { command: 'unmap', args: '<X_ID>', description: '刪除這個 X ID 的所有平台映射' },
   { command: 'approve', args: '<batchId>', description: '批准一個被保留的批次，發布到下游' },
   { command: 'skip', args: '<batchId>', description: '略過（不同步）某個批次' },
   { command: 'mirror', args: '<id> [X_URL]', description: '標記為你手動鏡像，之後不再同步' },
@@ -242,6 +246,37 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
       const reminders = context.store.pendingReminders(context.engine.config.telegram.privateChatId);
       const body = [...held.map(b => `• ${b.id}\n  狀態：${b.state}（${b.reason}）`), ...reminders.map(r => `• ${r.aggregateId}\n  X 提醒：${r.state}（請操作原提醒或 /mirror <id> <X_URL>）`)].join('\n') || '目前沒有等待處理的批次或提醒。';
       await context.telegram.sendPlain(`待處理批次（${held.length}）\n${body}`, 'private');
+    }
+    else if (['/map', '/maps', '/unmap'].includes(command)) {
+      let reply: string;
+      try {
+        const show = (handle: string, targets: MentionTargets): string => `X @${handle}\n${(['bluesky', 'sharkey', 'telegram'] as const)
+          .map(platform => `  ${platform}：${targets[platform] ? `@${targets[platform]}` : '未設定（連回 X）'}`).join('\n')}`;
+        if (command === '/maps') {
+          if (parts.length !== 1) throw new Error('用法：/maps');
+          reply = [...context.store.mentionMappings()].map(([handle, targets]) => show(handle, targets)).join('\n\n') || '目前沒有 ID 映射。用 /map <X_ID> bluesky=ID sharkey=ID telegram=ID 加入。';
+        } else {
+          if (!id) throw new Error(`用法：${command} <X_ID>${command === '/map' ? ' [bluesky=ID sharkey=ID telegram=ID]' : ''}`);
+          const handle = normalizeXHandle(id);
+          if (command === '/unmap') {
+            if (parts.length !== 2) throw new Error('用法：/unmap <X_ID>');
+            reply = context.store.deleteMentionMapping(handle) ? `已刪除 @${handle} 的 ID 映射。` : `@${handle} 沒有 ID 映射。`;
+          } else {
+            const patch: Partial<Record<Destination, string | null>> = {};
+            for (const arg of parts.slice(2)) {
+              const match = arg.match(/^(bluesky|sharkey|telegram)=(.+)$/i);
+              if (!match) throw new Error('格式：/map X_ID bluesky=alice.bsky.social sharkey=@alice@dvd.chat telegram=@alice_tg；可只填一個平台，平台=- 可清除。');
+              const platform = match[1]!.toLowerCase() as Destination;
+              if (Object.hasOwn(patch, platform)) throw new Error(`平台 ${platform} 重複填寫。`);
+              patch[platform] = match[2] === '-' ? null : match[2]!;
+            }
+            const updated = parts.length > 2;
+            const targets = updated ? context.store.setMentionMapping(handle, patch) : context.store.mentionMapping(handle);
+            reply = `${updated ? '已儲存 ID 映射。\n' : ''}${show(handle, targets)}${updated ? '\n只用於 X 確認的提及；不改寫已開始發布的工作。' : ''}`;
+          }
+        }
+      } catch (error) { reply = `ID 映射未變更：${error instanceof Error ? error.message : '輸入無效'}`; }
+      await context.telegram.sendPlain(reply, 'private');
     }
     else if (command === '/skip' && id) { context.engine.action('skip', id); await context.telegram.sendPlain(`已跳過 ${id}`, 'private'); }
     else if (command === '/mirror' && id) {
