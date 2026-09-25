@@ -256,23 +256,20 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
           if (parts.length !== 1) throw new Error('用法：/maps');
           reply = [...context.store.mentionMappings()].map(([handle, targets]) => show(handle, targets)).join('\n\n') || '目前沒有 ID 映射。用 /map <X_ID> bluesky=ID sharkey=ID telegram=ID 加入。';
         } else {
-          if (!id) throw new Error(`用法：${command} <X_ID>${command === '/map' ? ' [bluesky=ID sharkey=ID telegram=ID]' : ''}`);
+          if (!id || parts.length > (command === '/unmap' ? 2 : Infinity)) throw new Error(`用法：${command} <X_ID>${command === '/map' ? ' [bluesky=ID sharkey=ID telegram=ID]' : ''}`);
           const handle = normalizeXHandle(id);
-          if (command === '/unmap') {
-            if (parts.length !== 2) throw new Error('用法：/unmap <X_ID>');
-            reply = context.store.deleteMentionMapping(handle) ? `已刪除 @${handle} 的 ID 映射。` : `@${handle} 沒有 ID 映射。`;
-          } else {
-            const patch: Partial<Record<Destination, string | null>> = {};
-            for (const arg of parts.slice(2)) {
-              const match = arg.match(/^(bluesky|sharkey|telegram)=(.+)$/i);
-              if (!match) throw new Error('格式：/map X_ID bluesky=alice.bsky.social sharkey=@alice@dvd.chat telegram=@alice_tg；可只填一個平台，平台=- 可清除。');
-              const platform = match[1]!.toLowerCase() as Destination;
-              if (Object.hasOwn(patch, platform)) throw new Error(`平台 ${platform} 重複填寫。`);
-              patch[platform] = match[2] === '-' ? null : match[2]!;
-            }
-            const updated = parts.length > 2;
-            const targets = updated ? context.store.setMentionMapping(handle, patch) : context.store.mentionMapping(handle);
-            reply = `${updated ? '已儲存 ID 映射。\n' : ''}${show(handle, targets)}${updated ? '\n只用於 X 確認的提及；不改寫已開始發布的工作。' : ''}`;
+          const patch: Partial<Record<Destination, string | null>> = {};
+          for (const arg of parts.slice(2)) {
+            const match = arg.match(/^(bluesky|sharkey|telegram)=(.+)$/i);
+            if (!match) throw new Error('格式：/map X_ID bluesky=alice.bsky.social sharkey=@alice@dvd.chat telegram=@alice_tg；平台=- 可清除。');
+            const platform = match[1]!.toLowerCase() as Destination;
+            if (Object.hasOwn(patch, platform)) throw new Error(`平台 ${platform} 重複填寫。`);
+            patch[platform] = match[2] === '-' ? null : match[2]!;
+          }
+          if (command === '/unmap') reply = context.store.deleteMentionMapping(handle) ? `已刪除 @${handle} 的 ID 映射。` : `@${handle} 沒有 ID 映射。`;
+          else {
+            const targets = parts.length > 2 ? context.store.setMentionMapping(handle, patch) : context.store.mentionMapping(handle);
+            reply = `${parts.length > 2 ? '已儲存 ID 映射。\n' : ''}${show(handle, targets)}`;
           }
         }
       } catch (error) { reply = `ID 映射未變更：${error instanceof Error ? error.message : '輸入無效'}`; }

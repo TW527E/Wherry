@@ -63,14 +63,11 @@ export function mapMentionText(body: MentionText, transform: (text: string) => s
 
 export function renderXMentions(post: SourcePost, destination: Destination, mappings: Map<string, MentionTargets>): MentionText {
   if (post.platform !== 'x' || !post.mentions?.length) return { text: cleanXLinks(post.text), mentions: [] };
-  if (!validTextMentions(post.text, post.mentions) || post.mentions.some(mention => !/^[A-Za-z0-9_]{1,15}$/.test(mention.handle))) {
-    throw new Error('X mention offsets do not match the source text');
-  }
-  const body = mapMentionText({ text: post.text, mentions: post.mentions }, cleanXLinks);
+  if (!validTextMentions(post.text, post.mentions)) throw new Error('X mention offsets do not match the source text');
   let text = '', cursor = 0;
   const mentions: TextMention[] = [];
-  for (const mention of body.mentions) {
-    text += body.text.slice(cursor, mention.start);
+  for (const mention of post.mentions) {
+    text += cleanXLinks(post.text.slice(cursor, mention.start));
     const target = mappings.get(mention.handle.toLowerCase())?.[destination];
     if (target) {
       const handle = normalizeMentionTarget(destination, target);
@@ -81,11 +78,11 @@ export function renderXMentions(post: SourcePost, destination: Destination, mapp
       // A URL needs boundaries even when the original @mention touches CJK text or punctuation.
       if (text && !/\s$/u.test(text)) text += ' ';
       text += `https://x.com/${mention.handle}`;
-      if (mention.end < body.text.length && !/^\s/u.test(body.text.slice(mention.end))) text += ' ';
+      if (mention.end < post.text.length && !/^\s/u.test(post.text.slice(mention.end))) text += ' ';
     }
     cursor = mention.end;
   }
-  return { text: text + body.text.slice(cursor), mentions };
+  return { text: text + cleanXLinks(post.text.slice(cursor)), mentions };
 }
 
 export function sliceMentions(mentions: TextMention[], start: number, end: number): TextMention[] {

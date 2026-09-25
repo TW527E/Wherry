@@ -84,7 +84,6 @@ export class Store {
     return this.transaction(() => {
       const mapping = this.setting<MentionTargets>(key, {});
       for (const [destination, value] of Object.entries(patch)) {
-        if (!['bluesky', 'sharkey', 'telegram'].includes(destination)) throw new Error('平台只能是 bluesky、sharkey 或 telegram。');
         if (value === null) delete mapping[destination as Destination];
         else if (typeof value === 'string') mapping[destination as Destination] = normalizeMentionTarget(destination, value);
         else throw new Error('平台 ID 必須是文字。');

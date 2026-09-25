@@ -545,14 +545,14 @@ export class Engine {
     if (!members.length) throw new Error('Job source not found');
     const planKey = `mention-plan:${job.id}`;
     let bodies = this.store.setting<MentionText[] | undefined>(planKey, undefined);
-    if (!bodies) {
-      // Only a mention-bearing post needs a pinned plan; without mentions the rewrite is the identity.
-      // Older partial deliveries have no plan at all; keep their original splitting on retry.
-      const convert = job.kind === 'publish' && !this.store.hasDeliveryEvidence(job.id) && members.some(post => post.mentions?.length);
+    // Pin the rewrite the first time it matters: editing a mapping between attempts must not re-split
+    // text whose earlier parts may already be delivered. A job that already delivered part of itself
+    // predates the pin, so it keeps the plain rendering rather than shifting under its own receipts.
+    if (!bodies && job.kind === 'publish' && !this.store.hasDeliveryEvidence(job.id) && members.some(post => post.mentions?.length)) {
       const mappings = this.store.mentionMappings();
-      bodies = members.map(post => convert ? renderXMentions(post, job.destination, mappings) : { text: cleanXLinks(post.text), mentions: [] });
+      bodies = members.map(post => renderXMentions(post, job.destination, mappings));
       if (job.destination === 'bluesky' && this.config.mode === 'live') await resolveBlueskyMentions(bodies, this.config.bluesky.publicUrl, this.transport);
-      if (convert) this.store.setSetting(planKey, bodies);
+      this.store.setSetting(planKey, bodies);
     }
     const output: PublishPart[] = [];
     if (job.kind === 'reminder') output.push({
@@ -576,7 +576,7 @@ export class Engine {
         ? await prepareVideo(videoAttachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)
         : undefined;
       const images = video ? [] : await prepareImages(post.attachments, this.config, this.transport);
-      const body = bodies[postIndex]!;
+      const body = bodies?.[postIndex] ?? { text: cleanXLinks(post.text), mentions: [] };
       let text = body.text;
       const mentions = body.mentions;
       if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;

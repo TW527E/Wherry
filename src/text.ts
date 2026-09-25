@@ -44,18 +44,14 @@ export function splitText(input: string, limits: TextLimits, protectedRanges: Te
   if (protectedRanges.some(range => !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
     || range.start < 0 || range.end <= range.start || range.end > input.length)) throw new Error('Invalid protected text range');
   if (fitsText(input, limits)) return [input];
-  const ranges = [...protectedRanges.map(range => ({ start: range.start, end: range.end })),
+  const ranges = [...protectedRanges,
     ...Array.from(input.matchAll(urlPattern), match => ({ start: match.index, end: match.index + match[0].length }))]
     .sort((a, b) => a.start - b.start);
-  const merged: TextRange[] = [];
-  for (const range of ranges) {
-    const previous = merged.at(-1);
-    if (previous && range.start < previous.end) previous.end = Math.max(previous.end, range.end);
-    else merged.push(range);
-  }
   const units: string[] = [];
   let cursor = 0;
-  for (const range of merged) {
+  for (const range of ranges) {
+    // An overlap means a range nested inside a wider one; the outer range already carries it whole.
+    if (range.start < cursor) continue;
     units.push(...graphemes(input.slice(cursor, range.start)));
     const unit = input.slice(range.start, range.end);
     if (!fitsText(unit, limits)) throw new Error(`A ${/^https?:\/\//i.test(unit) ? 'URL' : 'mention'} exceeds the destination text limit; manual shortening is required`);
