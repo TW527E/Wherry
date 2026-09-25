@@ -411,7 +411,8 @@ export class XCollector implements Collector {
     // The collector reuses one long-lived page. X is an SPA that does not auto-refresh, and a goto
     // to the URL it is already on can serve a stale cached timeline, so force a reload when we are
     // already there to make X refetch the current timeline every cycle.
-    const alreadyThere = page.url().startsWith(url);
+    // Only the exact profile URL may be reloaded; thread expansion leaves this page at /status/….
+    const alreadyThere = page.url() === url;
     if (alreadyThere) await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
     else await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const title = await page.title(); const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');

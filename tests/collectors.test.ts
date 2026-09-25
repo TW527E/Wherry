@@ -3,11 +3,32 @@ import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
 import { BlueskyClient } from '../src/platforms/bluesky.js';
 import { SharkeyClient } from '../src/platforms/sharkey.js';
+import { XCollector } from '../src/platforms/x.js';
+import type { Page } from 'playwright-core';
 import type { HttpResponse, Transport } from '../src/types.js';
 
 const did = 'did:web:author.example';
 const instant = '2026-09-24T00:00:00.000Z';
 const json = (value: unknown, status = 200): HttpResponse => ({ status, headers: {}, body: Buffer.from(JSON.stringify(value)) });
+
+test('X reloads only the exact Posts timeline, never a thread or Replies page', async () => {
+  const profile = 'https://x.com/TW527E';
+  const stop = new Error('Stop before reading the timeline');
+  for (const current of [profile, `${profile}/status/2101987919871557884?s=20`, `${profile}/with_replies`, `${profile}_other`, 'about:blank']) {
+    const calls: string[] = [];
+    const page = {
+      isClosed: () => false,
+      url: () => current,
+      async goto(url: string) { calls.push(`goto ${url}`); },
+      async reload() { calls.push(`reload ${current}`); },
+      async title() { throw stop; },
+    } as unknown as Page;
+    const collector = new XCollector(loadConfig({ X_HANDLE: 'TW527E' }).x);
+    collector['page'] = page;
+    await assert.rejects(() => collector.collect(), error => error === stop);
+    assert.deepEqual(calls, [current === profile ? `reload ${profile}` : `goto ${profile}`], current);
+  }
+});
 
 test('Bluesky retains rotated sessions without a persistence callback and retries with the refreshed token', async () => {
   const requests: Array<{ method: string; token?: string }> = [];
