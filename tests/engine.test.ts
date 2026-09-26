@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { Store } from '../src/store.js';
 import { Engine, collectCycle, decideMirror, exceedsXLimit, holdIsApprovable, unsupportedReason } from '../src/engine.js';
-import type { Collector, Destination, SourcePost, SourceSnapshot, Transport } from '../src/types.js';
+import type { Attachment, Collector, Destination, SourcePost, SourceSnapshot, Transport } from '../src/types.js';
 
 const base = Date.parse('2026-09-19T00:00:00.000Z');
 const at = (offsetSeconds: number): string => new Date(base + offsetSeconds * 1000).toISOString();
@@ -197,6 +197,64 @@ test('a root opens a collecting batch and nothing publishes before it settles', 
   assert.equal(store.jobs(100).length, 0);
 });
 
+/** A root post on a downstream platform, as the Bluesky collector would report it. */
+function downstream(id: string, text: string, createdAt: string): SourcePost {
+  return {
+    platform: 'bluesky', id: `at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/${id}`,
+    authorId: 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', createdAt, text, replyToId: null, replyToAuthorId: null,
+    relationKnown: true, visibility: 'public', attachments: [], metadataComplete: true,
+  };
+}
+
+test('an existing database drops the baseline history it had registered as pending mirrors', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'crosspost-prune-')), 'crosspost.sqlite');
+  const old = downstream('old', '早安', at(-30 * 86400));
+  const native = downstream('native', '剛剛在 Bluesky 發的', at(-3600));
+  const seeded = new Store(file);
+  seeded.addPost(old, 'baseline', 'first_snapshot_no_backfill', at(0));
+  seeded.addPost(native, 'ready', 'manual_x_reminder', at(0));
+  seeded.addMirror(old, at(0));    // what the old code did for the whole collected downstream history
+  seeded.addMirror(native, at(0)); // a genuine pending mirror, created alongside a manual-X reminder
+  assert.equal(seeded.mirrors(at(0)).length, 2);
+  seeded.close();
+  // Reopening runs the repair, so a database that is already live gets the fix too — not just a fresh one.
+  const reopened = new Store(file);
+  assert.deepEqual(reopened.mirrors(at(0)).map(m => m.post.text), ['剛剛在 Bluesky 發的']);
+  assert.ok(reopened.events(10).some(event => /baseline/i.test(event.message)), 'the repair is reported, not silent');
+  reopened.close();
+  // Idempotent: a second start has nothing left to remove and says nothing.
+  const again = new Store(file);
+  assert.equal(again.mirrors(at(0)).length, 1);
+  assert.equal(again.events(20).filter(event => /baseline/i.test(event.message)).length, 1);
+  again.close();
+});
+
+test('a baseline sweep of downstream history does not become pending mirror candidates', () => {
+  const store = new Store(':memory:');
+  const engine = new Engine(store, makeConfig(), transport);
+  // The first snapshot of a downstream account is the baseline, and it arrives with that account's whole
+  // recent feed — which, since X is the source, is mostly older copies of the owner's own X posts.
+  engine.ingest({ platform: 'bluesky', accountId: 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', fetchedAt: at(0), complete: true, warnings: [],
+    posts: [downstream('old', '早安', at(-30 * 86400)), downstream('fresh', '剛剛在 Bluesky 發的', at(-3600))] }, at(0));
+  const candidates = store.mirrors(at(0));
+  assert.deepEqual(candidates.map(c => c.post.text), ['剛剛在 Bluesky 發的'],
+    'only a post still inside the pending window can be awaiting a manual X copy');
+  // So a month-old downstream copy can no longer park a brand-new short X post in review. Seeding the
+  // whole history was what made almost every short post need a manual decision.
+  assert.equal(decideMirror([post({ id: '1', createdAt: at(0), text: '早安' })], candidates).state, 'none');
+});
+
+test('a downstream post already paired with an X post stops being mirror evidence', () => {
+  const store = new Store(':memory:');
+  const mirrorId = store.addMirror(downstream('native', '早安', at(-3600)), at(0));
+  const shortPost = (id: string): SourcePost[] => [post({ id, createdAt: at(0), text: '早安' })];
+  // While unclaimed it is genuine evidence: a short exact match is ambiguous, so the owner is asked.
+  assert.equal(decideMirror(shortPost('1'), store.mirrors(at(0))).state, 'review');
+  store.matchMirror(mirrorId, '12345');
+  // Once claimed by X post 12345 it cannot also be post 2's mirror, so it must stop holding batches.
+  assert.equal(decideMirror(shortPost('2'), store.mirrors(at(0))).state, 'none');
+});
+
 test('a linear self-thread inside the window joins the batch and seals after the cutoff', () => {
   const { store, engine } = setup();
   engine.ingest(snapshot([post({ id: '100', createdAt: at(10) })], at(20)), at(20));
@@ -230,6 +288,50 @@ test('late self-replies, replies to others and orphan self-replies are excluded'
   assert.equal(store.getPost('x', '202')?.classification, 'ignored');
   assert.equal(store.getPost('x', '203')?.reason, 'self_reply_outside_new_batch');
   assert.deepEqual(store.batchPosts('x:200').map(m => m.post.id), ['200']);
+});
+
+test('a self-reply whose parent was never collected is reported, not dropped in silence', () => {
+  const { store, engine } = setup();
+  engine.ingest(snapshot([
+    // A reply to someone else is recorded but never batched, so replying to IT is a decision, not a gap.
+    post({ id: '901', createdAt: at(10), replyToId: '800', replyToAuthorId: 'someone-else' }),
+    post({ id: '902', createdAt: at(20), replyToId: '901', replyToAuthorId: 'owner' }),
+    // 999 was never collected at all; this continuation used to vanish without a single word anywhere.
+    post({ id: '903', createdAt: at(30), replyToId: '999', replyToAuthorId: 'owner' }),
+  ], at(100)), at(100));
+  assert.equal(store.getPost('x', '902')?.reason, 'self_reply_outside_new_batch');
+  assert.equal(store.getPost('x', '903')?.reason, 'self_reply_outside_new_batch');
+  const gaps = store.events(50).filter(event => event.level === 'warn' && /never collected/.test(event.message));
+  assert.equal(gaps.length, 1, 'only the genuinely uncollected parent is reported');
+  assert.match(gaps[0]!.message, /903/);
+  assert.match(gaps[0]!.message, /999/);
+});
+
+test('untrusted media locations are rejected at the API boundary, not mid-publish', () => {
+  const { engine } = setup();
+  // zod's .url() accepts any scheme, so these used to be stored and only rejected once the worker was
+  // already delivering — a failed job with a transport error instead of a clean refusal up front.
+  for (const attachment of [
+    { kind: 'image', url: 'javascript:alert(1)' },
+    { kind: 'image', url: 'file:///etc/passwd' },
+    { kind: 'image', path: '../../../etc/passwd' },
+  ]) {
+    assert.throws(() => engine.schedule({ text: 'hi', attachments: [attachment] as never, dueAt: at(3600) }, at(0)), JSON.stringify(attachment));
+  }
+  const id = engine.schedule({ text: 'hi', attachments: [{ kind: 'image', url: 'https://example.com/a.jpg', alt: '' }], dueAt: at(3600) }, at(0));
+  assert.match(id, /^local:/);
+});
+
+test('a held X video names the reason that actually applies', () => {
+  const video = (extra: Partial<Attachment>): SourcePost => post({ id: '1', createdAt: at(0), attachments: [{ kind: 'video', alt: '', ...extra }] });
+  const mp4 = 'https://video.twimg.com/amplify_video/1/vid/a.mp4';
+  assert.equal(unsupportedReason(video({ url: mp4 }), false), 'video_sync_disabled');
+  // An X GIF renders as a <video> too; publishing it as one would silently change the content.
+  assert.equal(unsupportedReason(video({ url: mp4, animated: true }), true), 'animated_video_not_supported');
+  // prepareVideo enforces the same ceiling, but only after the bytes are already downloaded.
+  assert.equal(unsupportedReason(video({ url: mp4, durationSeconds: 141 }), true), 'video_exceeds_duration_limit');
+  assert.equal(unsupportedReason(video({}), true), 'x_video_has_no_downloadable_source');
+  assert.equal(unsupportedReason(video({ url: mp4, durationSeconds: 140 }), true), undefined);
 });
 
 test('a branching thread is held for review rather than flattened', () => {

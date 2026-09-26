@@ -174,11 +174,13 @@ X 貼文 tag 的 `@帳號` 到了 Bluesky／Sharkey／Telegram 不一定存在�
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
-| `VIDEO_ENABLED` | `false` | 設 true 後，單一且有可讀取來源的影片會轉成 MP4，再交給下游 publisher。GIF、混合附件與無直接來源的 X 影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
+| `VIDEO_ENABLED` | `false` | 設 true 後，單一且解析得到可下載來源的影片會轉成 MP4，再交給下游 publisher。開啟時每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（公開嵌入端點）取 MP4。GIF、混合附件、只有 HLS 沒有 MP4、超過 140 秒的影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
 | `FFMPEG_PATH` | `ffmpeg` | 轉碼程式名（由 `PATH` 搜尋）或執行檔路徑；不是 shell 命令或額外參數欄位。 | 從系統套件管理器安裝 FFmpeg，確認包含 H.264／AAC 編碼器。 |
 | `FFPROBE_PATH` | `ffprobe` | 探測影片資訊的程式名或執行檔路徑。一般文字與靜態圖片同步不會呼叫。 | 通常隨 FFmpeg 套件提供；自行確認實際安裝路徑。 |
 
-影片管線已接入 Engine 與 Bluesky／Sharkey／Telegram。輸入必須是可下載的自含媒體檔，或位於 `DATA_DIR/media` 內的本機檔案，並受 `MAX_DOWNLOAD_BYTES` 限制；不接受播放清單另開網路或其他本機檔案。輸出保留比例、最長邊不超過 1280、30 fps、H.264／AAC、最長 140 秒。Bluesky 使用專用影片服務。X collector 目前不提供直接影片來源，因此 X 影片仍會被保留；真實平台配額與上傳能力需另行驗證。
+影片管線已接入 Engine 與 Bluesky／Sharkey／Telegram。輸入必須是可下載的自含媒體檔，或位於 `DATA_DIR/media` 內的本機檔案，並受 `MAX_DOWNLOAD_BYTES` 限制；不接受播放清單另開網路或其他本機檔案。輸出保留比例、最長邊不超過 1280、30 fps、H.264／AAC、最長 140 秒。Bluesky 使用專用影片服務。
+
+X 的影片來源由公開嵌入端點 `cdn.syndication.twimg.com/tweet-result` 解析：X 自己的播放器串 `blob:` 的 HLS，頁面裡沒有可下載的 URL，該端點則會回傳同一則推文的漸進式 MP4 各畫質版本。程式挑「估算大小仍塞得進 `MAX_DOWNLOAD_BYTES` 的最高 bitrate」——X 最高給到 4K（單支可達數百 MB），而管線無論如何都會重新編碼到最長邊 1280，取最大版本只是白花下載預算。這個端點未公開文件化，行為可能隨時改變；解析不到任何 MP4 時（推文已刪、受保護、回應格式改變、或只有 HLS）影片就照舊保留為 `x_video_has_no_downloadable_source`，不會誤發。保留理由另有 `animated_video_not_supported`（GIF 在 X 上也是 `<video>`）與 `video_exceeds_duration_limit`（超過 140 秒，在下載前就判定）。真實平台配額與上傳能力需另行驗證。
 
 <a id="credentials"></a>
 ## 官方憑證與帳號資料取得
@@ -336,6 +338,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | `Incomplete snapshot`／backlog 超出預算 | 結構性失敗不推進檢查點。X 若提供已解析的最舊時間，會推進至該時間並警告可能漏掉更早内容；可在上限內調整 `X_MAX_PAGES`。B/S 超出頁數仍保留檢查點。不要清空狀態來隱藏缺口。 |
 | X 批次停在 `open` | 檢查窗口、settle 時間與來源新鮮度。從未成功觀察的來源仍會阻止封存；下游連續失敗三次後可使用舊鏡像資料並記警告，X 本身的新鮮度不放寬。 |
 | 批次或工作停在 `review` | 先看原因；疑似鏡像或長文要人工決定，非公開／不完整或不支援媒體不能用 approve 強行放行。敏感標記本身不再保留；無其他問題時會帶警告同步。 |
+| 短貼文一直被判 `possible_manual_mirror` 要人工審核 | 只有仍在 72 小時窗內、且尚未配對的下游原生貼文才是鏡像候選；基準快照掃進來的下游歷史不算。若仍頻繁發生，代表確實有近期的下游原生貼文文字相同——文字完全相同但長度不足 20 個字元時，工具刻意問你而不自動吞掉（見 [防回音](../README.md#同步規則)）。中文貼文很容易低於 20 字元，這個門檻是為拉丁字母校準的。 |
 | 401／403／Sharkey `read:account` 不足 | 核對同帳戶的憑證與實例；Sharkey 優先填自己的 username 或 user ID，若採 `/api/i` 才另外需要 read scope。不要把 token 或完整回應貼到 issue。 |
 | Telegram 不回指令／按鈕沒反應 | 需 live、enabled、token、`TELEGRAM_POLL_COMMANDS=true`，且 owner/private chat 都正確；先 `/start`，檢查是否另有 poller／webhook。preview 不會回應。 |
 | Telegram 沒有告警 | 需 live 及可用 Telegram 設定；自動告警一律送 private chat。只轉送新 `error` 事件，並非所有訊息；pollCommands=false 仍可發告警。 |
@@ -343,7 +346,8 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | `/session` 被拒絕 | 核對 owner/private chat、live、輪詢、X enabled、明確的 `/session` 指令／caption、本工具匯出格式與 256 KiB 上限；勿反覆把登入檔傳到其他 chat。 |
 | `unknown` 或送出後連線中斷 | 先人工確認遠端是否已有內容並處理對帳。`/retry`、`/resync`、CLI retry 都不是強制重送 unknown 的後門，不能靠重啟解決。 |
 | 429／暫時失敗 | 已確認安全重試的工作會按伺服器延遲／退避處理，至 `MAX_ATTEMPTS` 上限；不要密集手動重試。送出結果不明則另走對帳。 |
-| 影片／GIF／超過四張圖不發布 | 靜態圖片最多四張。影片需 `VIDEO_ENABLED=true`、FFmpeg 與直接媒體來源；X 影片無直接來源時仍保留，GIF 不支援。 |
+| 影片／GIF／超過四張圖不發布 | 靜態圖片最多四張。影片需 `VIDEO_ENABLED=true`、FFmpeg，且嵌入端點解析得到 MP4；解析不到、只有 HLS、超過 140 秒或是 GIF 都會保留，理由寫在事件與網頁的貼文列表裡。 |
+| 想知道某則為什麼沒同步 | 看網頁介面的「最近讀到的貼文」，每則都列出分類與原因；`self_reply_outside_new_batch` 若伴隨 `never collected` 的 warn 事件，代表上一則沒被收集到（可提高 `X_MAX_PAGES` 或縮短 `POLL_SECONDS`）。 |
 | 外部 URL 被拒絕 | API／媒體通道會拒絕私有、loopback、保留／metadata 位址、不允許的埠與不安全重導向。先核對服務 URL，不要停用防護或嵌入帳密。 |
 | Web 寫入回 401 | 設 token 後須在 UI 填入相同值；未設 token 的 loopback 仍要求 JSON／同來源。不要為了方便把服務直接公開。 |
 | 已有服務時 CLI 回報資料目錄正在使用 | 這是避免兩個 worker／recovery 同時改寫狀態的保護。用現有 Web／Telegram 介面，或停止服務後再執行維護命令；不要刪鎖硬闖。 |

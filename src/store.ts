@@ -8,6 +8,13 @@ import type { Batch, Classification, Destination, EventRecord, Job, JobState, Re
 
 type Row = Record<string, unknown>;
 const decode = <T>(value: unknown): T => JSON.parse(String(value)) as T;
+/**
+ * How long a downstream post stays a *pending* mirror — the window in which the owner might still be
+ * manually copying it to X. `mirrors()` keeps returning it for a further 7 days as weaker fuzzy
+ * evidence, but only an unexpired candidate can produce a conclusive automatic match.
+ */
+export const MIRROR_PENDING_MS = 72 * 3600_000;
+
 const schema = [
   'PRAGMA journal_mode=WAL', 'PRAGMA foreign_keys=ON', 'PRAGMA busy_timeout=5000',
   'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
@@ -42,7 +49,25 @@ export class Store {
       });
     }
     this.db.prepare('INSERT OR IGNORE INTO manual_x_links SELECT id,matched_x_id FROM mirrors WHERE matched_x_id IS NOT NULL').run();
+    this.pruneBaselineMirrors();
     if (path !== ':memory:') chmodSync(path, 0o600);
+  }
+  /**
+   * One-off repair for databases filled before a baseline sweep stopped registering pending mirrors.
+   * The first snapshot of a downstream account carries that account's whole recent feed, and every root
+   * in it used to be recorded as a pending mirror — meaning "the owner may still be copying this to X by
+   * hand". For months-old history that is never true, so those rows could only ever park new X posts in
+   * mirror_review. Deleting them is what makes the fix apply to a database that is already running, not
+   * just to a fresh one.
+   *
+   * Scoped to `pending` on purpose: a `matched` mirror records a confirmed pairing and is referenced by
+   * manual_x_links, so it must survive (and the filter is also what keeps this from breaking that key).
+   */
+  private pruneBaselineMirrors(): void {
+    const removed = Number(this.db.prepare(
+      "DELETE FROM mirrors WHERE state='pending' AND post_key IN (SELECT key FROM posts WHERE classification='baseline')",
+    ).run().changes);
+    if (removed) this.event('info', `Dropped ${removed} baseline history posts that had been registered as pending manual mirrors; they could only hold new X posts for review`);
   }
   acquireRuntimeLock(): () => void {
     const token = randomUUID();
@@ -145,7 +170,7 @@ export class Store {
   addMirror(post: SourcePost, now: string): string {
     const key = Store.postKey(post.platform, post.id);
     const id = `mirror:${key}`;
-    this.db.prepare('INSERT OR IGNORE INTO mirrors(id,post_key,payload,expires_at) VALUES(?,?,?,?)').run(id, key, JSON.stringify(post), new Date(Date.parse(now) + 72 * 3600_000).toISOString());
+    this.db.prepare('INSERT OR IGNORE INTO mirrors(id,post_key,payload,expires_at) VALUES(?,?,?,?)').run(id, key, JSON.stringify(post), new Date(Date.parse(now) + MIRROR_PENDING_MS).toISOString());
     return id;
   }
   mirrors(now: string): Array<{ id: string; post: SourcePost; expired: boolean; state: string }> {

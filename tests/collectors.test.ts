@@ -30,6 +30,37 @@ test('X reloads only the exact Posts timeline, never a thread or Replies page', 
   }
 });
 
+test('the X video lookup asks syndication once per tweet, skips it when video is off, and degrades to held', async () => {
+  const xConfig = (): ReturnType<typeof loadConfig>['x'] => loadConfig({ X_HANDLE: 'TW527E' }).x;
+  const media = { video: true, maxDownloadBytes: 20_000_000 };
+  const mp4 = 'https://video.twimg.com/amplify_video/1/vid/a.mp4';
+  const payload = { mediaDetails: [{ type: 'video', video_info: { duration_millis: 10_000,
+    variants: [{ content_type: 'video/mp4', bitrate: 800_000, url: mp4 }] } }] };
+  const calls: string[] = [];
+  const collector = new XCollector(xConfig(), { async request(url) { calls.push(url); return json(payload); } }, media);
+  assert.equal((await collector['resolveVideo']('123'))?.url, mp4);
+  await collector['resolveVideo']('123');
+  assert.equal(calls.length, 1, 'the answer is cached per tweet id, not re-fetched on every scan');
+  // A wrong parameter name here would 404 every lookup and be indistinguishable from "no video source".
+  assert.match(calls[0]!, /^https:\/\/cdn\.syndication\.twimg\.com\/tweet-result\?id=123&token=[0-9a-z]+&lang=en$/);
+
+  // With video sync off the post is held as video_sync_disabled regardless, so nothing is requested.
+  const off = new XCollector(xConfig(), { async request(url) { calls.push(url); return json(payload); } }, { ...media, video: false });
+  assert.equal(await off['resolveVideo']('456'), undefined);
+  assert.equal(calls.length, 1);
+
+  // Every failure path must land on "no source", which is the behaviour that existed before this lookup.
+  const failing: Transport[] = [
+    { async request() { return json({ error: 'gone' }, 404); } },
+    { async request() { return json({ mediaDetails: [{ type: 'photo' }] }); } },
+    { async request() { return { status: 200, headers: {}, body: Buffer.from('not json') }; } },
+    { async request() { throw new Error('offline'); } },
+  ];
+  for (const transport of failing) {
+    assert.equal(await new XCollector(xConfig(), transport, media)['resolveVideo']('789'), undefined);
+  }
+});
+
 test('Bluesky retains rotated sessions without a persistence callback and retries with the refreshed token', async () => {
   const requests: Array<{ method: string; token?: string }> = [];
   let loginCalls = 0, refreshCalls = 0, createCalls = 0;

@@ -2,27 +2,35 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import twitterText from 'twitter-text';
 import type { AppConfig } from './config.js';
-import { Store } from './store.js';
+import { Store, MIRROR_PENDING_MS } from './store.js';
 import { BLUESKY_SENSITIVE_LABELS, contentWarning, isSensitiveContent, warningPrefix } from './content-warning.js';
 import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
 import { prepareImages } from './media.js';
-import { prepareVideo } from './video.js';
+import { prepareVideo, MAX_VIDEO_SECONDS } from './video.js';
 import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, TextRange, Transport } from './types.js';
 
+// Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
+// output is re-validated on the way in. zod's `.url()` accepts ANY scheme, so `javascript:` and
+// `file:` used to be stored and only rejected mid-publish by the transport — as a failed job with a
+// confusing message instead of a clean rejection. The loaders remain the authoritative check; these
+// two just stop the bad value from entering the database at all.
+const mediaUrl = z.string().url().refine(value => /^https?:\/\//i.test(value), 'Media URLs must be http(s)');
+const mediaPath = z.string().refine(value => !value.split(/[\\/]/).includes('..'), 'Media paths must not traverse');
 const attachmentSchema = z.object({
-  kind: z.enum(['image', 'video', 'audio', 'unknown']), url: z.string().url().optional(), path: z.string().optional(),
+  kind: z.enum(['image', 'video', 'audio', 'unknown']), url: mediaUrl.optional(), path: mediaPath.optional(),
   mimeType: z.string().optional(), alt: z.string().default(''), sha256: z.string().optional(),
-  width: z.number().positive().optional(), height: z.number().positive().optional(), size: z.number().nonnegative().optional(), animated: z.boolean().optional(),
+  width: z.number().positive().optional(), height: z.number().positive().optional(), size: z.number().nonnegative().optional(),
+  animated: z.boolean().optional(), durationSeconds: z.number().positive().optional(),
 });
 export const sourcePostSchema = z.object({
   platform: z.enum(['x', 'bluesky', 'sharkey', 'local']), id: z.string().min(1), authorId: z.string().min(1),
   createdAt: z.string().datetime(), text: z.string().max(100_000), url: z.string().url().optional(), rootId: z.string().optional(),
   mentions: z.array(z.object({ handle: z.string().regex(/^[A-Za-z0-9_]{1,15}$/), start: z.number().int().nonnegative(), end: z.number().int().positive() })).max(1000).optional(),
   replyToId: z.string().nullable().optional(), replyToAuthorId: z.string().nullable().optional(), relationKnown: z.boolean(),
-  visibility: z.enum(['public', 'restricted', 'unknown']), repost: z.boolean().optional(), quoteUrl: z.string().optional(), poll: z.boolean().optional(),
+  visibility: z.enum(['public', 'restricted', 'unknown']), repost: z.boolean().optional(), quoteUrl: mediaUrl.optional(), poll: z.boolean().optional(),
   pollData: pollSnapshotSchema.optional(),
   cw: z.string().optional(), sensitive: z.boolean().optional(), sensitiveLabels: z.array(z.enum(BLUESKY_SENSITIVE_LABELS)).max(4).optional(),
   attachments: z.array(attachmentSchema).max(100), metadataComplete: z.boolean(),
@@ -90,10 +98,17 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
   const video = post.attachments.find(a => a.kind === 'video');
   if (video) {
     // A single video only, never mixed with images, and only when the operator opted in. An X video is
-    // an HLS stream behind a blob: URL with no direct download, so the collector records it with neither
-    // url nor path; such a post is held with a clear reason instead of being force-published text-only.
+    // an HLS stream behind a blob: URL, so the collector resolves a progressive MP4 through the public
+    // syndication endpoint; when that yields nothing the attachment arrives with neither url nor path
+    // and the post is held with a clear reason instead of being force-published text-only.
     if (!videoEnabled) return 'video_sync_disabled';
     if (post.attachments.length > 1) return 'video_must_be_the_only_attachment';
+    // An X animated GIF also renders as a <video>; this project publishes no animations, so holding it
+    // here keeps it from being silently transcoded into one.
+    if (video.animated) return 'animated_video_not_supported';
+    // Reject an over-length source before spending the download budget on it. prepareVideo enforces the
+    // same ceiling, but only once the bytes are already on disk.
+    if (video.durationSeconds !== undefined && video.durationSeconds > MAX_VIDEO_SECONDS) return 'video_exceeds_duration_limit';
     if (!video.url && !video.path) return 'x_video_has_no_downloadable_source';
   } else if (post.attachments.some(a => a.kind !== 'image' || a.animated)) {
     return 'only_static_images_or_video';
@@ -128,6 +143,10 @@ export function decideMirror(posts: SourcePost[], candidates: ReturnType<Store['
   const exact: string[] = [];
   let possible = false;
   for (const candidate of candidates) {
+    // A downstream post already paired with an X post has done its job: one downstream post can be the
+    // manual copy of at most one X post, so it is accounted for and cannot be evidence about a different
+    // batch. Leaving it in only produced review noise on every later post that happened to resemble it.
+    if (candidate.state !== 'pending') continue;
     const expected = normalizeText(candidate.post.text);
     const textEqual = expected === text || expected === spaced;
     const mediaMatch = compatibleMedia(candidate.post.attachments, media);
@@ -183,7 +202,14 @@ export class Engine {
         if (this.store.getPost(post.platform, post.id)) continue;
         if (!baselineAt || post.createdAt <= baselineAt) {
           if (this.store.addPost(post, 'baseline', 'first_snapshot_no_backfill', now)) added++;
-          if (post.platform !== 'x' && post.replyToId === null && !post.repost && !post.quoteUrl && post.visibility === 'public') this.store.addMirror(post, now);
+          // A baseline snapshot is history we deliberately never backfill, and it arrives with the
+          // account's whole recent feed (up to 300 notes per platform). Registering ALL of it as pending
+          // mirrors made anti-echo compare every new X post against months of the owner's own older
+          // downstream copies — so almost any short post resembled something and was parked in
+          // mirror_review. A pending mirror means "the owner may still be copying this to X by hand",
+          // which only a post inside that window can be; older history is not evidence of anything.
+          if (post.platform !== 'x' && post.replyToId === null && !post.repost && !post.quoteUrl && post.visibility === 'public'
+            && Date.parse(now) - Date.parse(post.createdAt) < MIRROR_PENDING_MS) this.store.addMirror(post, now);
           continue;
         }
         if (Date.parse(post.createdAt) > Date.parse(snapshot.fetchedAt) + 60_000) {
@@ -255,7 +281,15 @@ export class Engine {
     }
     const parent = this.store.getPost('x', post.replyToId);
     const batch = parent?.batchId ? this.store.getBatch(parent.batchId) : undefined;
-    if (!batch || !parent) { this.store.addPost(post, 'ignored', 'self_reply_outside_new_batch', now); return; }
+    if (!batch || !parent) {
+      this.store.addPost(post, 'ignored', 'self_reply_outside_new_batch', now);
+      // A parent we DID collect and deliberately left unbatched (a baseline post, or a thread already
+      // synced) is a decision, so it needs no notice. A parent we never collected at all is a coverage
+      // gap that would otherwise drop this reply without a word, so say so once — `warn` rather than
+      // `error` because there is nothing to action beyond posting it manually or scanning more often.
+      if (!parent) this.store.event('warn', `X self-reply ${post.id} continues ${post.replyToId}, which was never collected; not synced (raise X_MAX_PAGES or scan more often)`, Store.postKey('x', post.id));
+      return;
+    }
     if (batch.state !== 'open' || post.createdAt > batch.cutoffAt || post.createdAt < parent.post.createdAt) {
       this.store.addPost(post, 'ignored', 'skipped_late_self_reply', now); return;
     }

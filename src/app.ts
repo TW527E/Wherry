@@ -46,7 +46,7 @@ export function createRuntime(config = loadConfig()): Runtime {
   const live = config.mode === 'live';
   // Collection is read-only and safe; it runs in every mode so preview can show what WOULD be synced.
   // Only the publish step differs: live uses the real clients, preview swaps in stubs.
-  if (config.x.enabled) collectors.push(new XCollector(config.x, transport));
+  if (config.x.enabled) collectors.push(new XCollector(config.x, transport, { video: config.media.video, maxDownloadBytes: config.maxDownloadBytes }));
   if (config.bluesky.enabled && config.bluesky.identifier && config.bluesky.appPassword) {
     const client = new BlueskyClient(config.bluesky, transport); collectors.push(client);
     if (live) publishers.set('bluesky', client);
@@ -404,8 +404,8 @@ button:disabled{opacity:.5;cursor:default}
 .batch,.job{border:1px solid var(--line);border-radius:10px;padding:.7rem .9rem;margin:.5rem 0}
 .batch .meta,.job .meta{color:var(--muted);font-size:.82rem;word-break:break-all}
 .state{font-size:.75rem;font-weight:700;padding:.15rem .5rem;border-radius:6px;background:#eff3f4;color:#0f1419}
-.state.review,.state.failed{background:#fde8e8;color:var(--err)}.state.open{background:#fff4d6;color:#7a5b00}
-.state.succeeded,.state.sealed{background:#d7f5ea;color:#00734d}
+.state.review,.state.failed,.state.unsupported,.state.mirror_review{background:#fde8e8;color:var(--err)}.state.open,.state.collecting{background:#fff4d6;color:#7a5b00}
+.state.succeeded,.state.sealed,.state.ready{background:#d7f5ea;color:#00734d}
 input,textarea{font:inherit;width:100%;padding:.5rem;border:1px solid var(--line);border-radius:8px}
 label{display:block;font-size:.85rem;color:var(--muted);margin:.4rem 0 .15rem}
 pre{background:#f7f9f9;border:1px solid var(--line);padding:.75rem;border-radius:8px;overflow:auto;font-size:.8rem;max-height:280px}
@@ -424,6 +424,7 @@ pre{background:#f7f9f9;border:1px solid var(--line);padding:.75rem;border-radius
 <label>內容</label><textarea id="s-text" rows="3" placeholder="要排程同步到下游的文字"></textarea>
 <div class="row" style="margin-top:.6rem"><button class="ok" onclick="schedule(this)">建立排程</button></div></div>
 <div class="card"><h2>工作佇列</h2><div id="jobs"><div class="empty">載入中…</div></div></div>
+<div class="card"><h2>最近讀到的貼文</h2><div class="meta" style="color:var(--muted);font-size:.82rem;margin-bottom:.4rem">每則的分類與原因；沒有同步的貼文為什麼沒同步，看這裡。</div><div id="posts"><div class="empty">載入中…</div></div></div>
 <div class="card"><h2>近期事件</h2><div id="events"></div></div>
 </main><div id="toast" class="toast"></div>
 <script>
@@ -438,12 +439,15 @@ async function schedule(btn){const text=$('#s-text').value.trim();if(!text){toas
 function batchCard(b){const acts=(b.state==='review'||b.state==='open')?'<button class="ok" onclick="act(\\'approve\\',\\''+b.id+'\\',this)">批准發布</button> <button class="ghost" onclick="act(\\'skip\\',\\''+b.id+'\\',this)">略過</button> <button class="warn" onclick="act(\\'mirror\\',\\''+b.id+'\\',this)">標記為我手動鏡像</button>':'<span class="meta">此批次已處理，無可用操作</span>';
 return '<div class="batch"><div class="row"><span class="state '+esc(b.state)+'">'+esc(b.state)+'</span><b>'+esc(b.id)+'</b></div><div class="meta">原因：'+esc(b.reason)+' · root '+esc(b.rootId)+' · '+esc(b.rootCreatedAt)+'</div><div class="row" style="margin-top:.5rem">'+acts+'</div></div>'}
 function jobCard(j){const canRetry=(j.state==='failed'||j.state==='review');const canReconcile=(j.state==='unknown');return '<div class="job"><div class="row"><span class="state '+esc(j.state)+'">'+esc(j.state)+'</span><b>'+esc(j.destination)+'</b><span class="meta">'+esc(j.aggregateId)+'</span></div>'+(j.error?'<div class="meta">錯誤：'+esc(j.error)+'</div>':'')+(canRetry?'<div class="row" style="margin-top:.5rem"><button class="ghost" onclick="act(\\'retry\\',\\''+j.id+'\\',this)">重試</button></div>':'')+(canReconcile?'<div class="row" style="margin-top:.5rem"><button class="warn" onclick="if(confirm(\\'請先到該平台確認這則沒有成功發出（沒有重複貼文），再繼續。確定重新發送未確認的部分？\\'))act(\\'reconcile\\',\\''+j.id+'\\',this)">已確認遠端、重新發送</button></div>':'')+'</div>'}
+function postCard(p){return '<div class="job"><div class="row"><span class="state '+esc(p.classification)+'">'+esc(p.classification)+'</span><b>'+esc(p.post.platform)+'</b><span class="meta">'+esc(p.post.id)+'</span></div><div class="meta">原因：'+esc(p.reason)+(p.batchId?' · 批次 '+esc(p.batchId):'')+' · '+esc(p.post.createdAt)+'</div>'+(p.post.text?'<div class="meta">'+esc(p.post.text.slice(0,140))+'</div>':'')+'</div>'}
 async function load(){try{const s=await fetch('/api/status').then(r=>r.json());
 const mode=$('#mode');mode.textContent='模式：'+s.mode;mode.className='pill '+(s.mode==='live'?'live':'preview');
 $('#xsess').textContent='X session：'+(s.xSession||'unknown');
 const held=(s.batches||[]).filter(b=>b.state==='review'||b.state==='open');
 $('#batches').innerHTML=held.length?held.map(batchCard).join(''):'<div class="empty">目前沒有待處理批次。新內容會出現在這裡供你批准／略過。</div>';
 const jobs=(s.jobs||[]);$('#jobs').innerHTML=jobs.length?jobs.slice(0,40).map(jobCard).join(''):'<div class="empty">佇列是空的。</div>';
+const posts=await fetch('/api/posts').then(r=>r.json()).catch(()=>[]);
+$('#posts').innerHTML=posts.length?posts.slice(0,40).map(postCard).join(''):'<div class="empty">尚未讀到任何貼文。</div>';
 $('#events').innerHTML=(s.events||[]).slice(0,20).map(e=>'<div class="evt '+esc(e.level)+'">['+esc(e.level)+'] '+esc(e.at)+' — '+esc(e.message)+'</div>').join('')||'<div class="empty">尚無事件。</div>';
 }catch(e){toast('讀取失敗：'+e.message)}}
 load();setInterval(load,5000)

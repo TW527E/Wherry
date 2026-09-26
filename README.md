@@ -36,6 +36,8 @@ X 官方 Automation Rules 明文禁止 `scripting the X website`，並寫明這*
 
 這個工具只讀你自己的個人頁、不做任何互動、低頻輪詢，但仍屬該條款描述的技術。風險由你承擔，請自行判斷是否要在有價值的帳號上啟用。若不啟用 X 讀取（`X_ENABLED=false`），其他功能仍可運作（例如只用排程發布與 B/D → 手動 X 提醒）。
 
+另外，`VIDEO_ENABLED=true` 時，每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（驅動網頁嵌入推文的公開端點），用來取得可下載的 MP4——X 自己的播放器只給 `blob:` 的 HLS，頁面裡沒有能下載的來源。這是唯讀、無認證的請求，仍然是對 X 基礎設施的請求，一併納入你的風險判斷。不開影片同步就完全不會發出這個請求。
+
 ---
 
 ## 快速開始
@@ -151,7 +153,9 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | 晚發的自回覆（超過 root 窗口） | `skipped_late_self_reply` |
 | 回覆一串早已同步完成的舊推文 | `self_reply_outside_new_batch` |
 | 串文分支（非線性） | 保留待審，不強行攤平 |
-| 轉貼、引用、非公開、影片、GIF、超過 4 張圖 | 保留或忽略，不會靜默降級 |
+| 轉貼、引用、非公開、GIF、超過 4 張圖 | 保留或忽略，不會靜默降級 |
+| 影片 | `VIDEO_ENABLED=true` 且解析得到可下載 MP4、長度在 140 秒內才同步；否則保留並說明理由 |
+| 自回覆的上一則從未被收集到 | 忽略（`self_reply_outside_new_batch`），並記一筆 `warn` 事件說明是收集缺口，不會無聲消失 |
 | 投票 | Sharkey／Telegram 各建獨立原生投票、Bluesky 文字呈現；資料不完整／已過期／敏感的投票才保留 |
 | 敏感內容（你標了敏感的媒體、來源端的 CW） | 照常同步：Bluesky 每段 selfLabels＋CW 文字、Sharkey 每段 CW＋敏感檔案、Telegram 正文與媒體 spoiler |
 | 你手動貼到 X 的鏡像 | `manual_mirror`，不同步 |
@@ -170,6 +174,8 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 ### 防回音怎麼判斷
 
 工具在 Bluesky／dvd.chat 發原生貼文時，**先寫入資料庫才發 Telegram 提醒**，並建立一筆 pending mirror（文字指紋＋媒體指紋，72 小時）。
+
+只有「**你可能還在手動搬到 X**」的下游貼文才算候選：第一次掃描下游帳號時掃進來的歷史（基準快照，本來就不回填）**不會**被當成 pending mirror，只有仍在 72 小時窗內的才會；已經配對到某則 X 貼文的鏡像也會退出比對，不會再攔下別的批次。少了這兩道，防回音會拿你幾個月前的下游舊文去比對每一則新推文，短貼文幾乎必然「像某一則」而被攔下來要你審核。
 
 當 X 出現新批次時：
 
@@ -205,7 +211,7 @@ SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取�
 
 - 預設只支援**靜態圖片**，每篇最多 4 張。
 - 依各平台限制自動壓縮（Bluesky 上限 2 MB），會先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
-- 動畫 GIF／APNG 不處理。單一影片可選用轉碼管線，限制見 [設定文件](docs/configuration.md#video)；X 無直接來源的影片仍保留。
+- 動畫 GIF／APNG 不處理。單一影片在 `VIDEO_ENABLED=true` 時會轉碼後同步，X 的來源由公開嵌入端點解析出可下載的 MP4（挑選能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質），限制見 [設定文件](docs/configuration.md#video)。
 - API、媒體下載與上傳經過受保護的 HTTP 通道；本機圖片與影片皆限於 `DATA_DIR/media`。
 
 ### 對外請求的安全邊界
@@ -289,8 +295,8 @@ X_BROWSER=chrome npm run cli -- doctor   # 顯示實際偵測到的瀏覽器
 - **X 讀取的選擇器可能隨 X 前端改版失效。** 解析失敗時會保留檢查點並回報錯誤，不會誤判成「沒有新內容」。
 - **Telegram 頻道內的回覆呈現**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際外觀需在你的頻道上驗證一次。
 - **dvd.chat 的實際可用上傳上限**由實例與角色政策決定，程式不寫死數字，以伺服器回應為準。
-- **影片轉碼為選用功能**：`VIDEO_ENABLED=true` 且有直接可讀取來源時，可經 FFmpeg 轉碼後交給下游；X collector 目前無直接影片來源，仍保留。GIF、純音訊、Quote 原生互動仍未支援。
-- Web UI 已提供文字排程表單；批次編輯仍未實作。
+- **影片轉碼為選用功能**：`VIDEO_ENABLED=true` 時，含影片的推文會先向公開嵌入端點取一個可下載的 MP4，再經 FFmpeg 轉碼交給下游。解析失敗（推文已刪、受保護、或 X 改了回應格式）就退回保留，理由是 `x_video_has_no_downloadable_source`；只有 HLS 沒有 MP4 的影片同樣保留。超過 140 秒會在下載前就以 `video_exceeds_duration_limit` 保留。GIF（在 X 上也是 `<video>`）以 `animated_video_not_supported` 保留，純音訊、圖片影片混合、Quote 原生互動仍未支援。
+- Web UI 已提供文字排程表單與「最近讀到的貼文」列表（每則的分類與原因）；排程附件與批次編輯仍未實作。
 
 ---
 

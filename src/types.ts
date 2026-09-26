@@ -15,6 +15,8 @@ export interface Attachment {
   height?: number;
   size?: number;
   animated?: boolean;
+  /** Source duration for video, so an over-length clip is held before its bytes are downloaded. */
+  durationSeconds?: number;
 }
 
 export interface PollOption {

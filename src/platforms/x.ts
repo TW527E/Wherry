@@ -5,6 +5,7 @@ import type { AppConfig } from '../config.js';
 import { mapMentionText, type MentionText } from '../mentions.js';
 import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, TextMention, Transport } from '../types.js';
 import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
+import { object, positiveInteger } from './parse.js';
 import { resolveBrowserPlan, verifyBrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
 
@@ -70,6 +71,60 @@ export function hasSensitiveWarning(chromeText: string): boolean {
     || /(?:sensitive content|sensitive material|敏感內容|敏感媒材)/i.test(chromeText);
 }
 const allowedHosts = new Set(['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'twimg.com', 'pbs.twimg.com', 'video.twimg.com']);
+
+// X's own player streams HLS from a `blob:` URL, so nothing in the rendered page is downloadable and a
+// video post used to be held forever as "no downloadable source". The public syndication endpoint that
+// powers embedded tweets returns progressive MP4 renditions of the same tweet, so a video post asks it
+// once for a direct source. Best effort by design: every failure path leaves the attachment with no
+// url, which is the exact state it replaces, so a broken lookup can never publish the wrong thing.
+// ponytail: undocumented embed endpoint, one request per video tweet. If X drops the MP4 renditions
+// this degrades to held-again, and the replacement would be an HLS fetch plus remux — far larger.
+const SYNDICATION_ENDPOINT = 'https://cdn.syndication.twimg.com/tweet-result';
+
+/** The token the embed endpoint expects: base36 of the tweet id scaled by pi, with 0s and the dot cut. */
+export function syndicationToken(id: string): string {
+  return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+export interface XVideoSource { url?: string; durationSeconds?: number; width?: number; height?: number; animated: boolean }
+
+/**
+ * Choose a downloadable MP4 rendition from a syndication `tweet-result` payload. Pure, so the variant
+ * choice is tested without a network. Returns undefined when the tweet carries no video at all.
+ *
+ * An animated GIF reports `animated: true` with NO url on purpose: on X a GIF also renders as a
+ * `<video>`, but this project publishes no animations, so it must stay held rather than be quietly
+ * transcoded into one. The rendition picked is the highest bitrate whose estimated bytes still fit the
+ * download budget — X offers up to 4K (hundreds of MB) while the pipeline re-encodes to a 1280 long
+ * edge regardless, so taking the largest would spend the whole budget to produce the same output.
+ */
+export function pickVideoSource(payload: unknown, maxDownloadBytes: number): XVideoSource | undefined {
+  const details = object(payload)?.mediaDetails;
+  if (!Array.isArray(details)) return undefined;
+  const media = details.map(object).find(entry => entry?.type === 'video' || entry?.type === 'animated_gif');
+  if (!media) return undefined;
+  const geometry = object(media.original_info);
+  const info = object(media.video_info);
+  const millis = info?.duration_millis;
+  const source: XVideoSource = {
+    animated: media.type === 'animated_gif',
+    ...(positiveInteger(geometry?.width) ? { width: geometry.width } : {}),
+    ...(positiveInteger(geometry?.height) ? { height: geometry.height } : {}),
+    // Rounded up: a clip a fraction over the ceiling must not round down under it.
+    ...(typeof millis === 'number' && Number.isFinite(millis) && millis > 0 ? { durationSeconds: Math.ceil(millis / 1000) } : {}),
+  };
+  if (source.animated || !Array.isArray(info?.variants)) return source;
+  const renditions = info.variants.map(object).flatMap(variant => {
+    const url = variant?.content_type === 'video/mp4' ? validMediaUrl(typeof variant.url === 'string' ? variant.url : undefined) : undefined;
+    return url && positiveInteger(variant?.bitrate) ? [{ url, bitrate: variant.bitrate }] : [];
+  }).sort((a, b) => a.bitrate - b.bitrate);
+  if (!renditions.length) return source;
+  // bitrate is bits per second, so bytes ≈ bitrate / 8 × seconds. With no duration there is no estimate,
+  // so fall back to the smallest rendition instead of guessing something past the download cap.
+  const affordable = source.durationSeconds === undefined ? []
+    : renditions.filter(rendition => (rendition.bitrate / 8) * source.durationSeconds! <= maxDownloadBytes);
+  return { ...source, url: (affordable.at(-1) ?? renditions[0]!).url };
+}
 
 /**
  * Hosts the X web app must reach to boot and render. Besides x.com itself, the SPA loads its
@@ -192,7 +247,36 @@ export class XCollector implements Collector {
   // Resolved t.co → real URL, kept for the collector's lifetime: the same short link appears across
   // many tweets (and re-appears every scan), so resolve each destination at most once.
   private readonly shortLinks = new Map<string, string | null>();
-  constructor(private readonly config: AppConfig['x'], private readonly transport?: Transport) {}
+  // Resolved video source per tweet id (null = looked up, nothing usable). Cached for the collector's
+  // lifetime so a tweet re-read on every scan costs at most one syndication request.
+  private readonly videoSources = new Map<string, XVideoSource | null>();
+  constructor(
+    private readonly config: AppConfig['x'],
+    private readonly transport?: Transport,
+    // Video lookup only happens when video sync is actually on: with it off the post is held as
+    // `video_sync_disabled` regardless, so the request would buy nothing.
+    private readonly media: { video: boolean; maxDownloadBytes: number } = { video: false, maxDownloadBytes: 20_000_000 },
+  ) {}
+
+  /**
+   * Ask the syndication endpoint for a downloadable source for this tweet's video. Every failure —
+   * network, non-200, unparseable body, deleted or protected tweet — returns undefined, which leaves
+   * the attachment without a url and the post held exactly as it was before this existed.
+   */
+  private async resolveVideo(tweetId: string, signal?: AbortSignal): Promise<XVideoSource | undefined> {
+    if (!this.transport || !this.media.video) return undefined;
+    const cached = this.videoSources.get(tweetId);
+    if (cached !== undefined) return cached ?? undefined;
+    let resolved: XVideoSource | undefined;
+    try {
+      const query = new URLSearchParams({ id: tweetId, token: syndicationToken(tweetId), lang: 'en' });
+      const response = await this.transport.request(`${SYNDICATION_ENDPOINT}?${query}`, { method: 'GET', timeoutMs: 10_000, maxBytes: 512_000 });
+      if (response.status === 200) resolved = pickVideoSource(JSON.parse(Buffer.from(response.body).toString('utf8')), this.media.maxDownloadBytes);
+    } catch { /* Held without a source, which is what the caller already handles. */ }
+    // A lookup cut short by shutdown is not a real "nothing here"; leave it uncached so the next run retries.
+    if (!signal?.aborted) this.videoSources.set(tweetId, resolved ?? null);
+    return resolved;
+  }
 
   /**
    * Expand every t.co short link in `text` to its real destination. X only exposes the real URL as
@@ -322,7 +406,15 @@ export class XCollector implements Collector {
     const sensitive = hasSensitiveWarning(chromeText);
     // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
     const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
-    if (hasVideo) media.push({ kind: 'video', alt: '' });
+    if (hasVideo) {
+      const source = await this.resolveVideo(own, signal);
+      media.push({ kind: 'video', alt: '',
+        ...(source?.url ? { url: source.url } : {}),
+        ...(source?.animated ? { animated: true } : {}),
+        ...(source?.durationSeconds !== undefined ? { durationSeconds: source.durationSeconds } : {}),
+        ...(source?.width ? { width: source.width } : {}),
+        ...(source?.height ? { height: source.height } : {}) });
+    }
     // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
     // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
     // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.

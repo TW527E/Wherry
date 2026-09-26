@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { isPublicAddress, SafeHttp, validatePublicUrl, HttpError } from '../src/security/http.js';
 import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape } from '../src/text.js';
 import { blueskyRecordKey } from '../src/platforms/bluesky.js';
-import { fullSizeImageUrl, hasSensitiveWarning, parseTweetFacts } from '../src/platforms/x.js';
+import { fullSizeImageUrl, hasSensitiveWarning, parseTweetFacts, pickVideoSource, syndicationToken } from '../src/platforms/x.js';
 import { TelegramClient } from '../src/platforms/telegram.js';
 import { SharkeyClient } from '../src/platforms/sharkey.js';
 import type { HttpOptions, HttpResponse, PreparedImage, Transport } from '../src/types.js';
@@ -193,6 +193,56 @@ test('the X sensitive-media warning is recognised but ordinary post chrome is no
   for (const chrome of ['誠誠-ChengCheng 💫@TW527E·1h12345', 'Replying to @someone', 'Show more', 'Translate post', 'Pinned', '1:23', '']) {
     assert.equal(hasSensitiveWarning(chrome), false, `ordinary chrome must not match: ${JSON.stringify(chrome)}`);
   }
+});
+
+test('an X video resolves to the best MP4 the download budget can afford; a GIF resolves to none', () => {
+  // Shape taken verbatim from a live syndication tweet-result payload: one HLS entry with no bitrate
+  // plus progressive MP4 renditions up to 4K. X serves no downloadable video in the page itself.
+  const payload = (type: string): unknown => ({ mediaDetails: [{ type, original_info: { width: 3840, height: 2160 },
+    video_info: { duration_millis: 20_000, variants: [
+      { content_type: 'application/x-mpegURL', url: 'https://video.twimg.com/amplify_video/1/pl/a.m3u8' },
+      { content_type: 'video/mp4', bitrate: 832_000, url: 'https://video.twimg.com/amplify_video/1/vid/avc1/640x360/b.mp4' },
+      { content_type: 'video/mp4', bitrate: 2_176_000, url: 'https://video.twimg.com/amplify_video/1/vid/avc1/1280x720/c.mp4' },
+      { content_type: 'video/mp4', bitrate: 25_128_000, url: 'https://video.twimg.com/amplify_video/1/vid/avc1/3840x2160/d.mp4' },
+    ] } }] });
+
+  // 20s at 2.176 Mbit/s ≈ 5.4 MB and fits; the 4K rendition ≈ 63 MB and must never be chosen, or a
+  // single clip would eat the whole download budget to produce the same 1280-capped output.
+  const chosen = pickVideoSource(payload('video'), 20_000_000);
+  assert.equal(chosen?.url, 'https://video.twimg.com/amplify_video/1/vid/avc1/1280x720/c.mp4');
+  assert.equal(chosen?.durationSeconds, 20);
+  assert.equal(chosen?.animated, false);
+  assert.deepEqual([chosen?.width, chosen?.height], [3840, 2160]);
+  // A tighter budget steps down rather than picking something that cannot be downloaded.
+  assert.equal(pickVideoSource(payload('video'), 3_000_000)?.url, 'https://video.twimg.com/amplify_video/1/vid/avc1/640x360/b.mp4');
+  // An animated GIF also renders as a <video> on X, but this project publishes no animations, so it
+  // must come back with no url and stay held instead of being transcoded into one.
+  const gif = pickVideoSource(payload('animated_gif'), 20_000_000);
+  assert.equal(gif?.animated, true);
+  assert.equal(gif?.url, undefined);
+});
+
+test('a video source is only accepted from X media hosts over https', () => {
+  const withUrl = (url: string): unknown => ({ mediaDetails: [{ type: 'video',
+    video_info: { duration_millis: 5_000, variants: [{ content_type: 'video/mp4', bitrate: 100_000, url }] } }] });
+  for (const url of ['http://video.twimg.com/a.mp4', 'https://evil.example/a.mp4', 'file:///a.mp4', 'not a url']) {
+    assert.equal(pickVideoSource(withUrl(url), 20_000_000)?.url, undefined, url);
+  }
+  assert.equal(pickVideoSource(withUrl('https://video.twimg.com/amplify_video/1/vid/a.mp4'), 20_000_000)?.url,
+    'https://video.twimg.com/amplify_video/1/vid/a.mp4');
+  // Anything that is not a video tweet yields nothing at all, so the caller holds it as before.
+  for (const payload of [{ mediaDetails: [{ type: 'photo' }] }, { mediaDetails: [] }, {}, 'nonsense', null]) {
+    assert.equal(pickVideoSource(payload, 20_000_000), undefined);
+  }
+  // An HLS-only tweet has no progressive rendition, so there is still nothing to download.
+  assert.equal(pickVideoSource({ mediaDetails: [{ type: 'video', video_info: { duration_millis: 5_000,
+    variants: [{ content_type: 'application/x-mpegURL', url: 'https://video.twimg.com/1/pl/a.m3u8' }] } }] }, 20_000_000)?.url, undefined);
+});
+
+test('the syndication token stays on the formula the endpoint accepts', () => {
+  // Anchored to a value the live endpoint answered 200 for; a drift here silently 404s every lookup.
+  assert.equal(syndicationToken('1567257003890831360'), '3srola8enwm');
+  assert.match(syndicationToken('20'), /^[0-9a-z]+$/);
 });
 
 test('the poll flag and sensitive label survive parsing into post facts', () => {
