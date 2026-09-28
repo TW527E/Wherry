@@ -206,6 +206,21 @@ function downstream(id: string, text: string, createdAt: string): SourcePost {
   };
 }
 
+test('a distinctive CJK post matches outright while a short greeting still asks', () => {
+  const sentence = '這部電影真的很好看，推薦大家去看';
+  const distinctive = new Store(':memory:');
+  distinctive.addMirror(downstream('a', sentence, at(-3600)), at(0));
+  // 16 code units but 48 UTF-8 bytes. Counting code units called this "too short to be sure" and sent
+  // every post like it to review, even though an exact match on a whole specific sentence is no accident.
+  assert.equal(decideMirror([post({ id: '1', createdAt: at(0), text: sentence })], distinctive.mirrors(at(0))).state, 'match');
+
+  const greeting = new Store(':memory:');
+  greeting.addMirror(downstream('b', '早安', at(-3600)), at(0));
+  // 6 bytes: two posts can say this on the same morning independently, so the owner is still asked
+  // rather than having the X post silently dropped.
+  assert.equal(decideMirror([post({ id: '2', createdAt: at(0), text: '早安' })], greeting.mirrors(at(0))).state, 'review');
+});
+
 test('an existing database drops the baseline history it had registered as pending mirrors', () => {
   const file = join(mkdtempSync(join(tmpdir(), 'crosspost-prune-')), 'crosspost.sqlite');
   const old = downstream('old', '早安', at(-30 * 86400));

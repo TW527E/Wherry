@@ -49,7 +49,13 @@ const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
 // happens to equal a recent downstream post ("早安") is far more likely to be a coincidence than a
 // manual copy, and a wrong automatic match silently drops a post the owner meant to sync — so a shorter
 // match is routed to review, where the owner confirms or rejects it, instead of being auto-suppressed.
-const MIRROR_MATCH_MIN_TEXT_LENGTH = 20;
+//
+// Measured in UTF-8 BYTES, not code units. Code units are a Latin-only proxy for "how much is actually
+// being said": a CJK character costs 3 bytes but carries roughly a whole word, so a 20-code-unit floor
+// made essentially every Chinese post "too short" — including ones as specific as
+// 「這部電影真的很好看，推薦大家去看」 — and sent all of them to review. Bytes put the two scripts on
+// comparable footing: 「早安」 is 6 and still asks, while that sentence is 48 and matches outright.
+const MIRROR_MATCH_MIN_TEXT_BYTES = 20;
 
 // X's own post limit, measured the way X measures it: every URL counts as 23 characters (the t.co
 // length) and CJK counts double. The collector expands t.co links to their real destinations before a
@@ -156,7 +162,7 @@ export function decideMirror(posts: SourcePost[], candidates: ReturnType<Store['
     // Text alone is only evidence when it is distinctive; a media fingerprint is evidence on its own.
     // A short text match leaves `evidence` false, which drops it into the `possible` check below and so
     // reaches the owner as a review notice rather than being suppressed without a word.
-    const evidence = (Boolean(expected) && expected.length >= MIRROR_MATCH_MIN_TEXT_LENGTH)
+    const evidence = (Boolean(expected) && Buffer.byteLength(expected, 'utf8') >= MIRROR_MATCH_MIN_TEXT_BYTES)
       || (media.length > 0 && mediaMatch === 'same');
     if (textEqual && mediaMatch === 'same' && evidence && !candidate.expired && !hasPoll) { exact.push(candidate.id); continue; }
     const sameMediaHash = media.some(a => a.sha256 && candidate.post.attachments.some(b => b.sha256 === a.sha256));
