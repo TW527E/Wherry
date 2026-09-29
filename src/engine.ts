@@ -297,7 +297,17 @@ export class Engine {
       return;
     }
     if (batch.state !== 'open' || post.createdAt > batch.cutoffAt || post.createdAt < parent.post.createdAt) {
-      this.store.addPost(post, 'ignored', 'skipped_late_self_reply', now); return;
+      this.store.addPost(post, 'ignored', 'skipped_late_self_reply', now);
+      // This is a self-reply the owner wrote that will never sync, and nothing else reports it: the
+      // classification is `ignored`, so it raises no notice and shows up nowhere the owner looks. The
+      // usual cause is a THREAD_WINDOW_SECONDS shorter than it actually takes to type the next tweet,
+      // which silently truncates every thread — so name the window and the overshoot, not just the fact.
+      const late = Math.round((Date.parse(post.createdAt) - Date.parse(batch.cutoffAt)) / 1000);
+      this.store.event('warn', late > 0
+        ? `X self-reply ${post.id} came ${late}s after its thread window closed (THREAD_WINDOW_SECONDS=${this.config.threadWindowSeconds}); not synced, and the rest of the thread will be dropped too`
+        : `X self-reply ${post.id} could not join batch ${batch.id} (state ${batch.state}); not synced`,
+        Store.postKey('x', post.id));
+      return;
     }
     const members = this.store.batchPosts(batch.id);
     const tail = members.at(-1)?.post;

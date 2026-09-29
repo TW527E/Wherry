@@ -206,6 +206,22 @@ function downstream(id: string, text: string, createdAt: string): SourcePost {
   };
 }
 
+test('a thread continuation dropped by the window says so instead of vanishing', () => {
+  const { store, engine } = setup();
+  // THREAD_WINDOW_SECONDS defaults to 600 here; the reply lands well past it.
+  engine.ingest(snapshot([post({ id: '700', createdAt: at(10) })], at(20)), at(20));
+  engine.ingest(snapshot([
+    post({ id: '700', createdAt: at(10) }),
+    post({ id: '701', createdAt: at(900), replyToId: '700', replyToAuthorId: 'owner' }),
+  ], at(1000)), at(1000));
+  assert.equal(store.getPost('x', '701')?.reason, 'skipped_late_self_reply');
+  // `ignored` raises no notice anywhere, so without this event the owner never learns the thread broke.
+  const dropped = store.events(50).filter(event => event.level === 'warn' && /thread window closed/.test(event.message));
+  assert.equal(dropped.length, 1);
+  assert.match(dropped[0]!.message, /701/);
+  assert.match(dropped[0]!.message, /THREAD_WINDOW_SECONDS=600/, 'the message names the knob that caused it');
+});
+
 test('a distinctive CJK post matches outright while a short greeting still asks', () => {
   const sentence = '這部電影真的很好看，推薦大家去看';
   const distinctive = new Store(':memory:');
@@ -597,9 +613,12 @@ test('a suspected-mirror X batch is surfaced as one ops notice, and a reply conf
 
   // The owner confirms the manual mirror by replying with the candidate code: an unknown code matches
   // nothing, the real code closes the batch as a mirror and links the X id so reverse sync is blocked.
+  // `now` is passed explicitly. Letting it default to the wall clock mixes this synthetic 2026-09-19
+  // timeline with real time, and the candidate silently ages out of getMirror's window exactly ten days
+  // after the base date — a test that passes for ten days and then fails on its own.
   const code = engine.mirrorCandidates(at(905)).find(c => c.postId === 'at://did:plc:x/9')!.id;
-  assert.equal(engine.confirmReviewMirror('x:950', 'see mirror:nope:missing').matched, 0);
-  assert.equal(engine.confirmReviewMirror('x:950', `mirrored here: ${code}`).matched, 1);
+  assert.equal(engine.confirmReviewMirror('x:950', 'see mirror:nope:missing', at(905)).matched, 0);
+  assert.equal(engine.confirmReviewMirror('x:950', `mirrored here: ${code}`, at(905)).matched, 1);
   assert.equal(store.getBatch('x:950')?.state, 'mirror');
   assert.equal(store.getPost('x', '950')?.classification, 'manual_mirror');
   assert.equal(store.mirrorMatchesXId('950'), true, 'the X id is linked so reverse sync is suppressed');
