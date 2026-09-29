@@ -219,7 +219,7 @@ export class Engine {
           continue;
         }
         if (Date.parse(post.createdAt) > Date.parse(snapshot.fetchedAt) + 60_000) {
-          this.store.addPost(post, 'mirror_review', 'source_clock_invalid', now); added++; continue;
+          this.parkWithoutBatch(post, 'source_clock_invalid', now); added++; continue;
         }
         if (post.platform === 'x') this.ingestX(post, now);
         else this.ingestNative(post, now);
@@ -265,9 +265,21 @@ export class Engine {
     if (this.canNotifyOwner()) this.store.enqueue('reminder', key, 'telegram', now);
   }
 
+  /**
+   * Park a post that needs the owner's decision but has no batch to hang an interactive notice on.
+   * `mirror_review` raises no notice by itself and `notifyHeldBatch` needs a batch id, so without this
+   * the post surfaces only in the Web UI's post list — the "it sat there and nobody told me" case.
+   * Recorded at `error` level because that is the only level the Telegram forwarder picks up, and the
+   * whole point is that this must not wait for the owner to go looking.
+   */
+  private parkWithoutBatch(post: SourcePost, reason: string, now: string): void {
+    this.store.addPost(post, 'mirror_review', reason, now);
+    this.store.event('error', `${post.platform} post ${post.id} is held for your decision (${reason}) and has no batch to attach a notice to; it will not sync until you handle it`, Store.postKey(post.platform, post.id));
+  }
+
   private ingestX(post: SourcePost, now: string): void {
     if (post.repost || post.visibility !== 'public') { this.store.addPost(post, 'ignored', 'repost_or_non_public', now); return; }
-    if (!post.relationKnown || post.replyToId === undefined) { this.store.addPost(post, 'mirror_review', 'reply_relationship_unknown', now); return; }
+    if (!post.relationKnown || post.replyToId === undefined) { this.parkWithoutBatch(post, 'reply_relationship_unknown', now); return; }
     // Deterministic anti-echo: the owner told us (via the reminder's "要發" flow) that this exact X
     // post is their manual copy of a downstream post, so never sync it back.
     if (this.store.mirrorMatchesXId(post.id)) { this.store.addPost(post, 'ignored', 'manual_mirror_registered', now); return; }
@@ -283,7 +295,11 @@ export class Engine {
       return;
     }
     if (!post.replyToAuthorId || post.replyToAuthorId.toLowerCase() !== post.authorId.toLowerCase()) {
-      this.store.addPost(post, post.replyToAuthorId ? 'ignored' : 'mirror_review', post.replyToAuthorId ? 'reply_to_other' : 'parent_author_unknown', now); return;
+      // Replying to somebody else never syncs and is not a decision, so it stays silent. A parent whose
+      // author we could not read is different: it may well be your own thread, so it needs you.
+      if (post.replyToAuthorId) this.store.addPost(post, 'ignored', 'reply_to_other', now);
+      else this.parkWithoutBatch(post, 'parent_author_unknown', now);
+      return;
     }
     const parent = this.store.getPost('x', post.replyToId);
     const batch = parent?.batchId ? this.store.getBatch(parent.batchId) : undefined;

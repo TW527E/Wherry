@@ -206,6 +206,28 @@ function downstream(id: string, text: string, createdAt: string): SourcePost {
   };
 }
 
+test('a post held without a batch is pushed to the owner instead of only sitting in the Web UI', () => {
+  const { store, engine } = setup();
+  engine.ingest(snapshot([
+    // Neither of these can open a batch, so notifyHeldBatch has nothing to attach an ops notice to —
+    // they used to exist only in the post list, waiting for the owner to happen to look.
+    post({ id: '800', createdAt: at(10), relationKnown: false, replyToId: '999' }),
+    post({ id: '801', createdAt: at(11), replyToId: '998', replyToAuthorId: null }),
+    // Replying to somebody else is not a decision and must stay silent, or every such reply pages you.
+    post({ id: '802', createdAt: at(12), replyToId: '997', replyToAuthorId: 'someone-else' }),
+  ], at(20)), at(20));
+  for (const id of ['800', '801']) {
+    assert.equal(store.getPost('x', id)?.classification, 'mirror_review');
+    assert.equal(store.getPost('x', id)?.batchId, undefined, 'there is no batch to hang a notice on');
+  }
+  assert.equal(store.getPost('x', '802')?.classification, 'ignored');
+  // `error` is the only level the Telegram forwarder picks up, so it is what stops this being silent.
+  const alerts = store.events(50).filter(event => event.level === 'error');
+  assert.deepEqual(alerts.map(a => a.entityId).sort(), ['x:800', 'x:801']);
+  assert.match(alerts.find(a => a.entityId === 'x:800')!.message, /reply_relationship_unknown/);
+  assert.match(alerts.find(a => a.entityId === 'x:801')!.message, /parent_author_unknown/);
+});
+
 test('a thread continuation dropped by the window says so instead of vanishing', () => {
   const { store, engine } = setup();
   // THREAD_WINDOW_SECONDS defaults to 600 here; the reply lands well past it.
