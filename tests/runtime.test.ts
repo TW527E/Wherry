@@ -77,4 +77,11 @@ test('web UI: held batches say whether approve can publish, and a schedule witho
   assert.equal(status.held.find((b: { id: string }) => b.id === 'x:1').text, 'post 1');
   const scheduled = await app.inject({ method: 'POST', url: '/api/schedule', headers: { 'content-type': 'application/json' }, payload: { text: 'right now' } });
   assert.equal(scheduled.statusCode, 200, scheduled.body);
+  // A job that can never deliver (an expired poll) can be given up; the reason it failed is kept.
+  const action = (id: string) => app.inject({ method: 'POST', url: '/api/action', headers: { 'content-type': 'application/json' }, payload: { action: 'cancel', id } });
+  const stuck = runtime.store.enqueue('publish', 'x:2', 'telegram', now);
+  runtime.store.updateJob(stuck, 'review', 'The X poll expired before delivery; it will not be reopened');
+  assert.equal((await action(stuck)).statusCode, 200);
+  assert.deepEqual([runtime.store.getJob(stuck)!.state, runtime.store.getJob(stuck)!.error], ['cancelled', 'The X poll expired before delivery; it will not be reopened']);
+  assert.equal((await action(stuck)).statusCode, 400, 'only failed/review/unknown jobs can be cancelled');
 });

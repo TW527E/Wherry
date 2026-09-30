@@ -106,6 +106,7 @@ npm run cli -- action skip <id>         # 不同步這個批次
 npm run cli -- action mirror <id>       # 標記為手動鏡像
 npm run cli -- action approve <id>      # 人工放行被保留的批次
 npm run cli -- action retry <jobId>     # 重試明確失敗的工作
+npm run cli -- action cancel <jobId>    # 放棄發不出去的工作（不再發送或重試）
 npm run cli -- doctor                   # 檢查設定
 npm run cli -- login                    # 本機開瀏覽器登入 X（只需一次）
 npm run cli -- export-session           # 匯出 X 登入到 X_SESSION_FILE
@@ -127,6 +128,7 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | `/mirror <id>` | 標記為手動鏡像，不再同步 |
 | `/mirror <id> <X_URL>` | 登記你手動發的 X 連結（設定防回音來源） |
 | `/retry <jobId>`、`/resync <jobId>` | 重試明確失敗的工作 |
+| `/cancel <jobId>` | 放棄發不出去的工作（例如投票已過期），不再發送或重試 |
 | `/session` | 更新 X 登入：接著上傳 `x-session.json` |
 | `/help` | 顯示所有指令 |
 
@@ -199,7 +201,7 @@ SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取�
 | `pending` / `running` | 等待中／執行中 |
 | `succeeded` | 已送達 |
 | `failed` | 明確被拒絕，可安全重試 |
-| `unknown` | **送出結果不明**（連線中斷等）。不會自動重試，需你確認遠端未成功後 `action reconcile` |
+| `unknown` | **送出結果不明**（連線中斷等）。不會自動重試，需你確認遠端：沒發出就 `action reconcile` 重送，已發出就 `action cancel` 結束 |
 | `review` | 等待你決定 |
 | `cancelled` | 被你取消 |
 
@@ -296,7 +298,7 @@ X_BROWSER=chrome npm run cli -- doctor   # 顯示實際偵測到的瀏覽器
 - **Telegram 頻道內的回覆呈現**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際外觀需在你的頻道上驗證一次。
 - **dvd.chat 的實際可用上傳上限**由實例與角色政策決定，程式不寫死數字，以伺服器回應為準。
 - **影片轉碼為選用功能**：`VIDEO_ENABLED=true` 時，含影片的推文會先向公開嵌入端點取一個可下載的 MP4，再經 FFmpeg 轉碼交給下游。解析失敗（推文已刪、受保護、或 X 改了回應格式）就退回保留，理由是 `x_video_has_no_downloadable_source`；只有 HLS 沒有 MP4 的影片同樣保留。超過 140 秒會在下載前就以 `video_exceeds_duration_limit` 保留。GIF（在 X 上也是 `<video>`）以 `animated_video_not_supported` 保留，純音訊、圖片影片混合、Quote 原生互動仍未支援。
-- Web UI 已提供文字排程表單與「最近讀到的貼文」列表（每則的分類與原因）；排程附件與批次編輯仍未實作。
+- Web UI 已提供文字排程表單、待決批次與失敗工作的批量處理，以及「最近讀到的貼文」列表（每則的分類與原因）；排程附件與批次編輯仍未實作。
 
 ---
 

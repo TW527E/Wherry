@@ -213,6 +213,7 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
   { command: 'retry', args: '<jobId>', description: '重試一個明確失敗的工作' },
   { command: 'resync', args: '<jobId>', description: 'retry 別名：重試明確失敗的工作' },
   { command: 'reconcile', args: '<jobId>', description: '對帳後重試 unknown 工作（先自行確認遠端沒有重複貼文）' },
+  { command: 'cancel', args: '<jobId>', description: '放棄發不出去的工作（不再發送或重試）' },
   { command: 'session', description: '更新 X 登入：接著上傳 x-session.json（或在檔案說明打 /session）' },
 ];
 
@@ -245,7 +246,7 @@ function statusText({ engine, store }: CommandContext): string {
     .map(state => [state, jobs.filter(j => j.state === state).length] as const).filter(([, n]) => n)
     .map(([state, n]) => `${LABELS[state]} ${n}`).join(' · ');
   const attention = jobs.filter(j => ATTENTION.has(j.state)).slice(0, 8).map(j =>
-    `• ${j.destination} ${j.aggregateId}：${LABELS[j.state]}${j.error ? `（${j.error.slice(0, 80)}）` : ''}\n  ${j.state === 'unknown' ? '/reconcile' : '/retry'} ${j.id}`);
+    `• ${j.destination} ${j.aggregateId}：${LABELS[j.state]}${j.error ? `（${j.error.slice(0, 80)}）` : ''}\n  ${j.state === 'unknown' ? '/reconcile' : '/retry'} ${j.id}\n  /cancel ${j.id}`);
   const events = store.events(8).map(e => `${e.level === 'error' ? '❌' : e.level === 'warn' ? '⚠️' : '•'} ${ago(e.at)}：${e.message.slice(0, 120)}`);
   return [
     '📊 Wherry 狀態',
@@ -319,7 +320,8 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
     else if (command === '/approve' && id) { context.engine.action('approve', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已批准 ${id}，正在背景發布到下游；狀態請看 /status。`, 'private'); }
     else if (['/retry', '/resync'].includes(command) && id) { context.engine.action('retry', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已排入重試 ${id}（背景執行）`, 'private'); }
     else if (command === '/reconcile' && id) { context.engine.action('reconcile', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已對帳並排入重新發送 ${id}（背景執行）。若剛才你在該平台看到已發出的貼文，請改用 /mirror 或 /skip，避免重複。`, 'private'); }
-    else if (['/skip', '/mirror', '/approve', '/retry', '/resync', '/reconcile'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
+    else if (command === '/cancel' && id) { context.engine.action('cancel', id); await context.telegram.sendPlain(`已放棄 ${id}，不會再發送或重試。`, 'private'); }
+    else if (['/skip', '/mirror', '/approve', '/retry', '/resync', '/reconcile', '/cancel'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
     else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
   } catch (error) { context.store.event('error', `Telegram command failed: ${safeError(error)}`); await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
 }
@@ -404,11 +406,11 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
   app.post('/api/scan', async () => { await runtime.once(); return { ok: true }; });
-  app.post<{ Body: { action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile'; id: string } }>('/api/action', async (request, reply) => {
+  app.post<{ Body: { action: Parameters<Engine['action']>[0]; id: string } }>('/api/action', async (request, reply) => {
     try {
       runtime.engine.action(request.body.action, request.body.id);
       // Deliver now instead of on the next poll, like the Telegram commands do.
-      if (request.body.action !== 'skip' && request.body.action !== 'mirror') void runtime.worker.run().catch(() => undefined);
+      if (['approve', 'retry', 'reconcile'].includes(request.body.action)) void runtime.worker.run().catch(() => undefined);
       return { ok: true };
     }
     catch (error) { return reply.code(400).send({ error: safeError(error) }); }
@@ -474,6 +476,10 @@ summary{cursor:pointer;color:var(--muted);font-size:.85rem;margin-top:.6rem}
 .toast{position:fixed;left:50%;bottom:1.2rem;transform:translate(-50%,.8rem);background:var(--text);color:var(--bg);padding:.6rem 1.1rem;border-radius:999px;font-size:.87rem;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100% - 2rem)}
 .toast.show{opacity:1;transform:translate(-50%,0)}.toast.bad{background:var(--err);color:#fff}
 .row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+input[type=checkbox]{width:1.05rem;height:1.05rem;margin:0;accent-color:var(--accent);cursor:pointer;flex:none}
+#held-bulk,#jobs-bulk{position:sticky;top:3.4rem;z-index:2}
+.bulk{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;padding:.45rem .7rem;border-radius:10px;background:var(--soft);min-height:2.6rem}
+.bulk label{display:inline-flex;align-items:center;gap:.35rem;margin:0 .3rem 0 0;color:var(--text);font-size:.85rem;cursor:pointer}
 [hidden]{display:none!important}
 </style></head><body>
 <header><div class="bar"><h1>Wherry</h1><span id="mode" class="pill">載入中…</span><span id="xsess" class="pill" hidden></span><span class="spacer"></span><span id="updated" class="updated"></span><button id="scan" title="收集一次並發送到期的工作">立即檢查</button></div></header>
@@ -482,8 +488,8 @@ summary{cursor:pointer;color:var(--muted);font-size:.85rem;margin-top:.6rem}
 <div id="offline" class="banner err" role="alert" hidden>連不上 Wherry 服務，會自動重試。</div>
 <div id="preview" class="banner" hidden><b>預覽模式</b>：照常讀取與分類，但不會真的發布到任何平台。確認行為正確後把 <code>APP_MODE</code> 改成 <code>live</code>。</div>
 <form id="token-box" class="banner" hidden><label for="token" style="margin-top:0">這個服務設定了 WEB_TOKEN，操作前請先輸入：</label><div class="row"><input id="token" type="password" autocomplete="off" style="flex:1;min-width:12rem"><button type="submit">儲存</button></div></form>
-<section><h2>等你決定 <span id="held-count" class="count">0</span></h2><p class="hint">X 上無法自動判斷的新內容會停在這裡；串文收集中的批次也可以提早發布。</p><div id="held"><div class="empty">載入中…</div></div></section>
-<section><h2>發送工作 <span id="jobs-count" class="count">0</span></h2><div id="jobs"><div class="empty">載入中…</div></div><details id="jobs-more" hidden><summary>已完成與已取消（<span id="jobs-done-count">0</span>）</summary><div id="jobs-done"></div></details></section>
+<section><h2>等你決定 <span id="held-count" class="count">0</span></h2><p class="hint">X 上無法自動判斷的新內容會停在這裡；串文收集中的批次也可以提早發布。</p><div id="held-bulk"></div><div id="held"><div class="empty">載入中…</div></div></section>
+<section><h2>發送工作 <span id="jobs-count" class="count">0</span></h2><div id="jobs-bulk"></div><div id="jobs"><div class="empty">載入中…</div></div><details id="jobs-more" hidden><summary>已完成與已取消（<span id="jobs-done-count">0</span>）</summary><div id="jobs-done"></div></details></section>
 <section><h2>最近讀到的貼文</h2><p class="hint">每則的分類與原因；沒同步的貼文為什麼沒同步，看這裡。</p><div id="posts"><div class="empty">載入中…</div></div></section>
 </div>
 <div class="col side">
@@ -497,9 +503,9 @@ const PLATFORM={x:'X',bluesky:'Bluesky',sharkey:'Sharkey',telegram:'Telegram',lo
 const KIND={publish:'發布',reminder:'X 提醒',ops:'待決通知'};
 const SESSION={authenticated:['X 已登入','ok'],error:['X 登入失效','err'],unknown:['X 登入未確認',''],disabled:['X 讀取未啟用','']};
 const TONE={succeeded:'ok',sealed:'ok',ready:'ok',manual_mirror:'ok',mirror:'ok',open:'info',collecting:'info',pending:'info',running:'info',review:'warn',mirror_review:'warn',failed:'err',unknown:'err',unsupported:'err'};
-const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送'};
+const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄'};
 const $=s=>document.querySelector(s);
-const busy=new Set();let status={};let loading=false;
+const busy=new Set();const picked=new Set();let scopes={};let status={};let loading=false;
 const rtf=new Intl.RelativeTimeFormat('zh-Hant',{numeric:'auto'});
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function label(code){return esc(L[code]||code)}
@@ -515,25 +521,34 @@ function askToken(){$('#token-box').hidden=false;$('#token').focus()}
 async function post(path,body){const headers={'content-type':'application/json'};if(token())headers.authorization='Bearer '+token();
 const r=await fetch(path,{method:'POST',headers,body:JSON.stringify(body||{})});const j=await r.json().catch(()=>({}));
 if(r.status===401){askToken();throw new Error('需要正確的 Web token')}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
-function confirmText(verb){
-if(verb==='approve')return status.mode==='live'?'確定發布到 '+((status.destinations||[]).map(d=>PLATFORM[d]||d).join('、')||'其他平台')+'？發出後無法自動收回。':'';
-if(verb==='skip')return '略過後這則不會同步，之後也無法再批准。確定？';
-if(verb==='mirror')return '標記為手動鏡像後這則不會同步。確定？';
+function confirmText(verb,n){const these=n>1?'這 '+n+' 筆':'這則';
+if(verb==='approve')return status.mode==='live'?'確定把'+these+'發布到 '+((status.destinations||[]).map(d=>PLATFORM[d]||d).join('、')||'其他平台')+'？發出後無法自動收回。':'';
+if(verb==='skip')return these+'略過後不會同步，之後也無法再批准。確定？';
+if(verb==='mirror')return these+'標記為手動鏡像後不會同步。確定？';
+if(verb==='cancel')return (n>1?'這 '+n+' 個工作':'這個工作')+'放棄後不會再發送或重試。確定？';
 if(verb==='reconcile')return '請先到該平台確認這則沒有成功發出（沒有重複貼文）。確定重新發送未確認的部分？';
 return ''}
-async function act(verb,id){const q=confirmText(verb);if(q&&!confirm(q))return;busy.add(verb+':'+id);render();
-try{await post('/api/action',{action:verb,id});toast(DONE[verb]||'完成')}catch(e){toast('失敗：'+e.message,true)}finally{busy.delete(verb+':'+id);await load()}}
+// One request per id: the same validated endpoint as a single click, so a bulk run can't bypass any per-item check.
+async function act(verb,ids){const q=confirmText(verb,ids.length);if(q&&!confirm(q))return;for(const id of ids)busy.add(verb+':'+id);render();let failed=0,last='';
+for(const id of ids){try{await post('/api/action',{action:verb,id});picked.delete(id)}catch(e){failed++;last=e.message}finally{busy.delete(verb+':'+id)}}
+if(failed)toast((ids.length>1?(ids.length-failed)+' 筆完成、'+failed+' 筆失敗：':'失敗：')+last,true);else toast((ids.length>1?ids.length+' 筆':'')+DONE[verb]);await load()}
+function pick(id){return '<input type="checkbox" data-pick="'+esc(id)+'" aria-label="選取"'+(picked.has(id)?' checked':'')+'>'}
+function bulkBar(scope){const {items,verbs}=scopes[scope];if(items.length<2)return '';const sel=items.filter(i=>picked.has(i.id));
+let h='<label><input type="checkbox" data-all="'+scope+'"'+(sel.length===items.length?' checked':'')+'>全選</label>';
+if(sel.length){h+='<span class="meta">已選 '+sel.length+' 筆</span>';for(const [verb,text,ok,cls] of verbs){const n=sel.filter(ok).length;if(n)h+='<button type="button" class="'+(cls||'ghost')+'" data-bulk="'+verb+'" data-scope="'+scope+'">'+text+'（'+n+'）</button>'}
+h+='<button type="button" class="ghost" data-clear="'+scope+'">取消選取</button>'}return '<div class="bulk">'+h+'</div>'}
 function heldItem(b){const collecting=b.state==='open';const approve=!b.approvable?'':btn('approve',b.id,collecting?'立即發布':b.reason==='long_x_post_requires_manual_review'?'仍要發布（自動分段）':'發布到其他平台','go');
-return '<div class="item '+(collecting?'':'decide')+'"><div class="head">'+tag(b.state)+'<span>'+label(b.reason)+'</span><span class="spacer"></span><span class="meta">'+when(b.rootCreatedAt)+'</span></div>'
+return '<div class="item '+(collecting?'':'decide')+'"><div class="head">'+pick(b.id)+tag(b.state)+'<span>'+label(b.reason)+'</span><span class="spacer"></span><span class="meta">'+when(b.rootCreatedAt)+'</span></div>'
 +(b.text?'<div class="text">'+esc(b.text)+'</div>':'')
 +'<div class="note">'+[b.count>1?'串文共 '+b.count+' 則':'',link(b.url,'在 X 開啟'),'<span class="id">'+esc(b.id)+'</span>'].filter(Boolean).join(' · ')+'</div>'
 +(b.approvable?'':'<div class="note">這種內容無法自動同步；需要的話請自行貼到其他平台。</div>')
 +'<div class="actions">'+approve+btn('skip',b.id,'略過')+btn('mirror',b.id,'我已手動鏡像')+'</div></div>'}
-function jobItem(j){const attn=j.state==='failed'||j.state==='unknown'||j.state==='review';
-const action=j.state==='unknown'?btn('reconcile',j.id,'已確認遠端，重新發送','go'):attn?btn('retry',j.id,'重試','go'):'';
-return '<div class="item'+(attn?' attn':'')+'"><div class="head">'+tag(j.state)+'<b>'+esc(PLATFORM[j.destination]||j.destination)+'</b><span class="meta">'+esc(KIND[j.kind]||j.kind)+(j.attempts?' · 第 '+j.attempts+' 次':'')+'</span><span class="spacer"></span><span class="meta">'+when(j.dueAt)+'</span></div>'
+const stuck=j=>j.state==='failed'||j.state==='unknown'||j.state==='review';
+function jobItem(j){const attn=stuck(j);
+const action=!attn?'':(j.state==='unknown'?btn('reconcile',j.id,'確認沒發出，重新發送','go'):btn('retry',j.id,'重試','go'))+btn('cancel',j.id,'放棄');
+return '<div class="item'+(attn?' attn':'')+'"><div class="head">'+(attn?pick(j.id):'')+tag(j.state)+'<b>'+esc(PLATFORM[j.destination]||j.destination)+'</b><span class="meta">'+esc(KIND[j.kind]||j.kind)+(j.attempts?' · 第 '+j.attempts+' 次':'')+'</span><span class="spacer"></span><span class="meta">'+when(j.dueAt)+'</span></div>'
 +'<div class="note"><span class="id">'+esc(j.aggregateId)+'</span></div>'
-+(j.error?'<div class="note bad">'+esc(j.error)+'</div>':'')+(j.state==='unknown'?'<div class="note">送出結果不明，不會自動重試，避免重複貼文。</div>':'')
++(j.error?'<div class="note'+(attn?' bad':'')+'">'+label(j.error)+'</div>':'')+(j.state==='unknown'?'<div class="note">送出結果不明，不會自動重試。請到該平台確認：沒發出就重新發送，已經發出就放棄。</div>':'')
 +(action?'<div class="actions">'+action+'</div>':'')+'</div>'}
 function postItem(p){return '<div class="item"><div class="head">'+tag(p.classification)+'<b>'+esc(PLATFORM[p.post.platform]||p.post.platform)+'</b><span class="meta">'+label(p.reason)+'</span><span class="spacer"></span><span class="meta">'+when(p.post.createdAt)+'</span></div>'
 +(p.post.text?'<div class="text short">'+esc(p.post.text)+'</div>':'')
@@ -544,10 +559,14 @@ const mode=$('#mode');mode.textContent=s.mode==='live'?'正式模式':'預覽模
 const sess=SESSION[s.xSession]||SESSION.unknown;const xs=$('#xsess');xs.textContent=sess[0];xs.className='pill '+sess[1];xs.hidden=false;
 if(s.tokenRequired&&!token())$('#token-box').hidden=false;
 const held=s.held||[];count('held-count',held.length,true);document.title=(held.length?'('+held.length+') ':'')+'Wherry';
-put('held',held.length?held.map(heldItem).join(''):'<div class="empty">沒有等你決定的內容。</div>');
 const jobs=s.jobs||[];const done=jobs.filter(j=>j.state==='succeeded'||j.state==='cancelled');const active=jobs.filter(j=>!done.includes(j));
-const rank=j=>j.state==='failed'||j.state==='unknown'||j.state==='review'?0:1;active.sort((a,b)=>rank(a)-rank(b));
-count('jobs-count',active.filter(j=>!rank(j)).length,true);
+const rank=j=>stuck(j)?0:1;active.sort((a,b)=>rank(a)-rank(b));
+scopes={held:{items:held,verbs:[['approve','發布',b=>b.approvable,'go'],['skip','略過',()=>true],['mirror','我已手動鏡像',()=>true]]},
+jobs:{items:active.filter(stuck),verbs:[['retry','重試',j=>j.state!=='unknown','go'],['cancel','放棄',()=>true]]}};
+const live=new Set([...scopes.held.items,...scopes.jobs.items].map(i=>i.id));for(const id of picked)if(!live.has(id))picked.delete(id);
+put('held-bulk',bulkBar('held'));put('jobs-bulk',bulkBar('jobs'));
+put('held',held.length?held.map(heldItem).join(''):'<div class="empty">沒有等你決定的內容。</div>');
+count('jobs-count',scopes.jobs.items.length,true);
 put('jobs',active.length?active.map(jobItem).join(''):'<div class="empty">沒有進行中或失敗的工作。</div>');
 $('#jobs-more').hidden=!done.length;$('#jobs-done-count').textContent=done.length;put('jobs-done',done.slice(0,40).map(jobItem).join(''));
 const posts=s.posts||[];put('posts',posts.length?posts.slice(0,40).map(postItem).join(''):'<div class="empty">還沒讀到任何貼文。按「立即檢查」讀一次。</div>');
@@ -558,7 +577,13 @@ async function load(){if(loading)return;loading=true;
 try{const [s,posts]=await Promise.all([fetch('/api/status').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}),fetch('/api/posts').then(r=>r.ok?r.json():[]).catch(()=>[])]);
 status=Object.assign(s,{posts});$('#offline').hidden=true;$('#updated').textContent='更新於 '+new Date().toLocaleTimeString('zh-TW',{hour12:false});render()}
 catch(e){$('#offline').hidden=false}finally{loading=false}}
-document.addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(b&&!b.disabled)act(b.dataset.act,b.dataset.id)});
+document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
+if(d.act)act(d.act,[d.id]);
+else if(d.bulk){const {items,verbs}=scopes[d.scope];const ok=verbs.find(v=>v[0]===d.bulk)[2];act(d.bulk,items.filter(i=>picked.has(i.id)&&ok(i)).map(i=>i.id))}
+else if(d.clear){for(const i of scopes[d.clear].items)picked.delete(i.id);render()}});
+document.addEventListener('change',e=>{const d=e.target.dataset||{};
+if(d.pick){if(e.target.checked)picked.add(d.pick);else picked.delete(d.pick);render()}
+else if(d.all){for(const i of scopes[d.all].items){if(e.target.checked)picked.add(i.id);else picked.delete(i.id)}render()}});
 $('#scan').addEventListener('click',async e=>{const b=e.currentTarget;b.disabled=true;b.textContent='檢查中…';
 try{await post('/api/scan');toast('檢查完成')}catch(err){toast('檢查失敗：'+err.message,true)}finally{b.disabled=false;b.textContent='立即檢查';load()}});
 $('#token-box').addEventListener('submit',e=>{e.preventDefault();try{localStorage.setItem('webToken',$('#token').value.trim())}catch{}$('#token-box').hidden=true;toast('已儲存 token')});

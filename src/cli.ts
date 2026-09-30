@@ -18,7 +18,7 @@ Usage:
   wherry scan                  Collect sources only (never publishes)
   wherry publish <batchId>     Enqueue downstream publication for a sealed batch
   wherry schedule <iso> <text> Create a local scheduled post (no X write)
-  wherry action <verb> <id>    skip | approve | mirror | retry | reconcile
+  wherry action <verb> <id>    skip | approve | mirror | retry | reconcile | cancel
   wherry doctor                Validate configuration and report capabilities
   wherry login                 Open a visible browser to log into X once (saves the session)
   wherry export-session        Export the X login to X_SESSION_FILE (default: data/x-session.json)
