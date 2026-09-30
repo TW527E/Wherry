@@ -410,6 +410,30 @@ test('thread closure waits for a fresh scan of every downstream platform', () =>
   assert.equal(engine.sealReady(at(900)), 1);
 });
 
+test('a slow collect cycle does not age its own scans out of the seal freshness gate', () => {
+  const { engine } = setup();
+  engine.ingest(snapshot([post({ id: '410', createdAt: at(10) })], at(650)), at(650));
+  // The cycle starts at 700; Sharkey fails this round, then X takes minutes, so seal runs at 1100.
+  engine.ingest(snapshot([], at(701), 'bluesky', 'bluesky-account'), at(701));
+  engine.ingest(snapshot([], at(702)), at(702));
+  assert.equal(engine.sealReady(at(1100), at(700)), 0, 'a source that missed this cycle still blocks');
+  engine.ingest(snapshot([], at(703), 'sharkey', 'sharkey-account'), at(703));
+  assert.equal(engine.sealReady(at(1100)), 0, 'measured from the end of the cycle, every scan looks stale');
+  assert.equal(engine.sealReady(at(1100), at(700)), 1);
+});
+
+test('a batch stuck long past its settle time pages the owner once', () => {
+  const { engine, store } = setup();
+  engine.ingest(snapshot([post({ id: '420', createdAt: at(10) })], at(650)), at(650));
+  const stuck = () => store.events(50).filter(e => e.level === 'error' && e.message.includes('/approve x:420'));
+  engine.sealReady(at(830 + 1700));
+  assert.equal(stuck().length, 0, 'waiting on a scan is silent at first');
+  engine.sealReady(at(830 + 1900));
+  engine.sealReady(at(830 + 2500));
+  assert.equal(stuck().length, 1);
+  assert.match(stuck()[0]!.message, /no fresh enough x scan/);
+});
+
 test('media-only and ambiguous mirrors are held, unique distinctive matches are marked as mirror', () => {
   const candidates = [{
     id: 'mirror:bluesky:at://1', state: 'pending', expired: false,
