@@ -532,12 +532,13 @@ export class BlueskyClient implements Publisher, Collector {
         for (const entry of result.feed) {
           const parsed = parsePost(entry, identity.did, identity.pds);
           // A post we cannot fully parse is not a reason to reject the whole window: the engine
-          // holds any post with metadataComplete:false downstream. Record it and move on.
-          if (!parsed.valid) warnings.push('a Bluesky post had incomplete metadata (held individually)');
-          if (!parsed.post) complete = false;
+          // holds any post with metadataComplete:false downstream. Record it and move on — but only
+          // for posts after the last scan; older ones were already handled and would repeat forever.
+          if (!parsed.post) { complete = false; warnings.push('a Bluesky post had incomplete metadata (held individually)'); }
           if (parsed.post) {
             const reason = object(object(entry)?.reason);
             const orderedAt = reason?.$type === 'app.bsky.feed.defs#reasonRepost' && typeof reason.indexedAt === 'string' ? reason.indexedAt : parsed.post.createdAt;
+            if (!parsed.valid && (!since || orderedAt > since)) warnings.push('a Bluesky post had incomplete metadata (held individually)');
             if (reason?.$type !== 'app.bsky.feed.defs#reasonPin' && (!oldest || orderedAt < oldest)) oldest = orderedAt;
             const previous = seen.get(parsed.post.id);
             if (!previous || (previous.repost && !parsed.post.repost)) seen.set(parsed.post.id, parsed.post);
