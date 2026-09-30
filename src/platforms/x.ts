@@ -601,13 +601,14 @@ export class XCollector implements Collector {
         // after the scan to collect the rest.
         if (!threadParent && parsed.replyToId === null && replyBelow) threadRoots.add(own);
       }
-      // The gap since the last fetch is covered only once the oldest tweet seen is at/older than
-      // the watermark AND the render has stopped growing. The no-growth condition matters:
-      // breaking in the very first round against a partially rendered timeline is exactly how a
-      // slow render used to masquerade as "nothing new since the watermark".
+      // The gap since the last fetch is covered once the oldest tweet seen is at/older than the
+      // watermark on a read after at least one scroll; the plateau wait above already guards the
+      // first render. Do not also require the render to stop growing: every scroll loads older
+      // tweets, so that only held at the very end of the timeline — every scan ran out of budget,
+      // the X checkpoint froze and no batch ever sealed without a manual approve.
       if (seen.size === previousCount) stableRounds++; else stableRounds = 0;
       previousCount = seen.size;
-      if (since && oldest && oldest <= since && stableRounds >= 1) { reachedWatermark = true; break; }
+      if (since && oldest && oldest <= since && round >= 1) { reachedWatermark = true; break; }
       if (stableRounds >= 2) break;
       // A shutdown can arrive mid-scroll; stop paging so the cycle ends and the process can exit.
       // What was already parsed is returned as a budget-limited snapshot (checkpoint advances to
