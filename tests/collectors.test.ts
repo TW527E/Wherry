@@ -116,7 +116,9 @@ test('Bluesky retains rotated sessions without a persistence callback and retrie
   } };
   const client = new BlueskyClient(loadConfig({ BLUESKY_IDENTIFIER: did, BLUESKY_APP_PASSWORD: 'offline' }).bluesky, transport);
   for (const key of ['first-post', 'next-post']) {
-    await client.publish({ key, sourcePostId: key, text: key, images: [] }, { idempotencyKey: key });
+    const ref = await client.publish({ key, sourcePostId: key, text: key, images: [] }, { idempotencyKey: key });
+    // bsky.app rejects a percent-encoded DID ("Invalid DID or handle").
+    assert.ok(ref.url?.startsWith(`https://bsky.app/profile/${did}/post/`), ref.url);
   }
   assert.equal(loginCalls, 1);
   assert.equal(refreshCalls, 1);

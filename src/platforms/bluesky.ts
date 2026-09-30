@@ -50,7 +50,8 @@ function strong(value: unknown): StrongRef | undefined {
 
 function postUrl(uri: unknown): string | undefined {
   const parsed = parseUri(uri);
-  return parsed ? `https://bsky.app/profile/${encodeURIComponent(parsed.did)}/post/${encodeURIComponent(parsed.key)}` : undefined;
+  // parseUri already rejects whitespace and / ? #, so both parts are path-safe; bsky.app rejects a %3A-encoded DID.
+  return parsed ? `https://bsky.app/profile/${parsed.did}/post/${parsed.key}` : undefined;
 }
 
 interface BlueskyFacet {

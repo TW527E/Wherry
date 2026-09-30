@@ -45,6 +45,8 @@ export const snapshotSchema = z.object({
 // downgraded from "seen within sourceFreshnessSeconds" to "ever seen", so a temporarily unreachable
 // downstream cannot block X→downstream publishing indefinitely. Never applied to X itself.
 const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
+// A batch still unsealed this long after its settle time is stuck rather than catching up; say so once.
+const SEAL_STUCK_ALERT_MS = 30 * 60_000;
 
 // A text-only mirror match is only conclusive when the text is distinctive. A short generic phrase that
 // happens to equal a recent downstream post ("早安") is far more likely to be a coincidence than a
@@ -364,7 +366,13 @@ export class Engine {
     this.store.enqueue('ops', batchId, 'telegram', now);
   }
 
-  sealReady(now: string = new Date().toISOString()): number {
+  /**
+   * `cycleStart` is when the collect cycle that just ran began. Freshness is measured from there, not
+   * from `now`: a source scanned in this cycle is as current as it can be, however long the scans took.
+   * Measuring from `now` made a slow X scan (minutes in a real browser) age every source past
+   * SOURCE_FRESHNESS_SECONDS by the time the cycle ended, so nothing ever sealed.
+   */
+  sealReady(now: string = new Date().toISOString(), cycleStart: string = now): number {
     if (this.store.setting('paused', false)) return 0;
     let count = 0;
     for (const batch of this.store.openBatches()) {
@@ -373,10 +381,10 @@ export class Engine {
       if (this.config.destinations.includes('bluesky')) sources.push('bluesky');
       if (this.config.destinations.includes('sharkey')) sources.push('sharkey');
       const degradedStale: string[] = [];
-      const blocked = sources.some(source => {
+      const blocker = sources.find(source => {
         const fresh = this.store.setting<string>(`fresh:${source}`, '');
         if (!fresh) return true;                                    // never observed at all — always blocks
-        const stale = Date.parse(now) - Date.parse(fresh) > this.config.sourceFreshnessSeconds * 1000;
+        const stale = Date.parse(cycleStart) - Date.parse(fresh) > this.config.sourceFreshnessSeconds * 1000;
         // X freshness is never relaxed: without a current scan of the source itself we cannot know the
         // thread, so a stale or pre-cutoff X watermark always blocks.
         if (source === 'x') return stale || fresh < batch.cutoffAt;
@@ -389,7 +397,17 @@ export class Engine {
         if (this.store.setting<number>(`collect_failures:${source}`, 0) >= DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES) { degradedStale.push(source); return false; }
         return true;
       });
-      if (blocked) continue;
+      if (blocker) {
+        // Waiting on a scan is normal and silent, but a batch still blocked long after it should have
+        // sealed sits in `open`, which raises no notice — the owner only found these in the Web UI.
+        // `error` is the level the Telegram forwarder picks up.
+        const alerted = `seal_stuck:${batch.id}`;
+        if (Date.parse(now) - Date.parse(batch.settleAt) > SEAL_STUCK_ALERT_MS && !this.store.setting(alerted, false)) {
+          this.store.setSetting(alerted, true);
+          this.store.event('error', `${batch.id} is still unpublished ${Math.round((Date.parse(now) - Date.parse(batch.settleAt)) / 60_000)} min after it should have sealed: no fresh enough ${blocker} scan (last ${this.store.setting<string>(`fresh:${blocker}`, '') || 'never'}, SOURCE_FRESHNESS_SECONDS=${this.config.sourceFreshnessSeconds}). Send /approve ${batch.id} to publish it now`, batch.id);
+        }
+        continue;
+      }
       if (degradedStale.length) this.store.event('warn', `Sealing ${batch.id} with stale downstream mirror data (${degradedStale.join(', ')} unreachable); manual-mirror detection may be incomplete`, batch.id);
       const posts = this.store.batchPosts(batch.id).map(p => p.post);
       const mirror = batch.platform === 'x' ? decideMirror(posts, this.store.mirrors(now)) : { state: 'none', reason: 'local_schedule' } as MirrorDecision;

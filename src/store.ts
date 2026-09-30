@@ -60,6 +60,11 @@ export class Store {
       classification=(SELECT CASE state WHEN 'sealed' THEN 'ready' WHEN 'mirror' THEN 'manual_mirror' WHEN 'ignored' THEN 'ignored' ELSE 'mirror_review' END FROM batches WHERE id=posts.batch_id),
       reason=(SELECT reason FROM batches WHERE id=posts.batch_id)
       WHERE classification='collecting' AND batch_id IN (SELECT id FROM batches WHERE state<>'open')`).run();
+    // One-off repair: Bluesky post URLs used to percent-encode the DID (did%3Aplc%3A…), which bsky.app
+    // rejects as "Invalid DID or handle". Posts are INSERT OR IGNORE, so stored rows never refresh on their own.
+    for (const table of ['posts', 'mirrors']) {
+      this.db.prepare(`UPDATE ${table} SET payload=replace(replace(payload,'bsky.app/profile/did%3Aplc%3A','bsky.app/profile/did:plc:'),'bsky.app/profile/did%3Aweb%3A','bsky.app/profile/did:web:') WHERE instr(payload,'bsky.app/profile/did%3A')`).run();
+    }
     if (path !== ':memory:') chmodSync(path, 0o600);
   }
   acquireRuntimeLock(): () => void {
