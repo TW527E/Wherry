@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { Store } from '../src/store.js';
 import { Engine, collectCycle, decideMirror, exceedsXLimit, holdIsApprovable, unsupportedReason } from '../src/engine.js';
+import { readableEvent } from '../src/labels.js';
 import type { Attachment, Collector, Destination, SourcePost, SourceSnapshot, Transport } from '../src/types.js';
 
 const base = Date.parse('2026-09-19T00:00:00.000Z');
@@ -590,6 +591,8 @@ test('the owner can hold or retry, and already delivered batches are protected',
   assert.equal(store.claimJob(delivered.id), true);
   store.updateJob(delivered.id, 'succeeded');
   assert.throws(() => engine.action('skip', 'x:900'), /in-flight|delivered/i);
+  // Guards the Web UI's translation against a reworded log line silently falling back to raw English.
+  for (const e of store.events(100)) assert.ok(readableEvent(e.message), `untranslated event: ${e.message}`);
   assert.throws(() => engine.action('retry', delivered.id), /unknown|failed|review/i);
     store.updateJob(delivered.id, 'failed', 'explicit rejection');
     assert.doesNotThrow(() => engine.action('retry', delivered.id));

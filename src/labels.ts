@@ -58,3 +58,60 @@ export function describe(code: string | undefined): string {
   const label = LABELS[code];
   return label ? `${label}（${code}）` : code;
 }
+
+export const PLATFORM_NAMES: Record<string, string> = { x: 'X', bluesky: 'Bluesky', sharkey: 'Sharkey', telegram: 'Telegram', local: '本地排程' };
+const P = (platform: string): string => PLATFORM_NAMES[platform] ?? platform;
+const L = (code: string): string => LABELS[code] ?? code;
+const ACTIONS: Record<string, string> = { approve: '批准發布', skip: '略過', mirror: '標記為手動鏡像' };
+
+/**
+ * The event log is written in English for greppable logs; these patterns turn the messages the code
+ * emits into zh-Hant for the Web UI. Order matters: the generic `platform: error` pattern is last.
+ * A message nothing matches returns undefined, and the UI shows it raw behind a disclosure.
+ */
+const EVENTS: Array<[RegExp, (...m: string[]) => string]> = [
+  [/^\[preview\] (\w+) (part|footer): ([\s\S]*)$/, (d, k, t) => `預覽：本來會發到 ${P(d)} 的${k === 'footer' ? '頁尾' : '內容'}：${t}`],
+  [/^(\w+): (\d+) new records from (\d+) collected( \(baseline only\))?; newest=\S+ baseline=\S+(?: — ([\s\S]*))?$/,
+    (p, added, seen, base, warn) => `${P(p)}：讀到 ${seen} 則，${base ? '首次掃描，只建立基準' : added === '0' ? '沒有新貼文' : `新增 ${added} 則`}${warn ? `；警告：${warn}` : ''}`],
+  [/^(\w+): delivered (\d+) parts$/, (d, n) => `${P(d)}：已送出 ${n} 則`],
+  [/^(\w+) collection failed: ([\s\S]*)$/, (p, e) => `讀取 ${P(p)} 失敗：${e}`],
+  [/^Service started in (\w+) mode on \S+$/, m => `服務已啟動（${m === 'live' ? '正式模式' : '預覽模式'}）`],
+  [/^Service cycle failed: ([\s\S]*)$/, e => `定期檢查失敗：${e}`],
+  [/^Startup cycle failed: ([\s\S]*)$/, e => `啟動後第一次檢查失敗：${e}`],
+  [/^Background task failed: ([\s\S]*)$/, e => `背景工作失敗：${e}`],
+  [/^Telegram update handling failed: ([\s\S]*)$/, e => `處理 Telegram 訊息失敗：${e}`],
+  [/^Telegram command polling failed: ([\s\S]*)$/, e => `讀取 Telegram 指令失敗：${e}`],
+  [/^Telegram command failed: ([\s\S]*)$/, e => `Telegram 指令執行失敗：${e}`],
+  [/^Telegram setMyCommands failed: ([\s\S]*)$/, e => `設定 Telegram 指令選單失敗：${e}`],
+  [/^Telegram reminder update failed; saved choice will be retried: ([\s\S]*)$/, e => `更新 Telegram 提醒失敗，會再重試：${e}`],
+  [/^Telegram review notice update failed; will retry: ([\s\S]*)$/, e => `更新 Telegram 待決通知失敗，會再重試：${e}`],
+  [/^Could not delete uploaded session message: ([\s\S]*)$/, e => `無法刪除你上傳的 session 訊息：${e}`],
+  [/^X session uploaded via Telegram for @(\S*); authenticated=(\w+); messageDeleted=(\w+)$/,
+    (h, ok, del) => `已透過 Telegram 安裝 @${h} 的 X session，${ok === 'true' ? '驗證成功' : '但驗證沒通過'}${del === 'true' ? '' : '（上傳的訊息沒刪掉，請手動刪除）'}`],
+  [/^X session upload failed: ([\s\S]*)$/, e => `X session 上傳失敗：${e}`],
+  [/^Native post held: (\w+)$/, r => `貼文暫停同步：${L(r)}`],
+  [/^(\w+) post (\S+) is held for your decision \((\w+)\)/, (p, id, r) => `${P(p)} 貼文 ${id} 等你決定（${L(r)}），處理前不會同步`],
+  [/^X self-reply (\S+) continues (\S+), which was never collected/, (id, parent) => `X 自回覆 ${id} 接在沒讀到的貼文 ${parent} 後面，不會同步（可調高 X_MAX_PAGES 或更常檢查）`],
+  [/^X self-reply (\S+) came (\d+)s after its thread window closed \(THREAD_WINDOW_SECONDS=(\d+)\)/,
+    (id, late, win) => `X 自回覆 ${id} 比串文窗口晚了 ${late} 秒（窗口 ${win} 秒），這則和之後的串文都不會同步`],
+  [/^X self-reply (\S+) could not join batch (\S+) \(state (\w+)\)/, (id, b, s) => `X 自回覆 ${id} 無法加入批次 ${b}（${L(s)}），不會同步`],
+  [/^Sealing (\S+) with stale downstream mirror data \((.+) unreachable\)/, (b, list) => `批次 ${b} 已封存，但 ${list.split(', ').map(P).join('、')} 連不上，手動鏡像判斷可能不完整`],
+  [/^X batch held: (\w+)$/, r => `X 批次暫停：${L(r)}`],
+  [/^X batch confirmed as manual mirror of (\d+) downstream/, n => `X 批次已確認是 ${n} 則下游貼文的手動鏡像，不會反向同步`],
+  [/^Manual mirror registered after delivery started/, () => '發送開始後才登記手動鏡像；請檢查其他平台的貼文，程式不會自動刪除'],
+  [/^Manual X mirror registered/, () => '已登記 X 手動鏡像，待發送的回傳已取消'],
+  [/^Owner cancelled a job/, () => '你放棄了一個工作，不會再發送或重試'],
+  [/^Owner reconciled an unknown delivery/, () => '你確認了結果不明的發送，未確認的部分會重新發送'],
+  [/^Owner action: (\w+)$/, a => `你的操作：${ACTIONS[a] ?? a}`],
+  [/^No publisher configured for (\w+)$/, d => `${P(d)} 沒有設定發布器`],
+  [/^Dropped (\d+) baseline history posts/, n => `清掉 ${n} 則誤登記為手動鏡像的舊貼文`],
+  [/^(x|bluesky|sharkey|telegram): ([\s\S]*)$/, (d, e) => `${P(d)} 發送失敗：${e}`],
+];
+
+export function readableEvent(message: string): string | undefined {
+  for (const [pattern, format] of EVENTS) {
+    const match = pattern.exec(message);
+    if (match) return format(...match.slice(1).map(v => v ?? ''));
+  }
+  return undefined;
+}

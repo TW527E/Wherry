@@ -3,7 +3,7 @@ import { loadConfig, type AppConfig } from './config.js';
 import { SafeHttp } from './security/http.js';
 import { Store } from './store.js';
 import { Engine, Worker, collectCycle, holdIsApprovable, safeError } from './engine.js';
-import { LABELS, describe } from './labels.js';
+import { LABELS, PLATFORM_NAMES, describe, readableEvent } from './labels.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
 import { TelegramClient, type TelegramUpdateMessage } from './platforms/telegram.js';
@@ -247,7 +247,7 @@ function statusText({ engine, store }: CommandContext): string {
     .map(([state, n]) => `${LABELS[state]} ${n}`).join(' · ');
   const attention = jobs.filter(j => ATTENTION.has(j.state)).slice(0, 8).map(j =>
     `• ${j.destination} ${j.aggregateId}：${LABELS[j.state]}${j.error ? `（${j.error.slice(0, 80)}）` : ''}\n  ${j.state === 'unknown' ? '/reconcile' : '/retry'} ${j.id}\n  /cancel ${j.id}`);
-  const events = store.events(8).map(e => `${e.level === 'error' ? '❌' : e.level === 'warn' ? '⚠️' : '•'} ${ago(e.at)}：${e.message.slice(0, 120)}`);
+  const events = store.events(8).map(e => `${e.level === 'error' ? '❌' : e.level === 'warn' ? '⚠️' : '•'} ${ago(e.at)}：${(readableEvent(e.message) ?? e.message).slice(0, 120)}`);
   return [
     '📊 Wherry 狀態',
     `模式：${config.mode === 'live' ? '正式（會發布）' : '預覽（不會發布）'}`,
@@ -402,7 +402,7 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
     mode: runtime.config.mode,
     xSession: runtime.store.setting<string>('x:session_state', runtime.config.x.enabled ? 'unknown' : 'disabled'),
     tokenRequired: Boolean(runtime.config.webToken), destinations: runtime.config.destinations,
-    jobs: runtime.store.jobs(100), batches: runtime.store.batches(100), held: heldBatches(runtime.engine), events: runtime.store.events(50),
+    jobs: runtime.store.jobs(100), batches: runtime.store.batches(100), held: heldBatches(runtime.engine), events: runtime.store.events(50).map(e => ({ ...e, text: readableEvent(e.message) })),
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
   app.post('/api/scan', async () => { await runtime.once(); return { ok: true }; });
@@ -473,6 +473,8 @@ summary{cursor:pointer;color:var(--muted);font-size:.85rem;margin-top:.6rem}
 .evt{display:grid;grid-template-columns:auto 1fr;gap:.1rem .6rem;font-size:.82rem;padding:.4rem 0;border-top:1px solid var(--line)}
 .evt:first-child{border-top:0}.evt time{color:var(--muted);white-space:nowrap}.evt span{word-break:break-word}
 .evt.lv-error span{color:var(--err)}.evt.lv-warn span{color:var(--warn)}
+.evt summary{margin:0;font-size:.82rem}.evt.lv-error summary{color:var(--err)}.evt.lv-warn summary{color:var(--warn)}.evt details span{display:block;margin-top:.2rem}
+button.small{font-size:.76rem;padding:.15rem .65rem}
 .toast{position:fixed;left:50%;bottom:1.2rem;transform:translate(-50%,.8rem);background:var(--text);color:var(--bg);padding:.6rem 1.1rem;border-radius:999px;font-size:.87rem;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100% - 2rem)}
 .toast.show{opacity:1;transform:translate(-50%,0)}.toast.bad{background:var(--err);color:#fff}
 .row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
@@ -494,18 +496,18 @@ input[type=checkbox]{width:1.05rem;height:1.05rem;margin:0;accent-color:var(--ac
 </div>
 <div class="col side">
 <section><h2>排程貼文</h2><p class="hint">只發布到其他平台；X 仍需你自己發。</p><form id="schedule"><label for="s-text" style="margin-top:0">內容</label><textarea id="s-text" placeholder="要同步到其他平台的文字" required></textarea><div id="s-count" class="meta" style="text-align:right">0 字</div><label for="s-due">發布時間（留空＝立即）</label><input id="s-due" type="datetime-local"><div class="actions"><button type="submit" class="go">建立排程</button><span class="meta">⌘／Ctrl + Enter</span></div></form></section>
-<section><h2>近期事件 <span id="evt-count" class="count" hidden></span></h2><div id="events"><div class="empty">載入中…</div></div></section>
+<section><h2>近期事件 <span id="evt-count" class="count" hidden></span><span class="spacer"></span><button type="button" id="evt-raw" class="ghost small" aria-pressed="false">顯示原文</button></h2><div id="events"><div class="empty">載入中…</div></div></section>
 </div>
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 const L=${JSON.stringify(LABELS)};
-const PLATFORM={x:'X',bluesky:'Bluesky',sharkey:'Sharkey',telegram:'Telegram',local:'本地排程'};
+const PLATFORM=${JSON.stringify(PLATFORM_NAMES)};
 const KIND={publish:'發布',reminder:'X 提醒',ops:'待決通知'};
 const SESSION={authenticated:['X 已登入','ok'],error:['X 登入失效','err'],unknown:['X 登入未確認',''],disabled:['X 讀取未啟用','']};
 const TONE={succeeded:'ok',sealed:'ok',ready:'ok',manual_mirror:'ok',mirror:'ok',open:'info',collecting:'info',pending:'info',running:'info',review:'warn',mirror_review:'warn',failed:'err',unknown:'err',unsupported:'err'};
 const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄'};
 const $=s=>document.querySelector(s);
-const busy=new Set();const picked=new Set();let scopes={};let status={};let loading=false;
+const busy=new Set();const picked=new Set();const openEvt=new Set();let rawEvents=false;try{rawEvents=localStorage.getItem('evtRaw')==='1'}catch{}let scopes={};let status={};let loading=false;
 const rtf=new Intl.RelativeTimeFormat('zh-Hant',{numeric:'auto'});
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function label(code){return esc(L[code]||code)}
@@ -553,6 +555,12 @@ return '<div class="item'+(attn?' attn':'')+'"><div class="head">'+(attn?pick(j.
 function postItem(p){return '<div class="item"><div class="head">'+tag(p.classification)+'<b>'+esc(PLATFORM[p.post.platform]||p.post.platform)+'</b><span class="meta">'+label(p.reason)+'</span><span class="spacer"></span><span class="meta">'+when(p.post.createdAt)+'</span></div>'
 +(p.post.text?'<div class="text short">'+esc(p.post.text)+'</div>':'')
 +'<div class="note">'+[link(p.post.url,'原文'),p.batchId?'<span class="id">'+esc(p.batchId)+'</span>':''].filter(Boolean).join(' · ')+'</div></div>'}
+// Readable by default; the header button flips every event to its raw log line. A line with no
+// translation stays behind a disclosure, kept open across the 5s refresh by its timestamp.
+function evtItem(e){const body=rawEvents?'<span>'+esc(e.message)+'</span>':e.text?'<span title="'+esc(e.message)+'">'+esc(e.text)+'</span>'
+:'<details data-k="'+esc(e.at)+'"'+(openEvt.has(e.at)?' open':'')+'><summary>無法解讀的事件，點開看原文</summary><span>'+esc(e.message)+'</span></details>';
+return '<div class="evt lv-'+esc(e.level)+'">'+when(e.at)+body+'</div>'}
+function rawBtn(){const b=$('#evt-raw');b.textContent=rawEvents?'顯示解讀':'顯示原文';b.setAttribute('aria-pressed',String(rawEvents))}
 function count(id,n,hot){const el=document.getElementById(id);el.textContent=n;el.className='count'+(hot&&n?' hot':'')}
 function render(){const s=status;if(!s.mode)return;
 const mode=$('#mode');mode.textContent=s.mode==='live'?'正式模式':'預覽模式';mode.className='pill '+(s.mode==='live'?'ok':'warn');$('#preview').hidden=s.mode==='live';
@@ -572,7 +580,7 @@ $('#jobs-more').hidden=!done.length;$('#jobs-done-count').textContent=done.lengt
 const posts=s.posts||[];put('posts',posts.length?posts.slice(0,40).map(postItem).join(''):'<div class="empty">還沒讀到任何貼文。按「立即檢查」讀一次。</div>');
 const events=(s.events||[]).slice(0,25);const errors=events.filter(e=>e.level==='error'&&Date.now()-Date.parse(e.at)<86400000).length;
 const ec=$('#evt-count');ec.hidden=!errors;ec.textContent=errors+' 錯誤';ec.className='count hot';
-put('events',events.length?events.map(e=>'<div class="evt lv-'+esc(e.level)+'">'+when(e.at)+'<span>'+esc(e.message)+'</span></div>').join(''):'<div class="empty">尚無事件。</div>')}
+put('events',events.length?events.map(evtItem).join(''):'<div class="empty">尚無事件。</div>')}
 async function load(){if(loading)return;loading=true;
 try{const [s,posts]=await Promise.all([fetch('/api/status').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}),fetch('/api/posts').then(r=>r.ok?r.json():[]).catch(()=>[])]);
 status=Object.assign(s,{posts});$('#offline').hidden=true;$('#updated').textContent='更新於 '+new Date().toLocaleTimeString('zh-TW',{hour12:false});render()}
@@ -584,6 +592,8 @@ else if(d.clear){for(const i of scopes[d.clear].items)picked.delete(i.id);render
 document.addEventListener('change',e=>{const d=e.target.dataset||{};
 if(d.pick){if(e.target.checked)picked.add(d.pick);else picked.delete(d.pick);render()}
 else if(d.all){for(const i of scopes[d.all].items){if(e.target.checked)picked.add(i.id);else picked.delete(i.id)}render()}});
+document.addEventListener('toggle',e=>{const k=e.target.dataset&&e.target.dataset.k;if(k){if(e.target.open)openEvt.add(k);else openEvt.delete(k)}},true);
+$('#evt-raw').addEventListener('click',()=>{rawEvents=!rawEvents;try{localStorage.setItem('evtRaw',rawEvents?'1':'')}catch{}rawBtn();render()});rawBtn();
 $('#scan').addEventListener('click',async e=>{const b=e.currentTarget;b.disabled=true;b.textContent='檢查中…';
 try{await post('/api/scan');toast('檢查完成')}catch(err){toast('檢查失敗：'+err.message,true)}finally{b.disabled=false;b.textContent='立即檢查';load()}});
 $('#token-box').addEventListener('submit',e=>{e.preventDefault();try{localStorage.setItem('webToken',$('#token').value.trim())}catch{}$('#token-box').hidden=true;toast('已儲存 token')});
