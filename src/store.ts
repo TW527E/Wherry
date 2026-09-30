@@ -54,6 +54,11 @@ export class Store {
     // confirmed pairing that manual_x_links still references.
     const pruned = Number(this.db.prepare("DELETE FROM mirrors WHERE state='pending' AND post_key IN (SELECT key FROM posts WHERE classification='baseline')").run().changes);
     if (pruned) this.event('info', `Dropped ${pruned} baseline history posts that had been registered as pending manual mirrors; they could only hold new X posts for review`);
+    // One-off repair: Bluesky post URLs used to percent-encode the DID (did%3Aplc%3A…), which bsky.app
+    // rejects as "Invalid DID or handle". Posts are INSERT OR IGNORE, so stored rows never refresh on their own.
+    for (const table of ['posts', 'mirrors']) {
+      this.db.prepare(`UPDATE ${table} SET payload=replace(replace(payload,'bsky.app/profile/did%3Aplc%3A','bsky.app/profile/did:plc:'),'bsky.app/profile/did%3Aweb%3A','bsky.app/profile/did:web:') WHERE instr(payload,'bsky.app/profile/did%3A')`).run();
+    }
     if (path !== ':memory:') chmodSync(path, 0o600);
   }
   acquireRuntimeLock(): () => void {
