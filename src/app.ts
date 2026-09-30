@@ -426,15 +426,17 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
   return app;
 }
 
+const icon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cdefs%3E%3ClinearGradient id='bg' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%232aa6f5'/%3E%3Cstop offset='1' stop-color='%230b6fc2'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='512' height='512' fill='url(%23bg)'/%3E%3Cpath d='M270 118 L356 146 Q338 224 366 300 L270 300 Z' fill='%23fff'/%3E%3Cpath d='M242 146 L242 300 L162 300 Q206 226 242 146 Z' fill='%23fff' opacity='.82'/%3E%3Crect x='250' y='104' width='14' height='212' rx='7' fill='%23fff'/%3E%3Cpath d='M132 318 H380 Q366 376 318 382 H194 Q146 376 132 318 Z' fill='%23fff'/%3E%3Cpath d='M116 420 q35 -22 70 0 t70 0 t70 0 t70 0' fill='none' stroke='%23fff' stroke-width='14' stroke-linecap='round' opacity='.55'/%3E%3C/svg%3E";
+
 // Client code stays free of backticks, backslashes and "${" so it can live in this template literal as-is.
-const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Wherry</title><style>
+const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Wherry</title><link rel="icon" href="${icon}"><style>
 :root{--bg:#f4f6f8;--card:#fff;--text:#0f1419;--muted:#5b6b78;--line:#e3e8ec;--soft:#eef2f4;--accent:#1d9bf0;--ok:#00875a;--warn:#9a6700;--err:#d1242f;--ok-bg:#dcf5ea;--warn-bg:#fff4d4;--err-bg:#fde8ea;--info-bg:#e2f1fd}
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--text:#e6edf3;--muted:#8d9aa7;--line:#2a323c;--soft:#222931;--accent:#4aa8f5;--ok:#3fcf8e;--warn:#e8b339;--err:#ff7b85;--ok-bg:#12352a;--warn-bg:#382c0c;--err-bg:#3f1a1f;--info-bg:#0f2a42}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Noto Sans TC",system-ui,sans-serif}
 header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);padding:.65rem 1rem}
 .bar{max-width:1180px;margin:0 auto;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
-h1{font-size:1.1rem;margin:0 .35rem 0 0}
+h1{font-size:1.1rem;margin:0 .35rem 0 0;display:flex;align-items:center;gap:.45rem}h1 img{border-radius:6px}
 .pill,.tag{font-size:.76rem;font-weight:600;padding:.15rem .55rem;border-radius:999px;background:var(--soft);color:var(--muted);white-space:nowrap}
 .tag{border-radius:6px}
 .ok{background:var(--ok-bg);color:var(--ok)}.warn{background:var(--warn-bg);color:var(--warn)}.err{background:var(--err-bg);color:var(--err)}.info{background:var(--info-bg);color:var(--accent)}
@@ -483,7 +485,7 @@ input[type=checkbox]{width:1.05rem;height:1.05rem;margin:0;accent-color:var(--ac
 .bulk label{display:inline-flex;align-items:center;gap:.35rem;margin:0 .3rem 0 0;color:var(--text);font-size:.85rem;cursor:pointer}
 [hidden]{display:none!important}
 </style></head><body>
-<header><div class="bar"><h1>Wherry</h1><span id="mode" class="pill">載入中…</span><span id="xsess" class="pill" hidden></span><span class="spacer"></span><span id="updated" class="updated"></span><button id="scan" title="收集一次並發送到期的工作">立即檢查</button></div></header>
+<header><div class="bar"><h1><img src="${icon}" alt="" width="24" height="24">Wherry</h1><span id="mode" class="pill">載入中…</span><span id="xsess" class="pill" hidden></span><span class="spacer"></span><span id="updated" class="updated"></span><button id="scan" title="收集一次並發送到期的工作">立即檢查</button></div></header>
 <main>
 <div class="col">
 <div id="offline" class="banner err" role="alert" hidden>連不上 Wherry 服務，會自動重試。</div>
