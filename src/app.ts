@@ -2,7 +2,8 @@ import { FastifyInstance, fastify } from 'fastify';
 import { loadConfig, type AppConfig } from './config.js';
 import { SafeHttp } from './security/http.js';
 import { Store } from './store.js';
-import { Engine, Worker, collectCycle, safeError } from './engine.js';
+import { Engine, Worker, collectCycle, holdIsApprovable, safeError } from './engine.js';
+import { LABELS, describe } from './labels.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
 import { TelegramClient, type TelegramUpdateMessage } from './platforms/telegram.js';
@@ -220,6 +221,43 @@ function helpText(): string {
   return ['📋 Wherry 指令', ...lines, '', '💡 更新 X 登入：打 /session 再上傳 x-session.json（或直接在檔案說明打 /session）。上傳的檔案會在安裝後自動刪除。', 'ℹ️ X 發文一律手動；本工具只讀 X、把新貼文同步到 Bluesky / Sharkey。'].join('\n');
 }
 
+const SESSION_LABELS: Record<string, string> = { authenticated: '已登入', error: '登入失效，請重新 /session', unknown: '尚未確認', disabled: '未啟用' };
+const ATTENTION = new Set(['failed', 'unknown', 'review']);
+
+function ago(iso: string): string {
+  const minutes = Math.round((Date.now() - Date.parse(iso)) / 60_000);
+  return minutes < 1 ? '剛剛' : minutes < 60 ? `${minutes} 分鐘前` : minutes < 1440 ? `${Math.round(minutes / 60)} 小時前` : `${Math.round(minutes / 1440)} 天前`;
+}
+
+/** Batches still waiting on the owner, with what the owner needs to decide: an excerpt and whether approve can publish. */
+function heldBatches(engine: Engine) {
+  return engine.store.batches(100).filter(b => b.state === 'review' || b.state === 'open').map(b => {
+    const posts = engine.store.batchPosts(b.id).map(p => p.post);
+    const hold = engine.holdReason(posts);
+    return { ...b, approvable: !hold || holdIsApprovable(hold), count: posts.length, text: posts[0]?.text ?? '', url: posts[0]?.url };
+  });
+}
+
+function statusText({ engine, store }: CommandContext): string {
+  const { config } = engine;
+  const jobs = store.jobs(100);
+  const tally = (['failed', 'unknown', 'review', 'pending', 'running'] as const)
+    .map(state => [state, jobs.filter(j => j.state === state).length] as const).filter(([, n]) => n)
+    .map(([state, n]) => `${LABELS[state]} ${n}`).join(' · ');
+  const attention = jobs.filter(j => ATTENTION.has(j.state)).slice(0, 8).map(j =>
+    `• ${j.destination} ${j.aggregateId}：${LABELS[j.state]}${j.error ? `（${j.error.slice(0, 80)}）` : ''}\n  ${j.state === 'unknown' ? '/reconcile' : '/retry'} ${j.id}`);
+  const events = store.events(8).map(e => `${e.level === 'error' ? '❌' : e.level === 'warn' ? '⚠️' : '•'} ${ago(e.at)}：${e.message.slice(0, 120)}`);
+  return [
+    '📊 Wherry 狀態',
+    `模式：${config.mode === 'live' ? '正式（會發布）' : '預覽（不會發布）'}`,
+    `X 登入：${SESSION_LABELS[store.setting<string>('x:session_state', config.x.enabled ? 'unknown' : 'disabled')] ?? '尚未確認'}`,
+    `待你決定：${heldBatches(engine).length} 批（/pending 查看）`,
+    `工作：${tally || '沒有進行中的工作'}`,
+    ...(attention.length ? ['', '需要處理：', ...attention] : []),
+    ...(events.length ? ['', '近期事件：', ...events] : []),
+  ].join('\n');
+}
+
 async function handleCommand(raw: string, context: CommandContext): Promise<void> {
   // Accept "/cmd", "/cmd@BotName" and arguments; ignore anything that is not a slash command.
   const parts = raw.trim().split(/\s+/u);
@@ -228,12 +266,15 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
   if (!command.startsWith('/')) return;
   try {
     if (command === '/help' || command === '/start') await context.telegram.sendPlain(helpText(), 'private');
-    else if (command === '/status') await context.telegram.sendPlain(JSON.stringify({ mode: context.engine.config.mode, xSession: context.store.setting('x:session_state', context.engine.config.x.enabled ? 'unknown' : 'disabled'), jobs: context.store.jobs(20), events: context.store.events(10) }, null, 2).slice(0, 3900), 'private');
+    else if (command === '/status') await context.telegram.sendPlain(statusText(context).slice(0, 3900), 'private');
     else if (command === '/pending') {
-      const held = context.store.batches(50).filter(b => ['review', 'open'].includes(b.state));
+      const held = heldBatches(context.engine);
       const reminders = context.store.pendingReminders(context.engine.config.telegram.privateChatId);
-      const body = [...held.map(b => `• ${b.id}\n  狀態：${b.state}（${b.reason}）`), ...reminders.map(r => `• ${r.aggregateId}\n  X 提醒：${r.state}（請操作原提醒或 /mirror <id> <X_URL>）`)].join('\n') || '目前沒有等待處理的批次或提醒。';
-      await context.telegram.sendPlain(`待處理批次（${held.length}）\n${body}`, 'private');
+      const body = [
+        ...held.map(b => `• ${b.id}｜${LABELS[b.state]}：${describe(b.reason)}${b.text ? `\n  ${Array.from(b.text).slice(0, 60).join('')}` : ''}\n  ${b.approvable ? `/approve ${b.id} · ` : ''}/skip ${b.id} · /mirror ${b.id}`),
+        ...reminders.map(r => `• ${r.aggregateId}\n  X 提醒：${r.state}（請操作原提醒或 /mirror <id> <X_URL>）`),
+      ].join('\n\n') || '目前沒有等待處理的批次或提醒。';
+      await context.telegram.sendPlain(`待處理批次（${held.length}）\n\n${body}`, 'private');
     }
     else if (['/map', '/maps', '/unmap'].includes(command)) {
       let reply: string;
@@ -358,84 +399,174 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
   app.get('/api/status', async () => ({
     mode: runtime.config.mode,
     xSession: runtime.store.setting<string>('x:session_state', runtime.config.x.enabled ? 'unknown' : 'disabled'),
-    jobs: runtime.store.jobs(100), batches: runtime.store.batches(100), events: runtime.store.events(50),
+    tokenRequired: Boolean(runtime.config.webToken), destinations: runtime.config.destinations,
+    jobs: runtime.store.jobs(100), batches: runtime.store.batches(100), held: heldBatches(runtime.engine), events: runtime.store.events(50),
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
   app.post('/api/scan', async () => { await runtime.once(); return { ok: true }; });
   app.post<{ Body: { action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile'; id: string } }>('/api/action', async (request, reply) => {
-    try { runtime.engine.action(request.body.action, request.body.id); return { ok: true }; }
+    try {
+      runtime.engine.action(request.body.action, request.body.id);
+      // Deliver now instead of on the next poll, like the Telegram commands do.
+      if (request.body.action !== 'skip' && request.body.action !== 'mirror') void runtime.worker.run().catch(() => undefined);
+      return { ok: true };
+    }
     catch (error) { return reply.code(400).send({ error: safeError(error) }); }
   });
-  app.post<{ Body: { text: string; attachments?: unknown[]; dueAt: string } }>('/api/schedule', async (request, reply) => {
-    try { return { id: runtime.engine.schedule({ text: request.body.text, attachments: request.body.attachments as never, dueAt: request.body.dueAt }) }; }
+  app.post<{ Body: { text: string; attachments?: unknown[]; dueAt?: string } }>('/api/schedule', async (request, reply) => {
+    // No dueAt = now, stamped here: a client-side "now" is already in the past when it arrives.
+    const now = new Date().toISOString();
+    try { return { id: runtime.engine.schedule({ text: request.body.text, attachments: request.body.attachments as never, dueAt: request.body.dueAt || now }, now) }; }
     catch (error) { return reply.code(400).send({ error: safeError(error) }); }
   });
   app.get('/', async (_request, reply) => { reply.type('text/html; charset=utf-8'); return html; });
   return app;
 }
 
-const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wherry</title><style>
-:root{--bg:#0f1419;--card:#fff;--line:#e1e8ed;--muted:#536471;--accent:#1d9bf0;--ok:#00ba7c;--warn:#f4b400;--err:#f4212e}
-*{box-sizing:border-box}body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:#f7f9f9;color:#0f1419}
-header{background:var(--bg);color:#fff;padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
-header h1{font-size:1.15rem;margin:0;font-weight:700}
-.pill{font-size:.8rem;padding:.2rem .6rem;border-radius:999px;font-weight:600}
-.pill.live{background:var(--ok);color:#fff}.pill.preview{background:var(--warn);color:#000}
-main{max-width:1080px;margin:1.25rem auto;padding:0 1rem;display:grid;gap:1.25rem}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1rem 1.25rem}
-.card h2{font-size:1rem;margin:.1rem 0 .8rem}
-button{font:inherit;border:0;border-radius:999px;padding:.45rem .9rem;cursor:pointer;background:var(--accent);color:#fff;font-weight:600}
-button.ghost{background:#eff3f4;color:#0f1419}button.ok{background:var(--ok)}button.warn{background:var(--warn);color:#000}button.err{background:var(--err)}
-button:disabled{opacity:.5;cursor:default}
-.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
-.batch,.job{border:1px solid var(--line);border-radius:10px;padding:.7rem .9rem;margin:.5rem 0}
-.batch .meta,.job .meta{color:var(--muted);font-size:.82rem;word-break:break-all}
-.state{font-size:.75rem;font-weight:700;padding:.15rem .5rem;border-radius:6px;background:#eff3f4;color:#0f1419}
-.state.review,.state.failed,.state.unsupported,.state.mirror_review{background:#fde8e8;color:var(--err)}.state.open,.state.collecting{background:#fff4d6;color:#7a5b00}
-.state.succeeded,.state.sealed,.state.ready{background:#d7f5ea;color:#00734d}
-input,textarea{font:inherit;width:100%;padding:.5rem;border:1px solid var(--line);border-radius:8px}
-label{display:block;font-size:.85rem;color:var(--muted);margin:.4rem 0 .15rem}
-pre{background:#f7f9f9;border:1px solid var(--line);padding:.75rem;border-radius:8px;overflow:auto;font-size:.8rem;max-height:280px}
-.empty{color:var(--muted);font-size:.9rem;padding:.5rem 0}
-.evt{font-size:.82rem;padding:.25rem 0;border-bottom:1px solid var(--line)}.evt.error{color:var(--err)}
-.toast{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#0f1419;color:#fff;padding:.6rem 1rem;border-radius:999px;font-size:.85rem;opacity:0;transition:opacity .2s;pointer-events:none}
-.toast.show{opacity:1}
+// Client code stays free of backticks, backslashes and "${" so it can live in this template literal as-is.
+const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Wherry</title><style>
+:root{--bg:#f4f6f8;--card:#fff;--text:#0f1419;--muted:#5b6b78;--line:#e3e8ec;--soft:#eef2f4;--accent:#1d9bf0;--ok:#00875a;--warn:#9a6700;--err:#d1242f;--ok-bg:#dcf5ea;--warn-bg:#fff4d4;--err-bg:#fde8ea;--info-bg:#e2f1fd}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--text:#e6edf3;--muted:#8d9aa7;--line:#2a323c;--soft:#222931;--accent:#4aa8f5;--ok:#3fcf8e;--warn:#e8b339;--err:#ff7b85;--ok-bg:#12352a;--warn-bg:#382c0c;--err-bg:#3f1a1f;--info-bg:#0f2a42}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Noto Sans TC",system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);padding:.65rem 1rem}
+.bar{max-width:1180px;margin:0 auto;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+h1{font-size:1.1rem;margin:0 .35rem 0 0}
+.pill,.tag{font-size:.76rem;font-weight:600;padding:.15rem .55rem;border-radius:999px;background:var(--soft);color:var(--muted);white-space:nowrap}
+.tag{border-radius:6px}
+.ok{background:var(--ok-bg);color:var(--ok)}.warn{background:var(--warn-bg);color:var(--warn)}.err{background:var(--err-bg);color:var(--err)}.info{background:var(--info-bg);color:var(--accent)}
+.spacer{flex:1}.updated{font-size:.78rem;color:var(--muted)}@media (max-width:520px){.updated{display:none}}
+main{max-width:1180px;margin:1rem auto;padding:0 1rem;display:grid;gap:1rem}
+@media (min-width:960px){main{grid-template-columns:minmax(0,1fr) 360px;align-items:start}.side{position:sticky;top:4.2rem}}
+.col{display:grid;gap:1rem;min-width:0}
+.banner{border:1px solid var(--line);border-radius:12px;padding:.7rem 1rem;font-size:.88rem;background:var(--warn-bg)}
+.banner.err{background:var(--err-bg)}
+section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1rem 1.1rem}
+h2{font-size:1rem;margin:0 0 .7rem;display:flex;align-items:center;gap:.45rem}
+.count{font-size:.74rem;font-weight:700;background:var(--soft);color:var(--muted);border-radius:999px;padding:0 .5rem;min-width:1.4rem;text-align:center}
+.count.hot{background:var(--err);color:#fff}
+.hint{color:var(--muted);font-size:.83rem;margin:-.35rem 0 .6rem}
+.item{border:1px solid var(--line);border-radius:10px;padding:.7rem .85rem;margin-top:.55rem}
+.item.attn{border-left:3px solid var(--err)}.item.decide{border-left:3px solid var(--warn)}
+.head{display:flex;align-items:center;gap:.45rem;flex-wrap:wrap}
+.head .spacer{min-width:.5rem}
+.meta{color:var(--muted);font-size:.8rem}
+.id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.76rem;color:var(--muted);word-break:break-all}
+.text{margin:.4rem 0 0;white-space:pre-wrap;word-break:break-word;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.text.short{-webkit-line-clamp:2;font-size:.88rem}
+.note{font-size:.83rem;margin-top:.4rem;color:var(--muted)}.note.bad{color:var(--err);word-break:break-word}
+.actions{display:flex;gap:.45rem;flex-wrap:wrap;margin-top:.6rem;align-items:center}
+button{font:inherit;font-size:.86rem;font-weight:600;border:1px solid transparent;border-radius:999px;padding:.38rem .9rem;cursor:pointer;background:var(--accent);color:#fff}
+button.go{background:var(--ok)}button.ghost{background:transparent;border-color:var(--line);color:var(--text)}
+button:hover:not(:disabled){filter:brightness(1.08)}button.ghost:hover:not(:disabled){background:var(--soft)}
+button:disabled{opacity:.55;cursor:progress}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+input,textarea{font:inherit;width:100%;padding:.5rem .65rem;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
+textarea{resize:vertical;min-height:6rem}
+label{display:block;font-size:.83rem;color:var(--muted);margin:.55rem 0 .2rem}
+code{font-size:.85em;background:var(--soft);padding:0 .3rem;border-radius:4px}
+.empty{color:var(--muted);font-size:.88rem;padding:.3rem 0}
+summary{cursor:pointer;color:var(--muted);font-size:.85rem;margin-top:.6rem}
+.evt{display:grid;grid-template-columns:auto 1fr;gap:.1rem .6rem;font-size:.82rem;padding:.4rem 0;border-top:1px solid var(--line)}
+.evt:first-child{border-top:0}.evt time{color:var(--muted);white-space:nowrap}.evt span{word-break:break-word}
+.evt.lv-error span{color:var(--err)}.evt.lv-warn span{color:var(--warn)}
+.toast{position:fixed;left:50%;bottom:1.2rem;transform:translate(-50%,.8rem);background:var(--text);color:var(--bg);padding:.6rem 1.1rem;border-radius:999px;font-size:.87rem;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100% - 2rem)}
+.toast.show{opacity:1;transform:translate(-50%,0)}.toast.bad{background:var(--err);color:#fff}
+.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+[hidden]{display:none!important}
 </style></head><body>
-<header><h1>🔗 Wherry</h1><span id="mode" class="pill">…</span><span id="xsess" class="pill ghost" style="background:#eff3f4;color:#0f1419"></span><span style="flex:1"></span>
-<button onclick="scan(this)">立即檢查</button><button class="ghost" onclick="load()">重新整理</button></header>
+<header><div class="bar"><h1>Wherry</h1><span id="mode" class="pill">載入中…</span><span id="xsess" class="pill" hidden></span><span class="spacer"></span><span id="updated" class="updated"></span><button id="scan" title="收集一次並發送到期的工作">立即檢查</button></div></header>
 <main>
-<div class="card"><label>Web token（僅在 .env 設定 WEB_TOKEN 時需要）</label><input id="token" type="password" placeholder="Bearer token"></div>
-<div class="card"><h2>待處理批次</h2><div id="batches"><div class="empty">載入中…</div></div></div>
-<div class="card"><h2>排程一則本地貼文（不會自動發到 X）</h2>
-<label>發布時間（留空＝立即）</label><input id="s-due" type="datetime-local">
-<label>內容</label><textarea id="s-text" rows="3" placeholder="要排程同步到下游的文字"></textarea>
-<div class="row" style="margin-top:.6rem"><button class="ok" onclick="schedule(this)">建立排程</button></div></div>
-<div class="card"><h2>工作佇列</h2><div id="jobs"><div class="empty">載入中…</div></div></div>
-<div class="card"><h2>最近讀到的貼文</h2><div class="meta" style="color:var(--muted);font-size:.82rem;margin-bottom:.4rem">每則的分類與原因；沒有同步的貼文為什麼沒同步，看這裡。</div><div id="posts"><div class="empty">載入中…</div></div></div>
-<div class="card"><h2>近期事件</h2><div id="events"></div></div>
-</main><div id="toast" class="toast"></div>
+<div class="col">
+<div id="offline" class="banner err" role="alert" hidden>連不上 Wherry 服務，會自動重試。</div>
+<div id="preview" class="banner" hidden><b>預覽模式</b>：照常讀取與分類，但不會真的發布到任何平台。確認行為正確後把 <code>APP_MODE</code> 改成 <code>live</code>。</div>
+<form id="token-box" class="banner" hidden><label for="token" style="margin-top:0">這個服務設定了 WEB_TOKEN，操作前請先輸入：</label><div class="row"><input id="token" type="password" autocomplete="off" style="flex:1;min-width:12rem"><button type="submit">儲存</button></div></form>
+<section><h2>等你決定 <span id="held-count" class="count">0</span></h2><p class="hint">X 上無法自動判斷的新內容會停在這裡；串文收集中的批次也可以提早發布。</p><div id="held"><div class="empty">載入中…</div></div></section>
+<section><h2>發送工作 <span id="jobs-count" class="count">0</span></h2><div id="jobs"><div class="empty">載入中…</div></div><details id="jobs-more" hidden><summary>已完成與已取消（<span id="jobs-done-count">0</span>）</summary><div id="jobs-done"></div></details></section>
+<section><h2>最近讀到的貼文</h2><p class="hint">每則的分類與原因；沒同步的貼文為什麼沒同步，看這裡。</p><div id="posts"><div class="empty">載入中…</div></div></section>
+</div>
+<div class="col side">
+<section><h2>排程貼文</h2><p class="hint">只發布到其他平台；X 仍需你自己發。</p><form id="schedule"><label for="s-text" style="margin-top:0">內容</label><textarea id="s-text" placeholder="要同步到其他平台的文字" required></textarea><div id="s-count" class="meta" style="text-align:right">0 字</div><label for="s-due">發布時間（留空＝立即）</label><input id="s-due" type="datetime-local"><div class="actions"><button type="submit" class="go">建立排程</button><span class="meta">⌘／Ctrl + Enter</span></div></form></section>
+<section><h2>近期事件 <span id="evt-count" class="count" hidden></span></h2><div id="events"><div class="empty">載入中…</div></div></section>
+</div>
+</main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
-const $=s=>document.querySelector(s);const tok=$('#token');tok.value=localStorage.getItem('webToken')||'';
-tok.addEventListener('change',()=>localStorage.setItem('webToken',tok.value));
-function headers(){const h={'content-type':'application/json'};const t=localStorage.getItem('webToken');if(t)h.authorization='Bearer '+t;return h}
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
-async function act(verb,id,btn){if(btn)btn.disabled=true;try{const r=await fetch('/api/action',{method:'POST',headers:headers(),body:JSON.stringify({action:verb,id})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);toast('已'+({skip:'略過',mirror:'標記鏡像',approve:'批准',retry:'重試',reconcile:'重新發送'}[verb]||verb));await load()}catch(e){toast('失敗：'+e.message);if(btn)btn.disabled=false}}
-async function scan(btn){if(btn)btn.disabled=true;try{const r=await fetch('/api/scan',{method:'POST',headers:headers(),body:'{}'});if(!r.ok)throw new Error(r.status);toast('已檢查');await load()}catch(e){toast('失敗：'+e.message)}finally{if(btn)btn.disabled=false}}
-async function schedule(btn){const text=$('#s-text').value.trim();if(!text){toast('請輸入內容');return}const due=$('#s-due').value;const dueAt=due?new Date(due).toISOString():new Date().toISOString();btn.disabled=true;try{const r=await fetch('/api/schedule',{method:'POST',headers:headers(),body:JSON.stringify({text,dueAt})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);toast('已排程 '+(j.id||''));$('#s-text').value='';await load()}catch(e){toast('失敗：'+e.message)}finally{btn.disabled=false}}
-function batchCard(b){const acts=(b.state==='review'||b.state==='open')?'<button class="ok" onclick="act(\\'approve\\',\\''+b.id+'\\',this)">批准發布</button> <button class="ghost" onclick="act(\\'skip\\',\\''+b.id+'\\',this)">略過</button> <button class="warn" onclick="act(\\'mirror\\',\\''+b.id+'\\',this)">標記為我手動鏡像</button>':'<span class="meta">此批次已處理，無可用操作</span>';
-return '<div class="batch"><div class="row"><span class="state '+esc(b.state)+'">'+esc(b.state)+'</span><b>'+esc(b.id)+'</b></div><div class="meta">原因：'+esc(b.reason)+' · root '+esc(b.rootId)+' · '+esc(b.rootCreatedAt)+'</div><div class="row" style="margin-top:.5rem">'+acts+'</div></div>'}
-function jobCard(j){const canRetry=(j.state==='failed'||j.state==='review');const canReconcile=(j.state==='unknown');return '<div class="job"><div class="row"><span class="state '+esc(j.state)+'">'+esc(j.state)+'</span><b>'+esc(j.destination)+'</b><span class="meta">'+esc(j.aggregateId)+'</span></div>'+(j.error?'<div class="meta">錯誤：'+esc(j.error)+'</div>':'')+(canRetry?'<div class="row" style="margin-top:.5rem"><button class="ghost" onclick="act(\\'retry\\',\\''+j.id+'\\',this)">重試</button></div>':'')+(canReconcile?'<div class="row" style="margin-top:.5rem"><button class="warn" onclick="if(confirm(\\'請先到該平台確認這則沒有成功發出（沒有重複貼文），再繼續。確定重新發送未確認的部分？\\'))act(\\'reconcile\\',\\''+j.id+'\\',this)">已確認遠端、重新發送</button></div>':'')+'</div>'}
-function postCard(p){return '<div class="job"><div class="row"><span class="state '+esc(p.classification)+'">'+esc(p.classification)+'</span><b>'+esc(p.post.platform)+'</b><span class="meta">'+esc(p.post.id)+'</span></div><div class="meta">原因：'+esc(p.reason)+(p.batchId?' · 批次 '+esc(p.batchId):'')+' · '+esc(p.post.createdAt)+'</div>'+(p.post.text?'<div class="meta">'+esc(p.post.text.slice(0,140))+'</div>':'')+'</div>'}
-async function load(){try{const s=await fetch('/api/status').then(r=>r.json());
-const mode=$('#mode');mode.textContent='模式：'+s.mode;mode.className='pill '+(s.mode==='live'?'live':'preview');
-$('#xsess').textContent='X session：'+(s.xSession||'unknown');
-const held=(s.batches||[]).filter(b=>b.state==='review'||b.state==='open');
-$('#batches').innerHTML=held.length?held.map(batchCard).join(''):'<div class="empty">目前沒有待處理批次。新內容會出現在這裡供你批准／略過。</div>';
-const jobs=(s.jobs||[]);$('#jobs').innerHTML=jobs.length?jobs.slice(0,40).map(jobCard).join(''):'<div class="empty">佇列是空的。</div>';
-const posts=await fetch('/api/posts').then(r=>r.json()).catch(()=>[]);
-$('#posts').innerHTML=posts.length?posts.slice(0,40).map(postCard).join(''):'<div class="empty">尚未讀到任何貼文。</div>';
-$('#events').innerHTML=(s.events||[]).slice(0,20).map(e=>'<div class="evt '+esc(e.level)+'">['+esc(e.level)+'] '+esc(e.at)+' — '+esc(e.message)+'</div>').join('')||'<div class="empty">尚無事件。</div>';
-}catch(e){toast('讀取失敗：'+e.message)}}
-load();setInterval(load,5000)
+const L=${JSON.stringify(LABELS)};
+const PLATFORM={x:'X',bluesky:'Bluesky',sharkey:'Sharkey',telegram:'Telegram',local:'本地排程'};
+const KIND={publish:'發布',reminder:'X 提醒',ops:'待決通知'};
+const SESSION={authenticated:['X 已登入','ok'],error:['X 登入失效','err'],unknown:['X 登入未確認',''],disabled:['X 讀取未啟用','']};
+const TONE={succeeded:'ok',sealed:'ok',ready:'ok',manual_mirror:'ok',mirror:'ok',open:'info',collecting:'info',pending:'info',running:'info',review:'warn',mirror_review:'warn',failed:'err',unknown:'err',unsupported:'err'};
+const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送'};
+const $=s=>document.querySelector(s);
+const busy=new Set();let status={};let loading=false;
+const rtf=new Intl.RelativeTimeFormat('zh-Hant',{numeric:'auto'});
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function label(code){return esc(L[code]||code)}
+function tag(code){return '<span class="tag '+(TONE[code]||'')+'" title="'+esc(code)+'">'+label(code)+'</span>'}
+function ago(iso){const t=Date.parse(iso);if(!t)return '';const s=(t-Date.now())/1000;if(Math.abs(s)<45)return '剛剛';for(const [unit,size] of [['day',86400],['hour',3600],['minute',60]])if(Math.abs(s)>=size)return rtf.format(Math.round(s/size),unit);return rtf.format(Math.round(s),'second')}
+function when(iso){return iso?'<time datetime="'+esc(iso)+'" title="'+esc(new Date(iso).toLocaleString('zh-TW'))+'">'+ago(iso)+'</time>':''}
+function link(url,text){return /^https?:/.test(url||'')?'<a href="'+esc(url)+'" target="_blank" rel="noopener noreferrer">'+text+' ↗</a>':''}
+function btn(verb,id,text,cls){const off=busy.has(verb+':'+id)?' disabled':'';return '<button type="button" class="'+(cls||'ghost')+'" data-act="'+verb+'" data-id="'+esc(id)+'"'+off+'>'+text+'</button>'}
+function put(id,html){const el=document.getElementById(id);if(el.dataset.h!==html){el.dataset.h=html;el.innerHTML=html}}
+let toastTimer;function toast(message,bad){const t=$('#toast');t.textContent=message;t.className='toast show'+(bad?' bad':'');clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.className='toast'+(bad?' bad':'')},bad?4500:2400)}
+function token(){try{return localStorage.getItem('webToken')||''}catch{return ''}}
+function askToken(){$('#token-box').hidden=false;$('#token').focus()}
+async function post(path,body){const headers={'content-type':'application/json'};if(token())headers.authorization='Bearer '+token();
+const r=await fetch(path,{method:'POST',headers,body:JSON.stringify(body||{})});const j=await r.json().catch(()=>({}));
+if(r.status===401){askToken();throw new Error('需要正確的 Web token')}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+function confirmText(verb){
+if(verb==='approve')return status.mode==='live'?'確定發布到 '+((status.destinations||[]).map(d=>PLATFORM[d]||d).join('、')||'其他平台')+'？發出後無法自動收回。':'';
+if(verb==='skip')return '略過後這則不會同步，之後也無法再批准。確定？';
+if(verb==='mirror')return '標記為手動鏡像後這則不會同步。確定？';
+if(verb==='reconcile')return '請先到該平台確認這則沒有成功發出（沒有重複貼文）。確定重新發送未確認的部分？';
+return ''}
+async function act(verb,id){const q=confirmText(verb);if(q&&!confirm(q))return;busy.add(verb+':'+id);render();
+try{await post('/api/action',{action:verb,id});toast(DONE[verb]||'完成')}catch(e){toast('失敗：'+e.message,true)}finally{busy.delete(verb+':'+id);await load()}}
+function heldItem(b){const collecting=b.state==='open';const approve=!b.approvable?'':btn('approve',b.id,collecting?'立即發布':b.reason==='long_x_post_requires_manual_review'?'仍要發布（自動分段）':'發布到其他平台','go');
+return '<div class="item '+(collecting?'':'decide')+'"><div class="head">'+tag(b.state)+'<span>'+label(b.reason)+'</span><span class="spacer"></span><span class="meta">'+when(b.rootCreatedAt)+'</span></div>'
++(b.text?'<div class="text">'+esc(b.text)+'</div>':'')
++'<div class="note">'+[b.count>1?'串文共 '+b.count+' 則':'',link(b.url,'在 X 開啟'),'<span class="id">'+esc(b.id)+'</span>'].filter(Boolean).join(' · ')+'</div>'
++(b.approvable?'':'<div class="note">這種內容無法自動同步；需要的話請自行貼到其他平台。</div>')
++'<div class="actions">'+approve+btn('skip',b.id,'略過')+btn('mirror',b.id,'我已手動鏡像')+'</div></div>'}
+function jobItem(j){const attn=j.state==='failed'||j.state==='unknown'||j.state==='review';
+const action=j.state==='unknown'?btn('reconcile',j.id,'已確認遠端，重新發送','go'):attn?btn('retry',j.id,'重試','go'):'';
+return '<div class="item'+(attn?' attn':'')+'"><div class="head">'+tag(j.state)+'<b>'+esc(PLATFORM[j.destination]||j.destination)+'</b><span class="meta">'+esc(KIND[j.kind]||j.kind)+(j.attempts?' · 第 '+j.attempts+' 次':'')+'</span><span class="spacer"></span><span class="meta">'+when(j.dueAt)+'</span></div>'
++'<div class="note"><span class="id">'+esc(j.aggregateId)+'</span></div>'
++(j.error?'<div class="note bad">'+esc(j.error)+'</div>':'')+(j.state==='unknown'?'<div class="note">送出結果不明，不會自動重試，避免重複貼文。</div>':'')
++(action?'<div class="actions">'+action+'</div>':'')+'</div>'}
+function postItem(p){return '<div class="item"><div class="head">'+tag(p.classification)+'<b>'+esc(PLATFORM[p.post.platform]||p.post.platform)+'</b><span class="meta">'+label(p.reason)+'</span><span class="spacer"></span><span class="meta">'+when(p.post.createdAt)+'</span></div>'
++(p.post.text?'<div class="text short">'+esc(p.post.text)+'</div>':'')
++'<div class="note">'+[link(p.post.url,'原文'),p.batchId?'<span class="id">'+esc(p.batchId)+'</span>':''].filter(Boolean).join(' · ')+'</div></div>'}
+function count(id,n,hot){const el=document.getElementById(id);el.textContent=n;el.className='count'+(hot&&n?' hot':'')}
+function render(){const s=status;if(!s.mode)return;
+const mode=$('#mode');mode.textContent=s.mode==='live'?'正式模式':'預覽模式';mode.className='pill '+(s.mode==='live'?'ok':'warn');$('#preview').hidden=s.mode==='live';
+const sess=SESSION[s.xSession]||SESSION.unknown;const xs=$('#xsess');xs.textContent=sess[0];xs.className='pill '+sess[1];xs.hidden=false;
+if(s.tokenRequired&&!token())$('#token-box').hidden=false;
+const held=s.held||[];count('held-count',held.length,true);document.title=(held.length?'('+held.length+') ':'')+'Wherry';
+put('held',held.length?held.map(heldItem).join(''):'<div class="empty">沒有等你決定的內容。</div>');
+const jobs=s.jobs||[];const done=jobs.filter(j=>j.state==='succeeded'||j.state==='cancelled');const active=jobs.filter(j=>!done.includes(j));
+const rank=j=>j.state==='failed'||j.state==='unknown'||j.state==='review'?0:1;active.sort((a,b)=>rank(a)-rank(b));
+count('jobs-count',active.filter(j=>!rank(j)).length,true);
+put('jobs',active.length?active.map(jobItem).join(''):'<div class="empty">沒有進行中或失敗的工作。</div>');
+$('#jobs-more').hidden=!done.length;$('#jobs-done-count').textContent=done.length;put('jobs-done',done.slice(0,40).map(jobItem).join(''));
+const posts=s.posts||[];put('posts',posts.length?posts.slice(0,40).map(postItem).join(''):'<div class="empty">還沒讀到任何貼文。按「立即檢查」讀一次。</div>');
+const events=(s.events||[]).slice(0,25);const errors=events.filter(e=>e.level==='error'&&Date.now()-Date.parse(e.at)<86400000).length;
+const ec=$('#evt-count');ec.hidden=!errors;ec.textContent=errors+' 錯誤';ec.className='count hot';
+put('events',events.length?events.map(e=>'<div class="evt lv-'+esc(e.level)+'">'+when(e.at)+'<span>'+esc(e.message)+'</span></div>').join(''):'<div class="empty">尚無事件。</div>')}
+async function load(){if(loading)return;loading=true;
+try{const [s,posts]=await Promise.all([fetch('/api/status').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}),fetch('/api/posts').then(r=>r.ok?r.json():[]).catch(()=>[])]);
+status=Object.assign(s,{posts});$('#offline').hidden=true;$('#updated').textContent='更新於 '+new Date().toLocaleTimeString('zh-TW',{hour12:false});render()}
+catch(e){$('#offline').hidden=false}finally{loading=false}}
+document.addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(b&&!b.disabled)act(b.dataset.act,b.dataset.id)});
+$('#scan').addEventListener('click',async e=>{const b=e.currentTarget;b.disabled=true;b.textContent='檢查中…';
+try{await post('/api/scan');toast('檢查完成')}catch(err){toast('檢查失敗：'+err.message,true)}finally{b.disabled=false;b.textContent='立即檢查';load()}});
+$('#token-box').addEventListener('submit',e=>{e.preventDefault();try{localStorage.setItem('webToken',$('#token').value.trim())}catch{}$('#token-box').hidden=true;toast('已儲存 token')});
+const text=$('#s-text');text.addEventListener('input',()=>{$('#s-count').textContent=Array.from(text.value.trim()).length+' 字'});
+text.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('#schedule').requestSubmit()});
+$('#schedule').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter||$('#schedule button');const due=$('#s-due').value;
+b.disabled=true;try{await post('/api/schedule',{text:text.value.trim(),dueAt:due?new Date(due).toISOString():undefined});toast(due?'已排程：'+new Date(due).toLocaleString('zh-TW',{hour12:false}):'已排入發布');text.value='';$('#s-due').value='';$('#s-count').textContent='0 字';load()}
+catch(err){toast('排程失敗：'+err.message,true)}finally{b.disabled=false}});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
+load();setInterval(()=>{if(!document.hidden)load()},5000);
 </script></body></html>`;

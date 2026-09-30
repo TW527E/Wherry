@@ -9,6 +9,7 @@ import { prepareImages } from './media.js';
 import { prepareVideo, MAX_VIDEO_SECONDS } from './video.js';
 import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
+import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, TextRange, Transport } from './types.js';
 
@@ -335,7 +336,7 @@ export class Engine {
   }
 
   /** The content reason that keeps this batch out of the automatic publish path, if any. */
-  private holdReason(posts: SourcePost[]): string | undefined {
+  holdReason(posts: SourcePost[]): string | undefined {
     return posts.map(p => unsupportedReason(p, this.config.media.video)).find(Boolean);
   }
 
@@ -556,7 +557,7 @@ export class Engine {
     // markup here would render as literal tags. Mirror codes stay copyable as plain text.
     const lines = hold ? [
       '⚠️ 這則 X 內容不會自動同步到其他平台，需要你決定。',
-      `原因：${hold}`,
+      `原因：${describe(hold)}`,
       url ? `X 原文：${url}` : `批次：${batch.id}`,
       excerpt ? `摘要：${excerpt}` : '',
       '',
@@ -567,7 +568,7 @@ export class Engine {
            '• 按「略過」＝關閉這則提醒。']),
     ] : [
       '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
-      `原因：${batch.reason}`,
+      `原因：${describe(batch.reason)}`,
       url ? `X 原文：${url}` : `批次：${batch.id}`,
       excerpt ? `摘要：${excerpt}` : '',
       '',
