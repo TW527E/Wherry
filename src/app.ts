@@ -80,8 +80,9 @@ export function createRuntime(config = loadConfig()) {
     if (cycle) return cycle;
     cycle = heavy.run(async () => {
       if (stopped) return;
+      const started = new Date().toISOString();
       await collectCycle(engine, collectors, undefined, shutdown.signal);
-      if (publish && !stopped) { engine.sealReady(); await worker.run(); }
+      if (publish && !stopped) { engine.sealReady(undefined, started); await worker.run(); }
     }).catch(error => { store.event('error', `Service cycle failed: ${safeError(error)}`); })
       .finally(async () => { try { await notifications?.flush(); } finally { cycle = undefined; } });
     return cycle;
