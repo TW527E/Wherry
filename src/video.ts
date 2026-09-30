@@ -1,10 +1,9 @@
-import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { Attachment, PreparedVideo, Transport } from './types.js';
-import { sourceBytes, UnsupportedMediaError } from './media.js';
+import { hash, sourceBytes, UnsupportedMediaError } from './media.js';
 
 /**
  * Phase 2 video profile: MP4 / H.264 / AAC-LC / YUV 4:2:0 / 30 fps, preserving aspect,
@@ -69,8 +68,6 @@ export async function probeVideo(path: string, config: VideoConfig): Promise<Vid
     hasVideo: Boolean(stream),
   };
 }
-
-const hash = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
 
 /**
  * Download (or read) the source, transcode it to the safe MP4 profile, and return the prepared

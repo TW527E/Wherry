@@ -6,6 +6,10 @@ import type { Reminder, ReviewNotice } from './types.js';
 
 export interface ReminderContext { config: AppConfig; telegram: TelegramClient; store: Store; engine: Engine; worker: Worker }
 
+/** When to retry a failed Telegram call: the server's retry_after, but never sooner than a minute. */
+const retryAt = (error: unknown): string =>
+  new Date(Date.now() + Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0) * 1000).toISOString();
+
 /** The owner-facing body a settled review notice is edited down to; empty while still `offered`. */
 function reviewNoticeStatusText(notice: ReviewNotice, engine: Engine): string {
   switch (notice.state) {
@@ -168,8 +172,7 @@ export class TelegramNotifications {
         await telegram.editMessageText(reminder.chatId, reminder.messageId, reminderText(reminder, store));
         store.reminderEdited(reminder);
       } catch (error) {
-        const seconds = Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0);
-        store.deferReminderEdit(reminder, new Date(Date.now() + seconds * 1000).toISOString());
+        store.deferReminderEdit(reminder, retryAt(error));
         store.event('error', `Telegram reminder update failed; saved choice will be retried: ${safeError(error)}`, reminder.aggregateId);
         break;
       }
@@ -182,8 +185,7 @@ export class TelegramNotifications {
         await telegram.editMessageText(notice.chatId, notice.messageId, text);
         store.reviewNoticeSynced(notice);
       } catch (error) {
-        const seconds = Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0);
-        store.deferReviewNoticeEdit(notice, new Date(Date.now() + seconds * 1000).toISOString());
+        store.deferReviewNoticeEdit(notice, retryAt(error));
         store.event('error', `Telegram review notice update failed; will retry: ${safeError(error)}`, notice.batchId);
         break;
       }
@@ -202,8 +204,7 @@ export class TelegramNotifications {
       store.setSetting('telegram:error_offset', errors.at(-1)!.id);
       store.setSetting('telegram:error_retry_at', '');
     } catch (error) {
-      const seconds = Math.max(60, Number((error as { retryAfter?: number }).retryAfter) || 0);
-      store.setSetting('telegram:error_retry_at', new Date(Date.now() + seconds * 1000).toISOString());
+      store.setSetting('telegram:error_retry_at', retryAt(error));
     }
   }
 }

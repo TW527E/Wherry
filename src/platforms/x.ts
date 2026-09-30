@@ -29,24 +29,8 @@ function launchOptionsFor(config: AppConfig['x'], headless: boolean): Parameters
   return options;
 }
 
-export interface TweetFacts {
-  id: string;
-  url?: string;
-  authorId: string;
-  createdAt?: string;
-  text: string;
-  mentions?: TextMention[];
-  replyToId?: string | null;
-  replyToAuthorId?: string | null;
-  relationKnown: boolean;
-  repost: boolean;
-  quoteUrl?: string;
-  attachments: Attachment[];
-  poll: boolean;
-  pollData?: PollSnapshot;
-  sensitive: boolean;
-  metadataComplete: boolean;
-}
+/** A parsed timeline tweet: a SourcePost whose timestamp may still be missing. */
+export type TweetFacts = Omit<SourcePost, 'createdAt'> & { createdAt?: string };
 
 const statusPath = /^\/(?:[^/]+)\/status\/(\d+)/;
 // t.co is X's link shortener. In the DOM the anchor href is the short link and the visible text
@@ -86,7 +70,7 @@ export function syndicationToken(id: string): string {
   return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
 }
 
-export interface XVideoSource { url?: string; durationSeconds?: number; width?: number; height?: number; animated: boolean }
+type XVideoSource = Pick<Attachment, 'url' | 'durationSeconds' | 'width' | 'height' | 'animated'>;
 
 /**
  * Choose a downloadable MP4 rendition from a syndication `tweet-result` payload. Pure, so the variant
@@ -121,9 +105,8 @@ export function pickVideoSource(payload: unknown, maxDownloadBytes: number): XVi
   if (!renditions.length) return source;
   // bitrate is bits per second, so bytes ≈ bitrate / 8 × seconds. With no duration there is no estimate,
   // so fall back to the smallest rendition instead of guessing something past the download cap.
-  const affordable = source.durationSeconds === undefined ? []
-    : renditions.filter(rendition => (rendition.bitrate / 8) * source.durationSeconds! <= maxDownloadBytes);
-  return { ...source, url: (affordable.at(-1) ?? renditions[0]!).url };
+  const affordable = renditions.findLast(r => source.durationSeconds !== undefined && (r.bitrate / 8) * source.durationSeconds <= maxDownloadBytes);
+  return { ...source, url: (affordable ?? renditions[0]!).url };
 }
 
 /**
@@ -185,6 +168,8 @@ export function parseTweetFacts(input: {
   // either does not. A post with no reply markers is a known root even without its own status link.
   const relationKnown = !isReply || Boolean(input.threadParentId) || Boolean(parentLink);
   return {
+    platform: 'x',
+    visibility: 'public',
     id: input.id,
     url: ownUrl,
     authorId: input.authorId || ownerHandle,
@@ -240,6 +225,47 @@ export function parseTweetText(html: string): MentionText {
   return { text, mentions };
 }
 
+/** The tweet id and author handle from an article's own timestamp permalink. */
+async function articleIdentity(article: Locator): Promise<{ id?: string; author: string }> {
+  const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
+  const path = permalink ? new URL(permalink, 'https://x.com').pathname : '';
+  return { id: path.match(statusPath)?.[1], author: path.split('/')[1] || '' };
+}
+
+/**
+ * X renders progressively after domcontentloaded, so wait until the article count has plateaued (or
+ * `ticks` × 500ms pass) before trusting the render. Returns the last count seen.
+ */
+async function settledArticleCount(page: Page, ticks: number, signal?: AbortSignal): Promise<number> {
+  let settled = 0; let lastCount = -1;
+  for (let i = 0; i < ticks && !signal?.aborted; i++) {
+    const count = await page.locator('article[data-testid="tweet"]').count().catch(() => 0);
+    if (count === lastCount) settled++; else { settled = 0; lastCount = count; }
+    if (lastCount >= 1 && settled >= 3) break;
+    await page.waitForTimeout(500);
+  }
+  return lastCount;
+}
+
+/** Keep the headless browser on X's own hosts and read-only methods. */
+async function guardRoutes(page: Page): Promise<void> {
+  await page.route('**/*', async route => {
+    const request = route.request(); const url = new URL(request.url());
+    if (['http:', 'https:'].includes(url.protocol) && isAllowedXHost(url.hostname) && ['GET', 'HEAD'].includes(request.method())) await route.continue();
+    else await route.abort();
+  });
+}
+
+/**
+ * Whether the session reads the configured profile. Decided solely by the logged-in account switcher:
+ * behind a login/verification wall that control never appears.
+ */
+async function sessionAuthenticated(page: Page, handle: string): Promise<{ authenticated: boolean }> {
+  await page.goto(`https://x.com/${encodeURIComponent(handle)}/with_replies`, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+  const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
+  return { authenticated };
+}
+
 export class XCollector implements Collector {
   readonly platform = 'x' as const;
   private context?: BrowserContext;
@@ -255,7 +281,7 @@ export class XCollector implements Collector {
     private readonly transport?: Transport,
     // Video lookup only happens when video sync is actually on: with it off the post is held as
     // `video_sync_disabled` regardless, so the request would buy nothing.
-    private readonly media: { video: boolean; maxDownloadBytes: number } = { video: false, maxDownloadBytes: 20_000_000 },
+    private readonly media?: { video: boolean; maxDownloadBytes: number },
   ) {}
 
   /**
@@ -264,7 +290,7 @@ export class XCollector implements Collector {
    * the attachment without a url and the post held exactly as it was before this existed.
    */
   private async resolveVideo(tweetId: string, signal?: AbortSignal): Promise<XVideoSource | undefined> {
-    if (!this.transport || !this.media.video) return undefined;
+    if (!this.transport || !this.media?.video) return undefined;
     const cached = this.videoSources.get(tweetId);
     if (cached !== undefined) return cached ?? undefined;
     let resolved: XVideoSource | undefined;
@@ -390,8 +416,7 @@ export class XCollector implements Collector {
           if (!['role', 'data-testid', 'dir', 'aria-label', 'aria-hidden', 'aria-checked', 'aria-disabled', 'aria-posinset', 'aria-setsize', 'alt', 'hidden', 'disabled'].includes(attribute.name)) element.removeAttribute(attribute.name);
         }
       }
-      const html = clone.outerHTML;
-      return { detected: true, html: html.length <= 256_000 ? html : '', capturedAt: new Date().toISOString() };
+      return { detected: true, html: clone.outerHTML, capturedAt: new Date().toISOString() };
     }, X_POLL_SELECTOR);
     const parsedPoll = pollRead.detected ? parseXPoll(pollRead.html, pollRead.capturedAt) : undefined;
     const hasPoll = pollRead.detected;
@@ -406,15 +431,7 @@ export class XCollector implements Collector {
     const sensitive = hasSensitiveWarning(chromeText);
     // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
     const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
-    if (hasVideo) {
-      const source = await this.resolveVideo(own, signal);
-      media.push({ kind: 'video', alt: '',
-        ...(source?.url ? { url: source.url } : {}),
-        ...(source?.animated ? { animated: true } : {}),
-        ...(source?.durationSeconds !== undefined ? { durationSeconds: source.durationSeconds } : {}),
-        ...(source?.width ? { width: source.width } : {}),
-        ...(source?.height ? { height: source.height } : {}) });
-    }
+    if (hasVideo) media.push({ kind: 'video', alt: '', ...await this.resolveVideo(own, signal) });
     // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
     // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
     // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
@@ -448,22 +465,12 @@ export class XCollector implements Collector {
   private async collectThreadTail(page: Page, rootId: string, seen: Set<string>, signal?: AbortSignal): Promise<TweetFacts[]> {
     const url = `https://x.com/${encodeURIComponent(this.config.handle)}/status/${rootId}`;
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    let settled = 0; let lastCount = -1;
-    for (let i = 0; i < 20; i++) {
-      if (signal?.aborted) return [];
-      const count = await page.locator('article[data-testid="tweet"]').count().catch(() => 0);
-      if (count === lastCount) settled++; else { settled = 0; lastCount = count; }
-      if (lastCount >= 1 && settled >= 3) break;
-      await page.waitForTimeout(500);
-    }
+    await settledArticleCount(page, 20, signal);
     const out: TweetFacts[] = [];
     let prevId: string | undefined; let started = false;
     for (const article of await page.locator('article[data-testid="tweet"]').all()) {
       if (signal?.aborted) break;
-      const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
-      const ownPath = permalink ? new URL(permalink, 'https://x.com').pathname : '';
-      const id = ownPath.match(statusPath)?.[1];
-      const author = ownPath.split('/')[1] || '';
+      const { id, author } = await articleIdentity(article);
       if (!id) continue;
       if (!started) { if (id === rootId) { started = true; prevId = rootId; } continue; }
       // The author's own thread runs as an unbroken same-author chain right after the root; the
@@ -487,12 +494,7 @@ export class XCollector implements Collector {
     const launchOptions = launchOptionsFor(this.config, this.config.headless);
     this.context = await chromium.launchPersistentContext(this.config.profileDir, launchOptions);
     this.page = this.context.pages()[0] || await this.context.newPage();
-    await this.page.route('**/*', async route => {
-      const request = route.request(); const url = new URL(request.url());
-      if (!['http:', 'https:'].includes(url.protocol) || !isAllowedXHost(url.hostname)) { await route.abort(); return; }
-      if (!['GET', 'HEAD'].includes(request.method())) { await route.abort(); return; }
-      await route.continue();
-    });
+    await guardRoutes(this.page);
     return this.page;
   }
 
@@ -539,14 +541,7 @@ export class XCollector implements Collector {
     // older tweet rendered before the newest one — and the watermark check below would then
     // declare the gap covered against an incomplete window, silently blind to the newest post.
     // So wait until the article count has plateaued (or ~15s cap) before trusting the render.
-    let settled = 0; let lastCount = -1;
-    for (let i = 0; i < 30; i++) {
-      if (signal?.aborted) break;
-      const count = await page.locator('article[data-testid="tweet"]').count().catch(() => 0);
-      if (count === lastCount) settled++; else { settled = 0; lastCount = count; }
-      if (lastCount >= 1 && settled >= 3) break;
-      await page.waitForTimeout(500);
-    }
+    const lastCount = await settledArticleCount(page, 30, signal);
     // An inline failure replaces the timeline with an error box. A healthy render shows several
     // articles, so only probe for X's error wording when almost nothing rendered — a tweet that
     // merely quotes the phrase must not fail the scan.
@@ -582,10 +577,7 @@ export class XCollector implements Collector {
       // article above was parsed in an earlier round (and is skipped as `seen` this round).
       let prev: { id: string; author: string; replyBelow: boolean } | undefined;
       for (const article of articles) {
-        const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
-        const ownPath = permalink ? new URL(permalink, 'https://x.com').pathname : '';
-        const own = ownPath.match(statusPath)?.[1];
-        const authorId = ownPath.split('/')[1] || '';
+        const { id: own, author: authorId } = await articleIdentity(article);
         // A self-thread continuation is the tweet directly under a same-author tweet that draws the
         // reply connector below it. Compute this before the `seen` short-circuit so `prev` tracks true
         // DOM adjacency across rounds; only the same author threads (a reply to someone else never
@@ -643,7 +635,7 @@ export class XCollector implements Collector {
         ? 'X page rendered tweets but none were parseable (tweet layout may have changed); no checkpoint advanced'
         : 'X page rendered no tweet elements (assets blocked, empty timeline, or slow render); no checkpoint advanced');
     }
-    const posts: SourcePost[] = facts.filter(f => f.createdAt).map(f => ({ platform: 'x', id: f.id, authorId: f.authorId, createdAt: f.createdAt!, text: f.text, mentions: f.mentions, url: f.url, replyToId: f.replyToId, replyToAuthorId: f.replyToAuthorId, relationKnown: f.relationKnown, visibility: 'public', repost: f.repost, quoteUrl: f.quoteUrl, poll: f.poll, pollData: f.pollData, sensitive: f.sensitive, attachments: f.attachments, metadataComplete: f.metadataComplete }));
+    const posts = facts.filter((f): f is SourcePost => Boolean(f.createdAt));
     if (reachedWatermark) return { platform: 'x', accountId: this.config.handle, posts, fetchedAt, complete: true, warnings: [] };
     // Budget exhausted before reaching the watermark. The posts parsed fine — we just did not
     // scroll back far enough. Report `oldest` as the watermark so the engine advances the
@@ -680,12 +672,7 @@ export async function loginInteractive(
     log('完成後回到這個終端機按 Enter，工具會儲存登入狀態並關閉瀏覽器。');
     await options.waitForEnter();
     // Verify the session actually reads the target profile without hitting a login wall.
-    const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
-    await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-    // Authentication is decided solely by the presence of the logged-in account switcher; if the
-    // profile loaded behind a login/verification wall this control never appears.
-    const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
-    return { authenticated };
+    return await sessionAuthenticated(page, config.handle);
   } finally {
     await context.close();
   }
@@ -718,18 +705,8 @@ export async function installSession(config: AppConfig['x'], file: SessionFile):
   try {
     await context.addCookies(file.state.cookies);
     const page = context.pages()[0] || await context.newPage();
-    const check = `https://x.com/${encodeURIComponent(config.handle)}/with_replies`;
-    await page.route('**/*', async route => {
-      const url = new URL(route.request().url());
-      if (!['http:', 'https:'].includes(url.protocol) || !isAllowedXHost(url.hostname)) { await route.abort(); return; }
-      if (!['GET', 'HEAD'].includes(route.request().method())) { await route.abort(); return; }
-      await route.continue();
-    });
-    await page.goto(check, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-    // Authentication is decided solely by the presence of the logged-in account switcher; if the
-    // profile loaded behind a login/verification wall this control never appears.
-    const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
-    return { authenticated };
+    await guardRoutes(page);
+    return await sessionAuthenticated(page, config.handle);
   } finally {
     await context.close();
   }

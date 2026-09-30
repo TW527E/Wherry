@@ -255,40 +255,33 @@ export class SharkeyClient implements Publisher, Collector {
       validateImage(image, limits.maxFileBytes);
       if (image.alt.length > limits.maxAltTextLength) throw new PlatformError('Image alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
     }
+    if (part.video) {
+      if (limits.maxFileBytes !== undefined && part.video.size > limits.maxFileBytes) throw new PlatformError('Video exceeds the Sharkey instance file size limit', { code: 'VideoTooLarge' });
+      if (part.video.alt.length > limits.maxAltTextLength) throw new PlatformError('Video alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
+    }
     const fileIds: string[] = [];
     const folderId = (part.images.length || part.video) ? await this.resolveFolder() : null;
     const uploadStamp = this.now().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-    for (let index = 0; index < part.images.length; index++) {
-      const image = part.images[index]!;
-      const filename = this.uploadFilename(index, image.mimeType === 'image/png' ? 'png' : 'jpg', uploadStamp);
-      const form = multipart({ i: this.config.token, comment: image.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
-        { field: 'file', filename, mimeType: image.mimeType, bytes: image.bytes },
+    // A video never shares a note with images (checked above), so this is either the images or the one video.
+    const uploads = part.video
+      ? [{ ext: 'mp4', alt: part.video.alt, mimeType: part.video.mimeType, bytes: await readFile(part.video.path) }]
+      : part.images.map(image => ({ ext: image.mimeType === 'image/png' ? 'png' : 'jpg', alt: image.alt, mimeType: image.mimeType, bytes: image.bytes }));
+    const operation = part.video ? 'Sharkey video upload' : 'Sharkey image upload';
+    for (const [index, upload] of uploads.entries()) {
+      const form = multipart({ i: this.config.token, comment: upload.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
+        { field: 'file', filename: this.uploadFilename(index, upload.ext, uploadStamp), mimeType: upload.mimeType, bytes: upload.bytes },
       ]);
       // Uploading a drive file is a PRE-publish step, not the publish itself: the note is only created
-      // after every image succeeds. A failed/uncertain upload therefore cannot leave a visible duplicate
+      // after every upload succeeds. A failed/uncertain upload therefore cannot leave a visible duplicate
       // (worst case an orphaned, unreferenced file), so it is NOT treated as an uncertain mutation —
       // a timeout/5xx here is a plain transient error the worker may safely retry. Only notes/create below
       // stays a true mutation. (mutation=false on both the request and the schema check.)
       const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,
-        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey image upload', false));
+        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, operation, false));
       // Misskey/Sharkey stores an empty comment as null and echoes it back as null, so treat null and
-      // '' as the same "no alt" value; only a genuine mismatch of non-empty text is a real error.
-      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true) || (file.comment !== undefined && (file.comment ?? '') !== image.alt)) throw schemaError('Sharkey image upload', false);
-      fileIds.push(file.id);
-    }
-    if (part.video) {
-      if (limits.maxFileBytes !== undefined && part.video.size > limits.maxFileBytes) throw new PlatformError('Video exceeds the Sharkey instance file size limit', { code: 'VideoTooLarge' });
-      if (part.video.alt.length > limits.maxAltTextLength) throw new PlatformError('Video alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
-      // Same pre-publish drive upload as images: a failed/uncertain upload can only leave an orphaned
-      // file, never a visible duplicate, so it is a plain transient (mutation=false), not an uncertain mutation.
-      const bytes = await readFile(part.video.path);
-      const filename = this.uploadFilename(0, 'mp4', uploadStamp);
-      const form = multipart({ i: this.config.token, comment: part.video.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
-        { field: 'file', filename, mimeType: part.video.mimeType, bytes },
-      ]);
-      const file = object(await requestJson(this.transport, `${this.baseUrl}/api/drive/files/create`,
-        { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body }, 'Sharkey video upload', false));
-      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true)) throw schemaError('Sharkey video upload', false);
+      // '' as the same "no alt" value; only a genuine mismatch of non-empty image alt text is a real error.
+      if (!noteId(file?.id) || (sensitive && file.isSensitive !== true)
+        || (!part.video && file.comment !== undefined && (file.comment ?? '') !== upload.alt)) throw schemaError(operation, false);
       fileIds.push(file.id);
     }
     // Sharkey does not promise a notes/create idempotency nonce. Never automatically replay an uncertain mutation.

@@ -8,7 +8,7 @@ interface MediaConfig { dataDir: string; maxDownloadBytes: number; maxImageBytes
 export class UnsupportedMediaError extends Error {
   constructor(message: string) { super(message); this.name = 'UnsupportedMediaError'; }
 }
-const hash = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
+export const hash = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
 
 export async function sourceBytes(attachment: Attachment, config: Pick<MediaConfig, 'dataDir' | 'maxDownloadBytes'>, transport: Transport): Promise<Buffer> {
   if (attachment.path) {

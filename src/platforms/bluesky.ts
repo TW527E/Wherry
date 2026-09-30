@@ -58,15 +58,20 @@ interface BlueskyFacet {
   features: Array<{ $type: 'app.bsky.richtext.facet#link'; uri: string } | { $type: 'app.bsky.richtext.facet#mention'; did: string }>;
 }
 
+async function resolveHandle(transport: Transport, publicUrl: string, handle: string, operation: string): Promise<string> {
+  const result = object(await requestJson(transport,
+    `${httpsBase(publicUrl, 'Bluesky public AppView')}/xrpc/com.atproto.identity.resolveHandle?${new URLSearchParams({ handle })}`,
+    { method: 'GET', maxBytes: 64_000 }, operation));
+  if (!didValid(result?.did)) throw schemaError(operation);
+  return result.did;
+}
+
 /** Only owner-mapped handles are resolved, before any durable delivery begins. */
 export async function resolveBlueskyMentions(bodies: MentionText[], publicUrl: string, transport: Transport): Promise<void> {
   const handles = new Set(bodies.flatMap(body => body.mentions.map(mention => mention.handle)));
   for (const handle of handles) {
-    const result = object(await requestJson(transport,
-      `${httpsBase(publicUrl, 'Bluesky public AppView')}/xrpc/com.atproto.identity.resolveHandle?${new URLSearchParams({ handle })}`,
-      { method: 'GET', maxBytes: 64_000 }, 'Bluesky mention resolution'));
-    if (!didValid(result?.did)) throw schemaError('Bluesky mention resolution');
-    for (const body of bodies) for (const mention of body.mentions) if (mention.handle === handle) mention.did = result.did;
+    const did = await resolveHandle(transport, publicUrl, handle, 'Bluesky mention resolution');
+    for (const body of bodies) for (const mention of body.mentions) if (mention.handle === handle) mention.did = did;
   }
 }
 
@@ -316,11 +321,7 @@ export class BlueskyClient implements Publisher, Collector {
             jsonBody({ identifier, password: this.config.appPassword }), 'Bluesky login'), this.serviceUrl);
           did = bootstrap.did; handle = bootstrap.handle;
         } else if (looksLikeHandle(identifier)) {
-          const result = object(await requestJson(this.transport,
-            `${this.publicUrl}/xrpc/com.atproto.identity.resolveHandle?${new URLSearchParams({ handle: identifier })}`,
-            { method: 'GET', maxBytes: 64_000 }, 'Bluesky handle discovery'));
-          if (!didValid(result?.did)) throw schemaError('Bluesky handle discovery');
-          did = result.did;
+          did = await resolveHandle(this.transport, this.publicUrl, identifier, 'Bluesky handle discovery');
         } else throw new PlatformError('Configure a Bluesky handle, DID or login email', { code: 'InvalidIdentifier' });
       }
       const pds = await this.resolvePds(did);

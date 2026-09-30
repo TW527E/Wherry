@@ -49,25 +49,12 @@ export class Store {
       });
     }
     this.db.prepare('INSERT OR IGNORE INTO manual_x_links SELECT id,matched_x_id FROM mirrors WHERE matched_x_id IS NOT NULL').run();
-    this.pruneBaselineMirrors();
+    // One-off repair: a baseline sweep used to register a downstream account's whole history as pending
+    // mirrors, which could only park new X posts in review. Only `pending` rows: a `matched` one is a
+    // confirmed pairing that manual_x_links still references.
+    const pruned = Number(this.db.prepare("DELETE FROM mirrors WHERE state='pending' AND post_key IN (SELECT key FROM posts WHERE classification='baseline')").run().changes);
+    if (pruned) this.event('info', `Dropped ${pruned} baseline history posts that had been registered as pending manual mirrors; they could only hold new X posts for review`);
     if (path !== ':memory:') chmodSync(path, 0o600);
-  }
-  /**
-   * One-off repair for databases filled before a baseline sweep stopped registering pending mirrors.
-   * The first snapshot of a downstream account carries that account's whole recent feed, and every root
-   * in it used to be recorded as a pending mirror — meaning "the owner may still be copying this to X by
-   * hand". For months-old history that is never true, so those rows could only ever park new X posts in
-   * mirror_review. Deleting them is what makes the fix apply to a database that is already running, not
-   * just to a fresh one.
-   *
-   * Scoped to `pending` on purpose: a `matched` mirror records a confirmed pairing and is referenced by
-   * manual_x_links, so it must survive (and the filter is also what keeps this from breaking that key).
-   */
-  private pruneBaselineMirrors(): void {
-    const removed = Number(this.db.prepare(
-      "DELETE FROM mirrors WHERE state='pending' AND post_key IN (SELECT key FROM posts WHERE classification='baseline')",
-    ).run().changes);
-    if (removed) this.event('info', `Dropped ${removed} baseline history posts that had been registered as pending manual mirrors; they could only hold new X posts for review`);
   }
   acquireRuntimeLock(): () => void {
     const token = randomUUID();
@@ -173,9 +160,13 @@ export class Store {
     this.db.prepare('INSERT OR IGNORE INTO mirrors(id,post_key,payload,expires_at) VALUES(?,?,?,?)').run(id, key, JSON.stringify(post), new Date(Date.parse(now) + MIRROR_PENDING_MS).toISOString());
     return id;
   }
-  mirrors(now: string): Array<{ id: string; post: SourcePost; expired: boolean; state: string }> {
+  /**
+   * Unclaimed downstream posts within the search window. A matched one is already the manual copy of an
+   * X post, and one downstream post mirrors at most one X post, so it is evidence for nothing else.
+   */
+  mirrors(now: string): Array<{ id: string; post: SourcePost; expired: boolean }> {
     const threshold = new Date(Date.parse(now) - 7 * 86400_000).toISOString();
-    return this.db.prepare('SELECT * FROM mirrors WHERE expires_at >= ?').all(threshold).map(r => ({ id: String(r.id), post: decode<SourcePost>(r.payload), expired: String(r.expires_at) < now, state: String(r.state) }));
+    return this.db.prepare("SELECT * FROM mirrors WHERE state='pending' AND expires_at >= ?").all(threshold).map(r => ({ id: String(r.id), post: decode<SourcePost>(r.payload), expired: String(r.expires_at) < now }));
   }
   matchMirror(id: string, xId: string): void {
     if (!this.db.prepare('SELECT 1 FROM mirrors WHERE id=?').get(id)) throw new Error('Mirror not found');
