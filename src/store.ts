@@ -54,6 +54,12 @@ export class Store {
     // confirmed pairing that manual_x_links still references.
     const pruned = Number(this.db.prepare("DELETE FROM mirrors WHERE state='pending' AND post_key IN (SELECT key FROM posts WHERE classification='baseline')").run().changes);
     if (pruned) this.event('info', `Dropped ${pruned} baseline history posts that had been registered as pending manual mirrors; they could only hold new X posts for review`);
+    // One-off repair: owner actions used to move only the batch, leaving its posts showing `collecting`
+    // forever. Bring those posts in line with the batch they belong to.
+    this.db.prepare(`UPDATE posts SET
+      classification=(SELECT CASE state WHEN 'sealed' THEN 'ready' WHEN 'mirror' THEN 'manual_mirror' WHEN 'ignored' THEN 'ignored' ELSE 'mirror_review' END FROM batches WHERE id=posts.batch_id),
+      reason=(SELECT reason FROM batches WHERE id=posts.batch_id)
+      WHERE classification='collecting' AND batch_id IN (SELECT id FROM batches WHERE state<>'open')`).run();
     // One-off repair: Bluesky post URLs used to percent-encode the DID (did%3Aplc%3A…), which bsky.app
     // rejects as "Invalid DID or handle". Posts are INSERT OR IGNORE, so stored rows never refresh on their own.
     for (const table of ['posts', 'mirrors']) {
