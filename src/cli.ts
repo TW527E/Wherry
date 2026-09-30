@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import 'dotenv/config';
+import { existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
 import { createRuntime, createWeb } from './app.js';
 import { safeError } from './engine.js';
@@ -25,6 +25,9 @@ Usage:
   wherry import-session        Install the session file at X_SESSION_FILE into this machine's X profile
 
 X publishing is always manual. This tool only reads X and can never post to it.`;
+
+// Variables already set by the shell, container or service manager win over .env.
+if (existsSync('.env')) process.loadEnvFile();
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
@@ -75,9 +78,8 @@ async function main(): Promise<number> {
         return 0;
       }
       case 'action': {
-        const verb = argv[1] as 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | undefined;
-        const id = argv[2];
-        if (!verb || !id || !['skip', 'mirror', 'approve', 'retry', 'reconcile'].includes(verb)) throw new Error('action requires one of skip|mirror|approve|retry|reconcile and an id');
+        // engine.action validates both the verb and the id; argv is just passed through.
+        const [, verb, id] = argv as [string, Parameters<typeof runtime.engine.action>[0], string];
         runtime.engine.action(verb, id);
         console.log(`applied ${verb} to ${id}`);
         return 0;

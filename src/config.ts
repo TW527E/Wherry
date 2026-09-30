@@ -130,13 +130,3 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   return config;
 }
-
-export function publicConfig(config: AppConfig): Record<string, unknown> {
-  return {
-    mode: config.mode, destinations: config.destinations, pollSeconds: config.pollSeconds,
-    threadWindowSeconds: config.threadWindowSeconds, settleSeconds: config.settleSeconds,
-    sources: { x: config.x.enabled, bluesky: config.bluesky.enabled, sharkey: config.sharkey.enabled },
-    telegramCommands: config.telegram.pollCommands,
-    capabilities: { xWrites: false, phase: 1, video: config.media.video, scheduling: true },
-  };
-}

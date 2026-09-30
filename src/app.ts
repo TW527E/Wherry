@@ -1,5 +1,5 @@
 import { FastifyInstance, fastify } from 'fastify';
-import { loadConfig, publicConfig, type AppConfig } from './config.js';
+import { loadConfig, type AppConfig } from './config.js';
 import { SafeHttp } from './security/http.js';
 import { Store } from './store.js';
 import { Engine, Worker, collectCycle, safeError } from './engine.js';
@@ -22,21 +22,9 @@ class PreviewPublisher implements Publisher {
   }
 }
 
-export interface Runtime {
-  config: AppConfig;
-  store: Store;
-  engine: Engine;
-  worker: Worker;
-  collectors: Collector[];
-  publishers: Map<Destination, Publisher>;
-  telegram?: TelegramClient;
-  start(): void;
-  stop(): Promise<void>;
-  once(): Promise<void>;
-  scan(): Promise<void>;
-}
+export type Runtime = ReturnType<typeof createRuntime>;
 
-export function createRuntime(config = loadConfig()): Runtime {
+export function createRuntime(config = loadConfig()) {
   const store = new Store(config.databasePath);
   const transport = new SafeHttp();
   const collectors: Collector[] = [];
@@ -367,7 +355,6 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
     catch (error) { await reply.code(401).send({ error: safeError(error) }); }
   });
   app.get('/healthz', async () => ({ ok: true, mode: runtime.config.mode }));
-  app.get('/api/config', async () => publicConfig(runtime.config));
   app.get('/api/status', async () => ({
     mode: runtime.config.mode,
     xSession: runtime.store.setting<string>('x:session_state', runtime.config.x.enabled ? 'unknown' : 'disabled'),

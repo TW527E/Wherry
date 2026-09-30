@@ -149,10 +149,6 @@ export function decideMirror(posts: SourcePost[], candidates: ReturnType<Store['
   const exact: string[] = [];
   let possible = false;
   for (const candidate of candidates) {
-    // A downstream post already paired with an X post has done its job: one downstream post can be the
-    // manual copy of at most one X post, so it is accounted for and cannot be evidence about a different
-    // batch. Leaving it in only produced review noise on every later post that happened to resemble it.
-    if (candidate.state !== 'pending') continue;
     const expected = normalizeText(candidate.post.text);
     const textEqual = expected === text || expected === spaced;
     const mediaMatch = compatibleMedia(candidate.post.attachments, media);
@@ -434,6 +430,15 @@ export class Engine {
     return id;
   }
 
+  /** Close a batch (if it exists) as the owner's manual mirror and cancel its undelivered echo jobs. */
+  private closeAsMirror(batchId: string): void {
+    this.store.updateBatch(batchId, 'mirror', 'manual_mirror_registered');
+    for (const member of this.store.batchPosts(batchId)) this.store.updatePost(member.key, 'manual_mirror', 'manual_mirror_registered');
+    for (const job of this.store.jobsForAggregate(batchId)) {
+      if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'manual_mirror_registered');
+    }
+  }
+
   private hasInFlightDelivery(jobs: ReturnType<Store['jobsForAggregate']>): boolean {
     return jobs.some(job => ['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id));
   }
@@ -450,13 +455,7 @@ export class Engine {
     this.store.transaction(() => {
       this.store.addMirror(source.post, now);
       this.store.matchMirror(`mirror:${aggregateId}`, xId);
-      if (this.store.getBatch(batchId)) {
-        this.store.updateBatch(batchId, 'mirror', 'manual_mirror_registered');
-        for (const member of this.store.batchPosts(batchId)) this.store.updatePost(member.key, 'manual_mirror', 'manual_mirror_registered');
-      }
-      for (const job of jobs) {
-        if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'manual_mirror_registered');
-      }
+      this.closeAsMirror(batchId);
       if (existing) this.store.updatePost(existing.key, 'manual_mirror', 'manual_mirror_registered');
       this.store.event(alreadyDelivered ? 'error' : 'info', alreadyDelivered
         ? 'Manual mirror registered after delivery started; inspect remote posts, no automatic deletion was attempted'
@@ -516,7 +515,7 @@ export class Engine {
    */
   mirrorCandidates(now: string = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string }> {
     return this.store.mirrors(now)
-      .filter(candidate => !candidate.expired && candidate.state === 'pending')
+      .filter(candidate => !candidate.expired)
       .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id }));
   }
 
@@ -536,11 +535,7 @@ export class Engine {
     if (!codes.length) return { matched: 0 };
     this.store.transaction(() => {
       for (const code of codes) this.store.matchMirror(code, batch.rootId);
-      this.store.updateBatch(batchId, 'mirror', 'manual_mirror_registered');
-      for (const member of this.store.batchPosts(batchId)) this.store.updatePost(member.key, 'manual_mirror', 'manual_mirror_registered');
-      for (const job of this.store.jobsForAggregate(batchId)) {
-        if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'manual_mirror_registered');
-      }
+      this.closeAsMirror(batchId);
       this.store.event('info', `X batch confirmed as manual mirror of ${codes.length} downstream post(s); reverse sync blocked`, batchId);
     });
     return { matched: codes.length };
