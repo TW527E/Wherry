@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRuntime } from '../src/app.js';
+import { createRuntime, createWeb } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { Store } from '../src/store.js';
 
@@ -58,4 +58,30 @@ test('command polling retains only live timer handles between polls', async t =>
   assert.equal(polls, 6);
   await runtime.stop();
   assert.equal(clear.mock.callCount(), 3, 'only two intervals and the next pending poll require cleanup');
+});
+
+test('web UI: held batches say whether approve can publish, and a schedule without dueAt means now', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'wherry-web-'));
+  const runtime = createRuntime(loadConfig({ DATA_DIR: directory, DESTINATIONS: 'telegram' }));
+  const app = await createWeb(runtime);
+  t.after(async () => { await app.close(); await runtime.stop(); rmSync(directory, { recursive: true, force: true }); });
+  const now = new Date().toISOString();
+  const post = (id: string, extra: object) => ({ platform: 'x' as const, id, authorId: 'owner', createdAt: now, text: `post ${id}`, url: `https://x.com/owner/status/${id}`,
+    relationKnown: true, visibility: 'public' as const, attachments: [], metadataComplete: true, replyToId: null, ...extra });
+  for (const [id, reason, extra] of [['1', 'possible_manual_mirror', {}], ['2', 'poll_details_unavailable', { poll: true }]] as const) {
+    runtime.store.addBatch({ id: `x:${id}`, platform: 'x', rootId: id, rootCreatedAt: now, cutoffAt: now, settleAt: now, state: 'review', reason });
+    runtime.store.addPost(post(id, extra), 'mirror_review', reason, now, `x:${id}`);
+  }
+  const status = (await app.inject({ method: 'GET', url: '/api/status' })).json();
+  assert.deepEqual(Object.fromEntries(status.held.map((b: { id: string; approvable: boolean }) => [b.id, b.approvable])), { 'x:1': true, 'x:2': false });
+  assert.equal(status.held.find((b: { id: string }) => b.id === 'x:1').text, 'post 1');
+  const scheduled = await app.inject({ method: 'POST', url: '/api/schedule', headers: { 'content-type': 'application/json' }, payload: { text: 'right now' } });
+  assert.equal(scheduled.statusCode, 200, scheduled.body);
+  // A job that can never deliver (an expired poll) can be given up; the reason it failed is kept.
+  const action = (id: string) => app.inject({ method: 'POST', url: '/api/action', headers: { 'content-type': 'application/json' }, payload: { action: 'cancel', id } });
+  const stuck = runtime.store.enqueue('publish', 'x:2', 'telegram', now);
+  runtime.store.updateJob(stuck, 'review', 'The X poll expired before delivery; it will not be reopened');
+  assert.equal((await action(stuck)).statusCode, 200);
+  assert.deepEqual([runtime.store.getJob(stuck)!.state, runtime.store.getJob(stuck)!.error], ['cancelled', 'The X poll expired before delivery; it will not be reopened']);
+  assert.equal((await action(stuck)).statusCode, 400, 'only failed/review/unknown jobs can be cancelled');
 });

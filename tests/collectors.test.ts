@@ -30,6 +30,35 @@ test('X reloads only the exact Posts timeline, never a thread or Replies page', 
   }
 });
 
+test('an X scan that scrolls past the checkpoint is complete even though every scroll keeps loading older tweets', async () => {
+  // Newest first, one hour apart; each scroll renders four more, so the timeline never stops growing.
+  const dates = Array.from({ length: 30 }, (_, i) => new Date(Date.parse(instant) - i * 3600_000).toISOString());
+  let rendered = 5;
+  const article = (i: number) => ({ locator: () => ({ first: () => ({ getAttribute: async () => `/TW527E/status/${1000 + i}` }) }) });
+  const locator = (selector: string) => ({
+    innerText: async () => '',
+    count: async () => selector.startsWith('article') ? rendered : 1,
+    all: async () => Array.from({ length: rendered }, (_, i) => article(i)),
+    first() { return this; },
+  });
+  const page = {
+    isClosed: () => false, url: () => 'https://x.com/TW527E', async reload() {}, async title() { return 'X'; },
+    locator, waitForTimeout: async () => undefined,
+    mouse: { async wheel() { rendered = Math.min(rendered + 4, dates.length); } },
+  } as unknown as Page;
+  const collector = new XCollector(loadConfig({ X_HANDLE: 'TW527E', X_MAX_PAGES: '4' }).x);
+  collector['page'] = page;
+  collector['hasReplyConnectorBelow'] = async () => false;
+  collector['parseArticle'] = async (_article: unknown, ctx: { own: string; authorId: string }) => ({
+    articleText: '',
+    parsed: { id: ctx.own, authorId: ctx.authorId, createdAt: dates[Number(ctx.own) - 1000], text: '', replyToId: null, relationKnown: true,
+      repost: false, attachments: [], poll: false, sensitive: false, metadataComplete: true },
+  });
+  const snapshot = await collector.collect(dates[10]);
+  assert.equal(snapshot.complete, true, snapshot.warnings.join('; '));
+  assert.ok(snapshot.posts.some(post => post.createdAt <= dates[10]!));
+});
+
 test('the X video lookup asks syndication once per tweet, skips it when video is off, and degrades to held', async () => {
   const xConfig = (): ReturnType<typeof loadConfig>['x'] => loadConfig({ X_HANDLE: 'TW527E' }).x;
   const media = { video: true, maxDownloadBytes: 20_000_000 };

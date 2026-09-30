@@ -9,6 +9,7 @@ import { prepareImages } from './media.js';
 import { prepareVideo, MAX_VIDEO_SECONDS } from './video.js';
 import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
+import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
 import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, TextRange, Transport } from './types.js';
 
@@ -335,7 +336,7 @@ export class Engine {
   }
 
   /** The content reason that keeps this batch out of the automatic publish path, if any. */
-  private holdReason(posts: SourcePost[]): string | undefined {
+  holdReason(posts: SourcePost[]): string | undefined {
     return posts.map(p => unsupportedReason(p, this.config.media.video)).find(Boolean);
   }
 
@@ -464,15 +465,25 @@ export class Engine {
     return { alreadyDelivered };
   }
 
-  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile', id: string, now: string = new Date().toISOString()): void {
+  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | 'cancel', id: string, now: string = new Date().toISOString()): void {
     // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
     // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
-    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile');
+    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile', 'cancel'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile|cancel');
     if (typeof id !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(id)) throw new Error('id must be a plain identifier');
     if (action === 'retry') {
       const job = this.store.getJob(id);
       if (!job || !['failed', 'review'].includes(job.state)) throw new Error('Only explicitly failed/review jobs can retry; unknown deliveries require reconciliation');
       this.store.updateJob(id, 'pending', undefined, now); return;
+    }
+    if (action === 'cancel') {
+      // The owner gives up on a delivery that cannot or need not happen (an expired poll, or an unknown
+      // delivery the owner found already posted). Nothing is sent; the worker only ever picks pending
+      // jobs, so these states are never mid-delivery. The original error stays as the record of why.
+      const job = this.store.getJob(id);
+      if (!job || !['failed', 'review', 'unknown'].includes(job.state)) throw new Error('Only failed/review/unknown jobs can be cancelled');
+      this.store.updateJob(id, 'cancelled', job.error);
+      this.store.event('info', 'Owner cancelled a job; it will not be sent or retried', id);
+      return;
     }
     if (action === 'reconcile') {
       // The owner has inspected the remote and confirmed the uncertain delivery left no usable post.
@@ -556,7 +567,7 @@ export class Engine {
     // markup here would render as literal tags. Mirror codes stay copyable as plain text.
     const lines = hold ? [
       '⚠️ 這則 X 內容不會自動同步到其他平台，需要你決定。',
-      `原因：${hold}`,
+      `原因：${describe(hold)}`,
       url ? `X 原文：${url}` : `批次：${batch.id}`,
       excerpt ? `摘要：${excerpt}` : '',
       '',
@@ -567,7 +578,7 @@ export class Engine {
            '• 按「略過」＝關閉這則提醒。']),
     ] : [
       '🕵️ 有一則 X 內容需要你決定是否同步到其他平台。',
-      `原因：${batch.reason}`,
+      `原因：${describe(batch.reason)}`,
       url ? `X 原文：${url}` : `批次：${batch.id}`,
       excerpt ? `摘要：${excerpt}` : '',
       '',
