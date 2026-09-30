@@ -248,7 +248,7 @@ export class Engine {
       this.store.addPost(post, outbound === 'known' ? 'ignored' : 'mirror_review', `outbound_${outbound}`, now);
       return;
     }
-    if (!post.relationKnown || post.replyToId === undefined || !post.metadataComplete) {
+    if (!post.relationKnown || post.replyToId === undefined) {
       this.store.addPost(post, 'mirror_review', 'native_relationship_unknown', now); return;
     }
     if (post.replyToId !== null || post.repost || post.quoteUrl || post.visibility !== 'public') {
@@ -258,7 +258,9 @@ export class Engine {
     const key = Store.postKey(post.platform, post.id);
     this.store.addPost(post, unsupported ? 'unsupported' : 'ready', unsupported || 'manual_x_reminder', now);
     this.store.addMirror(post, now);
-    if (unsupported) { this.store.event('warn', `Native post held: ${unsupported}`, key); return; }
+    // A held root means the X reminder the owner expects never comes, so this must reach Telegram —
+    // and `error` is the only level the forwarder picks up (incomplete metadata lands here too).
+    if (unsupported) { this.store.event('error', `Native post held: ${unsupported}`, key); return; }
     // The reminder is only a notification; the post itself is already recorded as ready for a manual X
     // post, so with no carrier for the notice there is nothing worth queueing.
     if (this.canNotifyOwner()) this.store.enqueue('reminder', key, 'telegram', now);

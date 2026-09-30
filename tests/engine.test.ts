@@ -865,3 +865,13 @@ test('a repeatedly failing downstream collector degrades seal freshness instead 
   engine.sealReady(farLater);
   assert.equal(store.getBatch('x:961')?.state, 'open', 'X freshness is never relaxed by the failure counter');
 });
+
+test('a native root with incomplete metadata is held loudly: error event for Telegram, mirror still registered', () => {
+  const { store, engine } = setup();
+  const native = post({ id: 'note1', platform: 'sharkey', authorId: 'sharkey-account', createdAt: at(5), metadataComplete: false });
+  engine.ingest(snapshot([native], at(10), 'sharkey', 'sharkey-account'), at(10));
+  assert.equal(store.getPost('sharkey', 'note1')?.classification, 'unsupported');
+  assert.equal(store.jobs(100).filter(j => j.kind === 'reminder').length, 0);
+  assert.deepEqual(store.mirrors(at(10)).map(m => m.post.id), ['note1'], 'a manual X copy must not echo back');
+  assert.deepEqual(store.errorEventsAfter(0).map(e => e.message), ['Native post held: incomplete_metadata']);
+});
