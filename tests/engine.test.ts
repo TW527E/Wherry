@@ -583,6 +583,7 @@ test('the owner can hold or retry, and already delivered batches are protected',
   assert.equal(store.getBatch('x:901')?.state, 'review');
   engine.action('skip', 'x:901');
   assert.equal(store.getBatch('x:901')?.state, 'ignored');
+  assert.equal(store.getPost('x', '901')?.classification, 'ignored', 'the posts follow the owner action, not stay collecting');
   assert.throws(() => engine.action('approve', 'x:901'), /Unsupported|not supported|cannot|Only open/i);
 
   // Simulate a completed delivery, then confirm the batch can no longer be rewritten.
@@ -701,6 +702,7 @@ test('a long X post is announced and can be released instead of stalling as a si
   // Approving must genuinely publish it — not park it in another failing state.
   engine.action('approve', 'x:970');
   assert.equal(store.getBatch('x:970')?.state, 'sealed');
+  assert.equal(store.getPost('x', '970')?.classification, 'ready');
   const job = store.jobs(100).find(j => j.kind === 'publish' && j.aggregateId === 'x:970' && j.destination === 'bluesky')!;
   const parts = await engine.parts(job);
   const bodies = parts.filter(p => !p.isFooter);

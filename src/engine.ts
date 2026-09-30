@@ -510,9 +510,11 @@ export class Engine {
       if (held.some(reason => !holdIsApprovable(reason))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
       if (members.some(m => !m.post.relationKnown)) throw new Error('Unknown reply relationship cannot be force-published');
       this.store.updateBatch(id, 'sealed', 'owner_confirmed_new_content');
+      for (const member of members) this.store.updatePost(member.key, 'ready', 'owner_confirmed_new_content');
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now);
     } else {
       this.store.updateBatch(id, action === 'mirror' ? 'mirror' : 'ignored', 'owner_override');
+      for (const member of this.store.batchPosts(id)) this.store.updatePost(member.key, action === 'mirror' ? 'manual_mirror' : 'ignored', 'owner_override');
       for (const job of jobs) this.store.updateJob(job.id, 'cancelled', 'owner_override');
     }
     this.store.event('info', `Owner action: ${action}`, id);
