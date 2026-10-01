@@ -1,73 +1,74 @@
 # Wherry
 
-X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動完成**；工具只讀取你自己的 X 內容，並自動同步到 Bluesky、dvd.chat（Sharkey）與 Telegram。
+以 X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動完成**；工具只讀取你自己的 X 內容，並同步到 Bluesky、dvd.chat（Sharkey）與 Telegram。
 
-設計依據見 [`crosspost-decisions.md`](crosspost-decisions.md)（v1.2）與平台限制查核 [`crosspost-spec-review.md`](crosspost-spec-review.md)。
+- 設定與維運：[`docs/configuration.md`](docs/configuration.md)
+- systemd 部署：[`deploy/README.md`](deploy/README.md)
+- 設計依據：[`crosspost-decisions.md`](crosspost-decisions.md)（v1.2）、平台限制查核 [`crosspost-spec-review.md`](crosspost-spec-review.md)
+
+**目錄**：[會做與不會做](#scope) · [X 政策風險](#x-policy) · [快速開始](#quickstart) · [設定重點](#config) · [指令](#commands) · [同步規則](#rules) · [資料與狀態](#state) · [媒體與網路](#media) · [部署](#deploy) · [已知限制](#limits) · [開發](#dev)
 
 ---
 
-## 這個工具會做與不會做的事
+<a id="scope"></a>
+## 會做與不會做
 
 **會做**
 
-- 讀取你自己 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道。
-- 在 Bluesky 同步完成後，多發一則回覆串文，附上該串文最頂端主推文的 `fixupx.com` 連結；Sharkey 改在各則內文附上可設定的署名與原文連結。
-- Telegram 對外頻道的每則訊息底部附 `原文連結`。
-- 貼文裡真的 tag 到的 X 帳號：有建立映射就換成該平台的原生 ID（Bluesky mention facet、Sharkey `@user@host`、Telegram `@username`），沒映射就換成該帳號的 X 個人頁連結，不會在下游變成「沒有此用戶」。純文字的 `@某人` 不受影響。
-- 偵測你在 Bluesky／dvd.chat 發的原生貼文，用 Telegram 私聊送一則**互動式提醒**：內含「1️⃣ 要發 / 2️⃣ 不發」按鈕。按「要發」後回覆該訊息貼上 X 連結，工具即登記為鏡像；按「不發」則不同步。訊息會就地更新狀態。
-- 認出你手動貼到 X 的鏡像內容（含互動提醒或 `/mirror` 登記的連結），**不再**回同步到其他平台。
-- 把系統錯誤事件自動轉發到 Telegram 私聊，秘密會先遮蔽。
-- 提供 CLI 與網頁介面，以及排程發布（排程只發布到下游並提醒你發 X）。
+- 讀取你 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道。
+- 附上原文連結：Bluesky 在串文最後多回覆一則 `fixupx.com` 連結；Sharkey 在各則內文附可設定的署名與連結；Telegram 每則底部附 `原文連結`。
+- 轉換 @提及：貼文裡真的 tag 到的 X 帳號，有映射就換成該平台的原生 ID，沒映射就換成 X 個人頁連結（[細節](#mentions)）。
+- 你在 Bluesky／dvd.chat 發原生貼文時，用 Telegram 私聊送**互動提醒**，請你決定要不要手動搬到 X（[細節](#telegram)）。
+- 認出你手動貼到 X 的鏡像內容，**不再**回同步到其他平台（[防回音](#echo)）。
+- 系統錯誤自動轉發到 Telegram 私聊，秘密先遮蔽。
+- CLI、網頁介面，以及排程發布（排程只發到下游，並提醒你發 X）。
 
 **不會做**
 
-- ❌ 不會自動登入 X、選檔、按 Post。程式碼中沒有任何 X 寫入路徑。
-- ❌ 不會反偵測、輪換代理、繞過驗證或速率限制。
-- ❌ 不會同步回覆他人的推文、晚發的自回覆、轉貼、引用或非公開內容。
-- ❌ 不做純音訊、圖片與影片混合、X Premium 長文。這些一律**保留**（不自動同步）並發通知說明原因；其中長文可由通知手動放行（發布時自動分段），其餘沒有可用的發布路徑。
-- 🗳️ 投票：Sharkey／Telegram 以原生 API 各建一份**獨立**投票（票數不與 X 或彼此合併），期限沿用 X 的絕對截止時間；Bluesky 沒有原生投票，改以文字列出選項與 X 原投票連結。資料不完整、已過期或敏感（Telegram 無法對題目防雷）的投票仍會保留。
+- ❌ 自動登入 X、選檔、按 Post。程式碼中沒有任何 X 寫入路徑。
+- ❌ 反偵測、輪換代理、繞過驗證或速率限制。
+- ❌ 同步回覆他人、晚發的自回覆、轉貼、引用或非公開內容。
+- ❌ 純音訊、圖片與影片混合、X Premium 長文：一律**保留**並通知原因。長文可由通知手動放行（發布時自動分段），其餘沒有發布路徑。
+
+投票不在上面兩類：Sharkey／Telegram 各建一份**獨立**原生投票（票數不與 X 或彼此合併，沿用 X 的截止時間）；Bluesky 沒有原生投票，改以文字列出選項並附 X 原投票連結。資料不完整、已過期或敏感的投票仍會保留。
 
 ---
 
 <a id="x-policy"></a>
 ## ⚠️ 啟用 X 讀取前請先讀這段
 
-X 官方 Automation Rules 明文禁止 `scripting the X website`，並寫明這**可能導致帳號被永久停權**。**讀取也包含在內**，不是只有發文。
+X 官方 Automation Rules 明文禁止 `scripting the X website`，並寫明**可能導致帳號被永久停權**。**讀取也包含在內**，不只是發文。
 
-這個工具只讀你自己的個人頁、不做任何互動、低頻輪詢，但仍屬該條款描述的技術。風險由你承擔，請自行判斷是否要在有價值的帳號上啟用。若不啟用 X 讀取（`X_ENABLED=false`），其他功能仍可運作（例如只用排程發布與 B/D → 手動 X 提醒）。
+這個工具只讀你自己的個人頁、不做任何互動、低頻輪詢，但仍屬該條款描述的技術。風險由你承擔，請自行判斷是否在有價值的帳號上啟用。不啟用（`X_ENABLED=false`）時其他功能照常運作，例如排程發布與 B/D → 手動 X 提醒。
 
-另外，`VIDEO_ENABLED=true` 時，每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（驅動網頁嵌入推文的公開端點），用來取得可下載的 MP4——X 自己的播放器只給 `blob:` 的 HLS，頁面裡沒有能下載的來源。這是唯讀、無認證的請求，仍然是對 X 基礎設施的請求，一併納入你的風險判斷。不開影片同步就完全不會發出這個請求。
+`VIDEO_ENABLED=true` 時，每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（網頁嵌入推文用的公開端點）取得可下載的 MP4，因為 X 播放器只給 `blob:` 的 HLS。這是唯讀、無認證的請求，但仍是對 X 基礎設施的請求，請一併納入判斷。不開影片同步就不會發出。
 
 ---
 
+<a id="quickstart"></a>
 ## 快速開始
+
+需要 Node.js 24 以上。
 
 ```bash
 cp .env.example .env      # 填入設定
 npm install
 npm run verify            # 型別檢查 + 測試 + 建置
-npm run cli -- doctor     # 檢查設定與能力
-npm run cli -- login      # 開瀏覽器手動登入 X 一次（只需一次）
+npm run cli -- doctor     # 檢查設定與實際偵測到的瀏覽器
+npm run cli -- login      # 開瀏覽器手動登入 X（只需一次）
 npm run cli -- serve      # 啟動排程、worker 與網頁介面
 ```
 
-**`login` 是必要的一步**：X 讀取靠一個持久化瀏覽器 profile，裡面要有已登入的 session。`login` 會用你選定的瀏覽器開一個可見視窗，你手動登入（含兩步驟驗證），回終端機按 Enter 後 session 就存進 `X_PROFILE_DIR`。之後所有 `scan` / `serve` 都用無頭模式重用這份登入，不必再登。沒做這一步的話，無頭瀏覽器會撞到 X 的登入牆、讀不到任何推文（`scan` 會回報 session 未登入）。
+**`login` 不能省**：X 讀取靠一個持久化瀏覽器 profile。`login` 用你選的瀏覽器開可見視窗，你手動登入（含兩步驟驗證）後回終端機按 Enter，session 就存進 `X_PROFILE_DIR`，之後 `scan`／`serve` 都以無頭模式重用。沒登入的話會撞到登入牆、讀不到任何推文（`scan` 會回報 session 未登入）。
 
-預設 `APP_MODE=preview`：**讀取、分類、組批次照常執行**（讀 X 是唯讀的、任何模式都安全），只有最後「發布」那步換成 stub 不對外送出。所以 preview 下你按「立刻檢查」就能看到工具偵測到你的新推文、預計會發什麼。確認行為正確後再改成 `live` 才會真的發到下游。
+**先用 preview 確認行為**：預設 `APP_MODE=preview` 時，讀取、分類、組批次照常執行（讀 X 是唯讀的），只有「發布」換成 stub 不對外送出。在網頁按「立刻檢查」就能看到偵測到哪些推文、預計發什麼。確認無誤再改 `live`。
 
-注意：Telegram 的對外發文、互動提醒與錯誤轉發**只在 `live` 模式送出**；preview 不會對外送任何 Telegram 訊息。指令輪詢（`/status`、`/sync` 等）與 session 上傳為 owner-only 的唯讀／管理操作，需 `TELEGRAM_POLL_COMMANDS=true` 並在 `live` 下才會啟動。
-
-網頁介面預設只在 `127.0.0.1:3000`。若綁到其他位址，`WEB_TOKEN` 必須至少 32 字元，且所有寫入請求都要帶 `Authorization: Bearer <token>`。
-
-### 用 Docker
-
-```bash
-docker compose up -d --build
-docker compose logs -f
-```
+- Telegram 的對外發文、互動提醒、錯誤轉發**只在 `live` 送出**。指令與 session 上傳另需 `TELEGRAM_POLL_COMMANDS=true`。
+- 網頁介面預設只綁 `127.0.0.1:3000`。綁其他位址時 `WEB_TOKEN` 必須至少 32 字元，所有寫入請求都要帶 `Authorization: Bearer <token>`。遠端存取請用 SSH 通道：`ssh -L 3000:127.0.0.1:3000 user@host`。
 
 ---
 
+<a id="config"></a>
 ## 設定重點
 
 | 變數 | 說明 |
@@ -75,77 +76,81 @@ docker compose logs -f
 | `APP_MODE` | `preview` 用 stub publisher；`live` 才真的發布 |
 | `DESTINATIONS` | 要同步過去的平台，例如 `bluesky,sharkey,telegram` |
 | `X_ENABLED` / `X_HANDLE` | 啟用 X 唯讀監聽 |
-| `X_BROWSER` | X 讀取用的瀏覽器：`auto`（偵測系統 Chrome → Edge → Chromium）、`chrome`、`msedge`、`chromium`、`path`（用 `CHROMIUM_PATH` 指定的執行檔） |
-| `CHROMIUM_PATH` | `X_BROWSER=path` 時的瀏覽器執行檔路徑 |
-| `X_PROFILE_DIR` | 你手動登入一次後保留的瀏覽器 profile 目錄（請保持私密） |
+| `X_BROWSER` | `auto`（依序找系統 Chrome → Edge → Chromium）、`chrome`、`msedge`、`chromium`、`path`（用 `CHROMIUM_PATH`） |
+| `X_PROFILE_DIR` | 登入後保留的瀏覽器 profile 目錄（視同密碼，請保持私密） |
 | `BLUESKY_*` | 官方 API，請用 **app password**，不要用主密碼 |
-| `BLUESKY_SENSITIVE_LABEL` | 未分類敏感內容的 self-label，預設 `graphic-media`（血腥／暴力類，不是通用警告）；依內容可選 `porn`、`sexual`、`nudity`、`graphic-media` |
-| `SHARKEY_*` | dvd.chat API token：發文需 `write:notes`、上傳需 `write:drive`；預設 Drive 資料夾另需 `read:drive` |
-| `TELEGRAM_BOT_TOKEN` | bot token（BotFather 取得） |
-| `TELEGRAM_PUBLIC_CHAT_ID` | 對外同步的頻道（一律用數字 ID，不是 @username） |
-| `TELEGRAM_PRIVATE_CHAT_ID` | 你的私聊：互動提醒、session 上傳、指令回覆 |
-| `TELEGRAM_OPS_CHAT_ID` | 保留的 ops chat 設定；自動錯誤告警仍送私聊 |
-| `TELEGRAM_OWNER_ID` | 唯一可下指令、按提醒按鈕、上傳 session 的使用者 ID |
-| `TELEGRAM_POLL_COMMANDS` | `true` 才輪詢並處理指令與互動按鈕（僅 `live`） |
+| `BLUESKY_SENSITIVE_LABEL` | 未分類敏感內容的 self-label，預設 `graphic-media`（血腥／暴力，不是通用警告）；可選 `porn`、`sexual`、`nudity` |
+| `SHARKEY_*` | API token 權限：發文 `write:notes`、上傳 `write:drive`；指定預設 Drive 資料夾另需 `read:drive` |
+| `TELEGRAM_ENABLED` / `TELEGRAM_BOT_TOKEN` | 啟用 bot（token 由 BotFather 取得） |
+| `TELEGRAM_PUBLIC_CHAT_ID` | 對外同步的頻道，一律用數字 ID，不是 @username |
+| `TELEGRAM_PRIVATE_CHAT_ID` | 你的私聊：互動提醒、錯誤告警、指令回覆、session 上傳 |
+| `TELEGRAM_OWNER_ID` | 唯一能下指令、按提醒按鈕、上傳 session 的使用者 |
+| `TELEGRAM_POLL_COMMANDS` | `true` 才處理指令與按鈕（僅 `live`） |
 
-完整設定說明（用途＋取得方式）見 [`docs/configuration.md`](docs/configuration.md)。
+完整設定（用途與取得方式）見 [`docs/configuration.md`](docs/configuration.md)。
 
-**設定會強制檢查**：若 `DESTINATIONS` 含 `bluesky`，就必須同時 `BLUESKY_ENABLED=true`，`sharkey` 同理。原因是工具必須觀察那個帳號才能排除「手動鏡像」，否則防回音會失去依據。這是刻意的設計，不是可以繞過的選項。
+**設定會強制檢查**：`DESTINATIONS` 含 `bluesky` 就必須 `BLUESKY_ENABLED=true`，`sharkey` 同理。工具必須觀察那個帳號才能辨認「手動鏡像」，否則防回音失去依據。這是刻意的設計，不能繞過。
 
 ---
 
-## CLI
+<a id="commands"></a>
+## 指令
+
+### CLI
 
 ```bash
-npm run cli -- serve                    # 常駐：輪詢、worker、Web UI
-npm run cli -- once                     # 跑一輪：收集 → 收斂串文 → 發布
-npm run cli -- status                   # 列出 jobs、batches、近期事件
-npm run cli -- publish <batchId>        # 對已封存的批次補發布
-npm run cli -- schedule <ISO時間> <文字>  # 排程發布（不會排程 X 寫入）
-npm run cli -- action skip <id>         # 不同步這個批次
-npm run cli -- action mirror <id>       # 標記為手動鏡像
-npm run cli -- action approve <id>      # 人工放行被保留的批次
-npm run cli -- action retry <jobId>     # 重試明確失敗的工作
-npm run cli -- action cancel <jobId>    # 放棄發不出去的工作（不再發送或重試）
-npm run cli -- doctor                   # 檢查設定
-npm run cli -- login                    # 本機開瀏覽器登入 X（只需一次）
-npm run cli -- export-session           # 匯出 X 登入到 X_SESSION_FILE
-npm run cli -- import-session           # 在伺服器安裝 X_SESSION_FILE 的登入
+npm run cli -- serve                     # 常駐：輪詢、worker、網頁介面
+npm run cli -- once                      # 跑一輪：收集 → 收斂串文 → 發布
+npm run cli -- scan                      # 只收集，不發布
+npm run cli -- status                    # 列出 jobs、batches、近期事件
+npm run cli -- publish <batchId>         # 對已封存的批次補發布
+npm run cli -- schedule <ISO時間> <文字>   # 排程發布（不會排程 X 寫入）
+npm run cli -- action <動作> <id>         # 見下表
+npm run cli -- doctor                    # 檢查設定
+npm run cli -- login                     # 本機開瀏覽器登入 X
+npm run cli -- export-session            # 匯出 X 登入到 X_SESSION_FILE
+npm run cli -- import-session            # 安裝 X_SESSION_FILE 的登入
 ```
 
-Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受 `TELEGRAM_OWNER_ID`）：
+`action` 的動作與 Telegram 指令對應同一套操作：
+
+| 動作 | Telegram | 作用 |
+|---|---|---|
+| `approve <batchId>` | `/approve` | 放行被保留的批次 |
+| `skip <batchId>` | `/skip` | 不同步這個批次 |
+| `mirror <id>` | `/mirror <id> [X_URL]` | 標記為手動鏡像；Telegram 可附上你發的 X 連結作為防回音依據 |
+| `retry <jobId>` | `/retry`、`/resync` | 重試**明確失敗**（`failed`）的工作 |
+| `reconcile <jobId>` | `/reconcile` | 重送結果不明（`unknown`）的工作——**先自己確認遠端沒有發出** |
+| `cancel <jobId>` | `/cancel` | 放棄發不出去的工作（例如投票已過期），不再發送或重試 |
+
+<a id="telegram"></a>
+### Telegram
+
+指令只接受 `TELEGRAM_OWNER_ID` 在私聊下達，且需 `live` + `TELEGRAM_POLL_COMMANDS=true`。除上表外：
 
 | 指令 | 作用 |
 |---|---|
-| `/status` | 目前模式、X session 狀態、任務與近期事件 |
+| `/status` | 模式、X session 狀態、任務與近期事件 |
 | `/sync` | 立即檢查一次（X 發文仍需手動） |
 | `/pending` | 列出等待處理的批次與 X 提醒 |
-| `/map <X_ID> [平台=ID …]` | 查看或設定 X 帳號的跨平台 ID 映射（`/map alice bluesky=alice.bsky.social`） |
-| `/maps` | 列出所有 ID 映射 |
-| `/unmap <X_ID>` | 刪除這個 X 帳號的所有映射 |
-| `/approve <batchId>` | 放行被保留的批次 |
-| `/skip <batchId>` | 不同步某批次 |
-| `/mirror <id>` | 標記為手動鏡像，不再同步 |
-| `/mirror <id> <X_URL>` | 登記你手動發的 X 連結（設定防回音來源） |
-| `/retry <jobId>`、`/resync <jobId>` | 重試明確失敗的工作 |
-| `/cancel <jobId>` | 放棄發不出去的工作（例如投票已過期），不再發送或重試 |
-| `/session` | 更新 X 登入：接著上傳 `x-session.json` |
+| `/map <X_ID> [平台=ID …]` | 查看或設定 @提及映射，例如 `/map alice bluesky=alice.bsky.social` |
+| `/maps`、`/unmap <X_ID>` | 列出／刪除映射 |
+| `/session` | 更新 X 登入：接著上傳 `x-session.json`（或在檔案說明填 `/session`） |
 | `/help` | 顯示所有指令 |
 
-互動提醒：偵測到 B/D 原生貼文時，私聊會收到帶「1️⃣ 要發 / 2️⃣ 不發」按鈕的訊息。按「要發」後**回覆該訊息貼上 X 連結**即完成鏡像登記；按「不發」則取消同步。訊息會就地更新狀態。
-
-另外，也可在 `x-session.json` 的檔案說明填 `/session` 後傳到私人聊天；未先下指令、也未加說明的檔案不會安裝。
+**互動提醒**：偵測到你在 Bluesky／dvd.chat 的原生貼文時，私聊會收到附「1️⃣ 要發 / 2️⃣ 不發」按鈕的訊息。按「要發」後**回覆該訊息貼上 X 連結**即登記為鏡像；按「不發」則不同步。訊息會就地更新狀態。
 
 ---
 
+<a id="rules"></a>
 ## 同步規則
 
-### 什麼會被同步（X → 下游）
+### 什麼會被同步
 
-1. 只有 `in_reply_to` 為空的推文能開啟新的批次。
-2. 以該 root 的**發布時間**起算固定 `THREAD_WINDOW_SECONDS`（預設 600 秒）窗口。窗口不會因為後續回覆而延長。
-3. 只有同一作者、沿著直接回覆鏈、且在窗口內的自回覆會加入同一批次。
-4. 批次在窗口結束、且**每個下游平台都有近期掃描**之後才封存；封存才發布。
+1. 只有 `in_reply_to` 為空的推文能開啟新批次。
+2. 從該 root 的**發布時間**起算 `THREAD_WINDOW_SECONDS`（預設 600 秒）窗口，不會因後續回覆而延長。
+3. 同一作者、沿直接回覆鏈、且在窗口內的自回覆加入同一批次。
+4. 窗口結束、且**每個下游平台都有近期掃描**後才封存；封存後才發布。
 
 ### 不同步與特殊處理
 
@@ -154,154 +159,139 @@ Telegram 私聊指令（需 `TELEGRAM_POLL_COMMANDS=true` 且 `live`，只接受
 | 回覆他人 | `reply_to_other`，忽略 |
 | 晚發的自回覆（超過 root 窗口） | `skipped_late_self_reply` |
 | 回覆一串早已同步完成的舊推文 | `self_reply_outside_new_batch` |
+| 自回覆的上一則從未被收集到 | `self_reply_outside_new_batch`，並記一筆 `warn` 說明收集缺口 |
 | 串文分支（非線性） | 保留待審，不強行攤平 |
 | 轉貼、引用、非公開、GIF、超過 4 張圖 | 保留或忽略，不會靜默降級 |
-| 影片 | `VIDEO_ENABLED=true` 且解析得到可下載 MP4、長度在 140 秒內才同步；否則保留並說明理由 |
-| 自回覆的上一則從未被收集到 | 忽略（`self_reply_outside_new_batch`），並記一筆 `warn` 事件說明是收集缺口，不會無聲消失 |
-| 投票 | Sharkey／Telegram 各建獨立原生投票、Bluesky 文字呈現；資料不完整／已過期／敏感的投票才保留 |
-| 敏感內容（你標了敏感的媒體、來源端的 CW） | 照常同步：Bluesky 每段 selfLabels＋CW 文字、Sharkey 每段 CW＋敏感檔案、Telegram 正文與媒體 spoiler |
+| 影片 | `VIDEO_ENABLED=true`、解析得到 MP4、長度 ≤140 秒才同步；否則保留並說明理由 |
+| 投票 | 見[會做與不會做](#scope)；資料不完整／已過期／敏感才保留 |
+| 敏感內容（標了敏感的媒體、來源 CW） | 照常同步，見下方 |
 | 你手動貼到 X 的鏡像 | `manual_mirror`，不同步 |
 
-敏感標記不會解除非公開或不支援媒體的限制，也不會讓敏感投票在 Telegram 發布（無法對投票題目防雷）。來源沒有 CW 時使用「來源標記為敏感內容」，各分段都預留警告長度；Bluesky 的媒體遮蔽仍依讀者設定，純文字只保留可見 CW，不保證折疊。X 偵測僅涵蓋頁面可見的警告，不能保證辨認所有敏感內容。詳見 [敏感內容同步說明](docs/configuration.md#敏感內容如何同步)。
+**敏感內容**：Bluesky 每段加 selfLabels＋CW 文字、Sharkey 每段加 CW＋敏感檔案、Telegram 正文與媒體加 spoiler。來源沒有 CW 時使用「來源標記為敏感內容」。敏感標記不會解除非公開或不支援媒體的限制；敏感投票不會在 Telegram 發布（無法對題目防雷）。Bluesky 的媒體遮蔽依讀者設定，純文字只保留可見 CW、不保證折疊。X 偵測只涵蓋頁面可見的警告。詳見[敏感內容同步說明](docs/configuration.md#敏感內容如何同步)。
 
-### tag 到的人（@提及）
+<a id="mentions"></a>
+### @提及
 
-只有 X 頁面上**真的是帳號連結**的提及才處理：顯示文字與連結路徑一致、位於貼文本體內。純文字裡的 `@某人`、引用推文裡的提及都不算。
+只處理 X 頁面上**真的是帳號連結**的提及（顯示文字與連結路徑一致、位於貼文本體）。純文字 `@某人`、引用推文裡的提及都不算。
 
-- 沒設定映射 → 換成該帳號的 X 個人頁連結（`https://x.com/帳號`），下游不會再把它當成自己站上的帳號。
-- 有設定映射 → 換成該平台的 ID：Bluesky 用完整 handle（發布時另查 DID 寫入 mention facet）、Sharkey 用 `@user` 或 `@user@host`、Telegram 用 `@username`。
+- 沒映射 → 換成 `https://x.com/帳號`，下游不會誤當成自己站上的帳號。
+- 有映射 → Bluesky 用完整 handle（發布時查 DID 寫入 mention facet）、Sharkey 用 `@user` 或 `@user@host`、Telegram 用 `@username`。
 
-用 `/map`、`/maps`、`/unmap` 管理（完整格式與驗證規則見 [設定文件](docs/configuration.md#mentions)）。映射只影響之後的發布：已經開始送出（有紀錄）的工作會沿用開始時的版本，不會因為改設定而漏送或重送。
+用 `/map`、`/maps`、`/unmap` 管理（格式與驗證規則見[設定文件](docs/configuration.md#mentions)）。映射只影響之後的發布；已開始送出的工作沿用當時的版本，不會因改設定而漏送或重送。
 
-### 防回音怎麼判斷
+<a id="echo"></a>
+### 防回音
 
-工具在 Bluesky／dvd.chat 發原生貼文時，**先寫入資料庫才發 Telegram 提醒**，並建立一筆 pending mirror（文字指紋＋媒體指紋，72 小時）。
+你在 Bluesky／dvd.chat 發原生貼文時，工具**先寫入資料庫再發 Telegram 提醒**，並建立一筆 pending mirror（文字指紋＋媒體指紋，有效 72 小時）。
 
-只有「**你可能還在手動搬到 X**」的下游貼文才算候選：第一次掃描下游帳號時掃進來的歷史（基準快照，本來就不回填）**不會**被當成 pending mirror，只有仍在 72 小時窗內的才會；已經配對到某則 X 貼文的鏡像也會退出比對，不會再攔下別的批次。少了這兩道，防回音會拿你幾個月前的下游舊文去比對每一則新推文，短貼文幾乎必然「像某一則」而被攔下來要你審核。
+只有「你可能還在手動搬到 X」的貼文才是候選：首次掃描下游帳號時的歷史（基準快照）不算，已配對到某則 X 貼文的也會退出比對。否則短貼文幾乎必然「像」某則舊文而被攔下審核。
 
-當 X 出現新批次時：
+X 出現新批次時：
 
-- 你已透過互動提醒或 `/mirror <id> <X_URL>` **明確登記過該 X 貼文 ID** → 直接判定為鏡像，忽略且不通知（確定性比對，最可靠）。
-- 文字正規化後完全相同、媒體指紋相容、文字**夠有辨識度**（≥20 UTF-8 位元組，約 7 個中文字），且**只有唯一符合**的候選 → 判定為鏡像，不同步。
-- 只有部分相似、媒體不一致、媒體沒有雜湊、文字相同但太短（如「早安」），或有多個候選 → 標記 `mirror_review`，**暫停並通知你**，不會自動發布。
-- 完全沒有證據 → 視為新的 X 原生內容，正常同步。
+| 證據 | 結果 |
+|---|---|
+| 已透過互動提醒或 `/mirror <id> <X_URL>` 登記過該 X 貼文 ID | 判定鏡像，忽略且不通知（確定性比對） |
+| 正規化文字完全相同、媒體指紋相容、文字 ≥20 UTF-8 位元組（約 7 個中文字），且**只有唯一**候選 | 判定鏡像，不同步 |
+| 部分相似、媒體不一致或沒雜湊、文字相同但太短（如「早安」）、多個候選 | `mirror_review`，**暫停並通知你** |
+| 完全沒有證據 | 視為 X 原生內容，正常同步 |
 
 > 寧可多問你一次，也不要重複發一篇。
 
 ---
 
+<a id="state"></a>
 ## 資料與狀態
 
-SQLite 位於 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取在 `DATA_DIR/media`，X profile 在 `DATA_DIR/x-profile`。
+SQLite 在 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取在 `DATA_DIR/media`，X profile 在 `DATA_DIR/x-profile`。
 
-工作狀態語意：
-
-| 狀態 | 意義 |
+| 工作狀態 | 意義 |
 |---|---|
 | `pending` / `running` | 等待中／執行中 |
 | `succeeded` | 已送達 |
-| `failed` | 明確被拒絕，可安全重試 |
-| `unknown` | **送出結果不明**（連線中斷等）。不會自動重試，需你確認遠端：沒發出就 `action reconcile` 重送，已發出就 `action cancel` 結束 |
+| `failed` | 明確被拒絕，可安全 `retry` |
+| `unknown` | **送出結果不明**（連線中斷、程序中途停止）。不會自動重試：遠端沒發出就 `reconcile`，已發出就 `cancel` |
 | `review` | 等待你決定 |
-| `cancelled` | 被你取消 |
+| `cancelled` | 已放棄 |
 
-已成功的子步驟有記錄，重試時**不會重複發送**。若程序在送出過程中中斷，下次啟動會把該工作標記為 `unknown` 而不是重播。
+已成功的子步驟有記錄，重試**不會重複發送**。程序在送出途中中斷時，下次啟動會把該工作標為 `unknown` 而不是重播。
 
 ---
 
-## 媒體處理（第一版）
+<a id="media"></a>
+## 媒體與網路
 
-- 預設只支援**靜態圖片**，每篇最多 4 張。
-- 依各平台限制自動壓縮（Bluesky 上限 2 MB），會先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
-- 動畫 GIF／APNG 不處理。單一影片在 `VIDEO_ENABLED=true` 時會轉碼後同步，X 的來源由公開嵌入端點解析出可下載的 MP4（挑選能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質），限制見 [設定文件](docs/configuration.md#video)。
-- API、媒體下載與上傳經過受保護的 HTTP 通道；本機圖片與影片皆限於 `DATA_DIR/media`。
+- 預設只支援**靜態圖片**，每篇最多 4 張；依平台限制壓縮（Bluesky 上限 2 MB），先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
+- 動畫 GIF／APNG 不處理。單一影片在 `VIDEO_ENABLED=true` 時從公開嵌入端點取能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質 MP4，經 FFmpeg 轉碼後同步（[限制](docs/configuration.md#video)）。
 
-### 對外請求的安全邊界
-
-API、媒體下載與上傳經過同一個通道；X 瀏覽器另有網域與唯讀方法限制，不具有下列全部 HTTP 防護：
+API、媒體下載與上傳都經過同一個受保護的 HTTP 通道：
 
 - 只允許 `http`／`https`；帶憑證與變更性請求**必須** HTTPS。
-- 拒絕 localhost、環回、私有、link-local、保留位址與雲端 metadata 位址，IPv4 與 IPv6 皆含。
-- DNS 解析出的**所有**位址都必須是公開位址，並把連線綁定到已驗證的位址（防 DNS rebinding）。
-- 每次重導向都重新驗證；不跨來源轉送憑證；HTTPS 不得降級。
-- 限制逾時、回應大小與解壓縮後大小；本機檔案只能讀取 `DATA_DIR/media` 之內。
+- 拒絕 localhost、環回、私有、link-local、保留與雲端 metadata 位址（IPv4／IPv6）。
+- DNS 解析出的**所有**位址都必須公開，連線綁定到已驗證位址（防 DNS rebinding）。
+- 每次重導向重新驗證；不跨來源轉送憑證；HTTPS 不得降級。
+- 限制逾時、回應大小與解壓後大小；本機檔案只能讀 `DATA_DIR/media`。
+
+X 瀏覽器不走這個通道，另有網域與唯讀方法限制。
 
 ---
 
+<a id="deploy"></a>
 ## 部署（Oracle ARM64 / Debian）
 
-兩種常駐方式：Docker，或 Linux systemd system service。systemd 有一支部署腳本 `deploy/install.sh`（`install`／`update`／`status`／`uninstall`，支援 `--dry-run` 先看再做），會建立服務帳號與目錄、安裝並建置程式、產生 unit、啟用啟動，更新前先備份資料目錄；完整說明見 [`deploy/README.md`](deploy/README.md)，unit 檔在 [`deploy/crosspost-bridge.service`](deploy/crosspost-bridge.service)。
+**systemd**：用部署腳本，先 `--dry-run` 看它會做什麼。更新前會自動備份資料目錄；完整說明見 [`deploy/README.md`](deploy/README.md)。
 
 ```bash
-sudo bash deploy/install.sh install --dry-run   # 先看它會做什麼
+sudo bash deploy/install.sh install --dry-run
 sudo bash deploy/install.sh install
+```
+
+**Docker**：容器內需設 `HOST=0.0.0.0` 與 32 字元以上的 `WEB_TOKEN`、資料目錄要讓 UID 10001 可寫，細節見 [Docker 部署](docs/configuration.md#docker)。
+
+```bash
+cp .env.example .env && vi .env
+docker compose up -d --build
+docker compose logs -f bridge
 ```
 
 收到 SIGTERM 後程式會停止新輪詢、等現有工作與瀏覽器收尾、釋放資料目錄鎖再退出。
 
-Docker：
+### 把 X 登入帶到伺服器
+
+VPS 通常開不了可見瀏覽器，所以**在本機登入、匯出 session 再帶過去**。session 檔等同你的 X 登入憑證，請當密碼保管。
 
 ```bash
-sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2
-cp .env.example .env && vi .env
-docker compose up -d --build
+# 本機（有桌面環境）
+npm run cli -- login
+npm run cli -- export-session          # 寫到 X_SESSION_FILE（預設 data/x-session.json）
 ```
 
-首次登入 X（只需一次）。VPS 通常沒有桌面環境、開不了可見瀏覽器，所以**在本機登入、把 session 帶到伺服器**。有三種方式，擇一即可：
-
-**方式 A — Telegram 上傳（最方便，推薦）**
+**方式 A — SSH 傳輸（建議）**
 
 ```bash
-# 在本機（有桌面環境）：
-npm run cli -- login              # 開瀏覽器登入 X 一次
-npm run cli -- export-session     # 匯出登入到 data/x-session.json
-```
-
-然後在 Telegram 與 bot 私聊先傳 `/session`，五分鐘內將 `x-session.json` 作為下一則訊息上傳（也可在檔案說明填 `/session`）。伺服器端在 `live` 且啟用指令輪詢時會驗證、安裝到 X profile，回報結果並嘗試刪除上傳訊息。
-
-> 只有 `TELEGRAM_OWNER_ID` 本人在私人聊天上傳才會被接受；其他來源一律忽略。檔案會嚴格驗證（必須是 export-session 產生的格式、含有效的 X 登入 cookie），大小上限 256KB。
-> 注意：session 檔＝你的 X 登入憑證。經 Telegram 傳輸代表 Telegram 伺服器與持有 bot token 者理論上能看到內容；這是為了方便換來的取捨。若不接受，用方式 B 或 C。
-
-**方式 B — 本機匯出、scp 到伺服器安裝**
-
-```bash
-# 本機匯出後：
 scp data/x-session.json user@host:/path/to/data/x-session.json
-# 伺服器上：
-npm run cli -- import-session     # 讀 X_SESSION_FILE 安裝到 profile
+# 伺服器上，先停止服務，用服務帳號與同一份設定執行：
+npm run cli -- import-session
 ```
 
-**方式 C — 直接搬整個 profile 目錄**
+**方式 B — Telegram 上傳（方便，但有取捨）**：在 bot 私聊先傳 `/session`，五分鐘內上傳 `x-session.json`（或在檔案說明填 `/session`）。伺服器在 `live` 且啟用指令輪詢時會驗證（格式、有效 cookie、≤256KB）、安裝並嘗試刪除該訊息。只接受 owner 本人在私聊上傳；沒下指令也沒填說明的檔案不會安裝。
+> 經 Telegram 傳輸代表 Telegram 伺服器與持有 bot token 者理論上能看到內容。不能接受就用方式 A。
 
-在本機 `npm run cli -- login` 後，把整個 `data/x-profile` 目錄上傳到伺服器對應的 volume。若伺服器上真的有可見瀏覽器，也可以直接跑：
-
-```bash
-docker compose run --rm --entrypoint /usr/bin/chromium bridge \
-  --user-data-dir=/app/data/x-profile --no-first-run https://x.com/login
-```
-
-session 過期或被要求重新驗證時，重跑本機 `login` + `export-session`，再上傳一次即可。
-
-在非容器環境（例如桌機測試）可以用系統已安裝的 Chrome／Edge 讀取 X：
-
-```bash
-X_BROWSER=chrome npm run cli -- doctor   # 顯示實際偵測到的瀏覽器
-```
-
-或用 SSH 通道看網頁介面：`ssh -L 3000:127.0.0.1:3000 user@host`。
+session 過期或被要求重新驗證時，重跑本機 `login` + `export-session` 再傳一次。權限與安全細節見 [X 登入與 session 安全](docs/configuration.md#x-session)。
 
 ---
 
+<a id="limits"></a>
 ## 已知限制
 
-- **X 讀取的選擇器可能隨 X 前端改版失效。** 解析失敗時會保留檢查點並回報錯誤，不會誤判成「沒有新內容」。
-- **Telegram 頻道內的回覆呈現**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際外觀需在你的頻道上驗證一次。
-- **dvd.chat 的實際可用上傳上限**由實例與角色政策決定，程式不寫死數字，以伺服器回應為準。
-- **影片轉碼為選用功能**：`VIDEO_ENABLED=true` 時，含影片的推文會先向公開嵌入端點取一個可下載的 MP4，再經 FFmpeg 轉碼交給下游。解析失敗（推文已刪、受保護、或 X 改了回應格式）就退回保留，理由是 `x_video_has_no_downloadable_source`；只有 HLS 沒有 MP4 的影片同樣保留。超過 140 秒會在下載前就以 `video_exceeds_duration_limit` 保留。GIF（在 X 上也是 `<video>`）以 `animated_video_not_supported` 保留，純音訊、圖片影片混合、Quote 原生互動仍未支援。
-- Web UI 已提供文字排程表單、待決批次與失敗工作的批量處理，以及「最近讀到的貼文」列表（每則的分類與原因）；排程附件與批次編輯仍未實作。
+- **X 前端改版可能讓選擇器失效。** 解析失敗時保留檢查點並回報錯誤，不會誤判成「沒有新內容」。
+- **Telegram 頻道內的回覆外觀**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際呈現請在你的頻道驗證一次。
+- **dvd.chat 的上傳上限**由實例與角色政策決定，程式不寫死，以伺服器回應為準。
+- **影片**：嵌入端點未公開文件化，解析失敗（推文已刪、受保護、格式改變、只有 HLS）就保留為 `x_video_has_no_downloadable_source`；超過 140 秒在下載前以 `video_exceeds_duration_limit` 保留；GIF 以 `animated_video_not_supported` 保留。
+- **網頁介面**已有文字排程、待決批次與失敗工作的批量處理、最近讀到的貼文（含分類與原因）；排程附件與批次編輯尚未實作。
 
 ---
 
+<a id="dev"></a>
 ## 開發
 
 ```bash
@@ -310,4 +300,4 @@ npm test        # node:test
 npm run verify  # check + test + build
 ```
 
-測試不需要網路、不需要帳號，也不會發送任何訊息。
+測試不需要網路與帳號，也不會發送任何訊息。
