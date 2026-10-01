@@ -152,3 +152,24 @@ test('native collectors retain their three-page bound and refuse an uncovered ba
     assert.ok(snapshot.warnings.some(warning => /page budget/.test(warning)));
   }
 });
+
+test('native collectors only warn about incomplete posts newer than the last scan', async () => {
+  const since = '2026-09-23T00:00:00.000Z';
+  for (const platform of ['bluesky', 'sharkey'] as const) {
+    const transport: Transport = { async request(url) {
+      if (url.endsWith('/.well-known/did.json')) return json({ id: did, service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: 'https://pds.example' }] });
+      if (url.endsWith('/users/show')) return json({ id: 'owner', username: 'owner', host: null });
+      // Both posts are incomplete (unknown embed / fileIds pointing at a deleted drive file); only the new one should warn.
+      if (platform === 'bluesky') return json({ feed: [instant, '2023-07-29T00:00:00.000Z'].map((createdAt, i) => ({ post: { uri: `at://${did}/app.bsky.feed.post/p${i}`, cid: 'offline-cid',
+        author: { did, labels: [] }, labels: [], embed: {}, record: { $type: 'app.bsky.feed.post', text: 'body', createdAt } } })) });
+      return json([instant, '2023-07-29T00:00:00.000Z'].map((createdAt, i) => ({ id: `note${i}`, userId: 'owner', user: { id: 'owner', host: null },
+        text: 'body', createdAt, cw: null, replyId: null, renoteId: null, files: [], fileIds: ['gone'], localOnly: false, visibility: 'public' })));
+    } };
+    const config = loadConfig({ BLUESKY_IDENTIFIER: did, SHARKEY_USERNAME: 'owner' });
+    const client = platform === 'bluesky' ? new BlueskyClient(config.bluesky, transport) : new SharkeyClient(config.sharkey, transport);
+    assert.equal((await client.collect(since)).warnings.length, 1, platform);
+    const old = await client.collect(instant);
+    assert.deepEqual(old.warnings, [], platform);
+    assert.equal(old.complete, true, platform);
+  }
+});

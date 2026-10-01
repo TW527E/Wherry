@@ -91,3 +91,12 @@ test('the manual-mirror prompt retains usable candidate codes after editing the 
   await f.notifications.flush();
   assert.match(f.calls.at(-1)!.body.text, /已登記為手動鏡像/);
 });
+
+test('forwarded error events reach Telegram in the same zh-Hant as the Web UI', async t => {
+  const { store, notifications, calls } = fixture(t);
+  store.event('error', 'Native post held: incomplete_metadata', 'sharkey:note1');
+  await notifications.flush();
+  const text = String(calls.find(call => call.method === 'sendMessage')?.body.text);
+  assert.match(text, /貼文暫停同步：貼文資料不完整/);
+  assert.doesNotMatch(text, /Native post held/);
+});

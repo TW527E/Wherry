@@ -326,8 +326,10 @@ export class SharkeyClient implements Publisher, Collector {
         for (const raw of result) {
           const parsed = parseNote(raw, account.id, this.baseUrl);
           // A note we cannot fully parse is held individually by the engine (metadataComplete:false);
-          // record it as a warning rather than rejecting the whole window.
-          if (!parsed.valid && parsed.reason) warnings.push(`note incomplete: ${parsed.reason}${parsed.post ? ` (id ${parsed.post.id})` : ''}`);
+          // record it as a warning rather than rejecting the whole window. Notes at/before the last
+          // scan were already handled, so re-reporting them every scan is noise (e.g. a 2023 note
+          // whose drive file was deleted keeps failing fileIds forever).
+          if (!parsed.valid && parsed.reason && (!since || !parsed.post || parsed.post.createdAt > since)) warnings.push(`note incomplete: ${parsed.reason}${parsed.post ? ` (id ${parsed.post.id})` : ''}`);
           if (!parsed.post) complete = false;
           if (parsed.post) {
             if (parsed.post.createdAt && (!oldest || parsed.post.createdAt < oldest)) oldest = parsed.post.createdAt;

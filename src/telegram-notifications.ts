@@ -1,6 +1,7 @@
 import type { AppConfig } from './config.js';
 import { Engine, Worker, safeError } from './engine.js';
 import { Store } from './store.js';
+import { readableEvent } from './labels.js';
 import { TelegramClient, type TelegramCallbackQuery, type TelegramUpdateMessage } from './platforms/telegram.js';
 import type { Reminder, ReviewNotice } from './types.js';
 
@@ -200,7 +201,7 @@ export class TelegramNotifications {
       return safeError(new Error(text));
     };
     try {
-      await telegram.sendPlain(`⚠️ Wherry 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, 'private');
+      await telegram.sendPlain(`⚠️ Wherry 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(readableEvent(error.message) ?? error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, 'private');
       store.setSetting('telegram:error_offset', errors.at(-1)!.id);
       store.setSetting('telegram:error_retry_at', '');
     } catch (error) {
