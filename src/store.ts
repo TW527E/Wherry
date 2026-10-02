@@ -277,6 +277,12 @@ export class Store {
   beginStep(jobId: string, key: string, content: unknown, now: string): void {
     this.db.prepare("INSERT INTO steps VALUES(?,?,'started',?,NULL,?) ON CONFLICT(job_id,step_key) DO UPDATE SET state='started',started_at=excluded.started_at").run(jobId, key, JSON.stringify(content), now);
   }
+  /** The receipt of one delivered part of a publish, e.g. where an earlier X post landed downstream. */
+  deliveredStep(aggregateId: string, destination: Destination, key: string): RemoteRef | undefined {
+    const row = this.db.prepare("SELECT s.result FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.kind='publish' AND j.aggregate_id=? AND j.destination=? AND s.step_key=? AND s.state='succeeded' AND s.result IS NOT NULL")
+      .get(aggregateId, destination, key);
+    return row ? decode<RemoteRef>(row.result) : undefined;
+  }
   finishStep(jobId: string, key: string, ref: RemoteRef): void { this.db.prepare("UPDATE steps SET state='succeeded',result=? WHERE job_id=? AND step_key=?").run(JSON.stringify(ref), jobId, key); }
   rejectStep(jobId: string, key: string): void { this.db.prepare("UPDATE steps SET state='rejected' WHERE job_id=? AND step_key=?").run(jobId, key); }
   /** Reconciliation: discard the uncertain (started-but-unconfirmed) steps of a job so a retry re-runs

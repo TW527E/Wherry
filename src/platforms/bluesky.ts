@@ -477,9 +477,12 @@ export class BlueskyClient implements Publisher, Collector {
       images.push({ alt: image.alt, image: uploaded, aspectRatio: { width: image.width, height: image.height } });
     }
     const videoBlob = part.video ? await this.uploadVideoBlob(part.video, session.did) : undefined;
-    const embed = videoBlob
+    const media = videoBlob
       ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: part.video!.width, height: part.video!.height }, ...(part.video!.alt ? { alt: part.video!.alt } : {}) }
       : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;
+    const quote = part.quote && strong({ uri: part.quote.uri ?? part.quote.id, cid: part.quote.cid });
+    const quoteEmbed = quote && { $type: 'app.bsky.embed.record', record: quote };
+    const embed = quoteEmbed && media ? { $type: 'app.bsky.embed.recordWithMedia', record: quoteEmbed, media } : quoteEmbed || media;
     const record: JsonObject = { $type: collection, text, createdAt: this.now().toISOString(),
       // Known source categories take precedence over the configured fallback. These labels moderate
       // media, not arbitrary text; the CW prefix also keeps a text-only warning visible.

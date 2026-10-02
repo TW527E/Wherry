@@ -134,6 +134,8 @@ export interface PublishPart {
    */
   video?: PreparedVideo;
   sourceUrl?: string;
+  /** This destination's copy of the quoted X post, quoted natively (embed / renote / reply) instead of linked. */
+  quote?: RemoteRef;
   isFooter?: boolean;
   /** Inline keyboard, one row of buttons, attached only by Telegram (e.g. the interactive reminder). */
   buttons?: InlineButton[];

@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
@@ -564,6 +565,32 @@ test('Sharkey appends the MFM signature to each note body and adds no reply foot
   assert.match(last.text, /^post 800\n\n<center><small>\$\[sparkle \$\[blur 這是從 X 來的推文，/);
   assert.ok(last.text.includes('[點擊此處](https://fixupx.com/owner/status/800)前往原文'), 'the {url} placeholder resolves to this note source link');
   assert.ok(last.text.includes('前往項目倉庫]]</small></center>'));
+});
+
+test('quoting your own synced post quotes its downstream copy; anything else links the tweet', async () => {
+  const { store, engine } = setup(['bluesky', 'sharkey', 'telegram']);
+  const refs = { bluesky: { id: 'at://did:plc:abc/app.bsky.feed.post/k', uri: 'at://did:plc:abc/app.bsky.feed.post/k', cid: 'bafy' },
+    sharkey: { id: 'note1' }, telegram: { id: '7', messageIds: [7], chatId: '@chan' } };
+  // Post 800 was delivered everywhere; record its first part's receipt per destination.
+  const key800 = createHash('sha256').update('800').digest('hex').slice(0, 16);
+  for (const [destination, ref] of Object.entries(refs)) {
+    const id = store.enqueue('publish', 'x:800', destination as Destination, at(0));
+    store.beginStep(id, `${key800}:0`, {}, at(0)); store.finishStep(id, `${key800}:0`, ref);
+  }
+  engine.ingest(snapshot([post({ id: '900', createdAt: at(10), text: 'look', quoteUrl: 'https://x.com/owner/status/800' }),
+    post({ id: '901', createdAt: at(11), text: 'other', quoteUrl: 'https://x.com/someone/status/1' })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'bluesky', 'bluesky-account'), at(700));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  engine.sealReady(at(900));
+  for (const [destination, ref] of Object.entries(refs)) {
+    const jobs = store.jobs(100).filter(j => j.destination === destination && j.kind === 'publish');
+    const own = (await engine.parts(jobs.find(j => j.aggregateId === 'x:900')!))[0]!;
+    assert.deepEqual(own.quote, ref, `${destination} quotes its own copy`);
+    assert.ok(own.text.startsWith('look') && !own.text.includes('引用推文'), `${destination} carries no link when quoting natively`);
+    const other = (await engine.parts(jobs.find(j => j.aggregateId === 'x:901')!))[0]!;
+    assert.equal(other.quote, undefined);
+    assert.ok(other.text.startsWith(destination === 'sharkey' ? 'other\n\n[引用推文](https://fixupx.com/someone/status/1)' : 'other\n\n引用推文：https://fixupx.com/someone/status/1'), destination);
+  }
 });
 
 test('an empty SHARKEY_SIGNATURE disables the inline attribution', async () => {

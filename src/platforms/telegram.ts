@@ -35,7 +35,9 @@ export class TelegramClient implements Publisher {
   private footer(url: string): string { return `\n\n<a href="${htmlEscape(url)}">原文連結</a>`; }
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     const audience = context.audience ?? 'public'; const chatId = this.chat(audience);
-    const reply = context.parent?.messageIds?.[0] ? { message_id: context.parent.messageIds[0], allow_sending_without_reply: false } : undefined;
+    // Telegram has no quote, so a quoted post replies to its earlier copy; a deleted copy just drops the reply.
+    const reply = context.parent?.messageIds?.[0] ? { message_id: context.parent.messageIds[0], allow_sending_without_reply: false }
+      : part.quote?.messageIds?.[0] && part.quote.chatId === chatId ? { message_id: part.quote.messageIds[0], allow_sending_without_reply: true } : undefined;
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Telegram CW must be text', { code: 'InvalidCW' });
     const sensitive = isSensitiveContent(part);
     if (part.poll) {

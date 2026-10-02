@@ -673,7 +673,15 @@ export class Engine {
       const body = bodies?.[postIndex] ?? { text: cleanXLinks(post.text), mentions: [] };
       let text = body.text;
       const mentions = body.mentions;
-      if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
+      // Quoting your own already-synced X post quotes its copy on this destination. Telegram can only
+      // express that as a reply, so it needs a post that is not already replying within its thread.
+      const quotedId = post.quoteUrl?.match(/\/status\/(\d+)/)?.[1];
+      const quoted = quotedId && (job.destination !== 'telegram' || postIndex === 0)
+        ? this.store.deliveredStep(`x:${quotedId}`, job.destination, `${createHash('sha256').update(quotedId).digest('hex').slice(0, 16)}:0`) : undefined;
+      if (post.quoteUrl && !quoted) {
+        const quoteUrl = fixupUrl(post.quoteUrl) || post.quoteUrl;
+        text += `${text ? '\n\n' : ''}${job.destination === 'sharkey' ? `[引用推文](${quoteUrl})` : `引用推文：${quoteUrl}`}`;
+      }
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
       if (poll) {
         const pollText = job.destination === 'bluesky' ? formatXPoll(poll, xPollUrl(post)!)
@@ -692,7 +700,7 @@ export class Engine {
         const chunks = splitHtml(text, images.length || video ? 1024 : 4096,
           (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0), mentions);
         const caption = chunks[0] ?? '';
-        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking });
+        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking, ...(quoted ? { quote: quoted } : {}) });
         for (let i = 1; i < chunks.length; i++) {
           output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl, ...marking });
         }
@@ -719,6 +727,7 @@ export class Engine {
           const partMentions = sliceMentions(mentions, offset, offset + chunk.length);
           offset += chunk.length;
           output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: rendered, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
+            ...(quoted && index === 0 ? { quote: quoted } : {}),
             ...(partMentions.length && job.destination === 'bluesky' ? { mentions: partMentions } : {}),
             ...(poll && job.destination === 'sharkey' && index === chunks.length - 1 ? { poll } : {}) });
         });
