@@ -649,6 +649,12 @@ export class Engine {
       this.store.setSetting(planKey, bodies);
     }
     const output: PublishPart[] = [];
+    // A post going out long after it was written (the service was down, it waited in review) keeps its
+    // own time on Bluesky, the one destination that lets a client set it, so a backlog lands where it
+    // belongs instead of flooding timelines. Normal delivery waits out the thread window and settle.
+    const lateMs = (this.config.threadWindowSeconds + this.config.settleSeconds + 3600) * 1000;
+    const backdate = (post: SourcePost): { backdate?: string } => job.destination === 'bluesky' && post.platform === 'x'
+      && Date.parse(now) - Date.parse(post.createdAt) > lateMs ? { backdate: post.createdAt } : {};
     if (job.kind === 'reminder') output.push({
       key: 'notice', sourcePostId: members[0]!.id,
       text: `🔔 你在 ${members[0]!.platform} 發了新內容。要不要也發到 X？\n下方是可直接複製的內容。請選擇：`,
@@ -727,7 +733,7 @@ export class Engine {
           const partMentions = sliceMentions(mentions, offset, offset + chunk.length);
           offset += chunk.length;
           output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: rendered, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
-            ...(quoted && index === 0 ? { quote: quoted } : {}),
+            ...(quoted && index === 0 ? { quote: quoted } : {}), ...backdate(post),
             ...(partMentions.length && job.destination === 'bluesky' ? { mentions: partMentions } : {}),
             ...(poll && job.destination === 'sharkey' && index === chunks.length - 1 ? { poll } : {}) });
         });
@@ -737,7 +743,7 @@ export class Engine {
       const root = members[0]!;
       const url = fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`);
       if (!url) throw new Error('X root URL invalid');
-      output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, images: [], sourceUrl: url, isFooter: true });
+      output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, images: [], sourceUrl: url, isFooter: true, ...backdate(members.at(-1)!) });
     }
     if (job.destination !== 'bluesky') {
       for (const part of output) {

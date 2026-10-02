@@ -483,7 +483,7 @@ export class BlueskyClient implements Publisher, Collector {
     const quote = part.quote && strong({ uri: part.quote.uri ?? part.quote.id, cid: part.quote.cid });
     const quoteEmbed = quote && { $type: 'app.bsky.embed.record', record: quote };
     const embed = quoteEmbed && media ? { $type: 'app.bsky.embed.recordWithMedia', record: quoteEmbed, media } : quoteEmbed || media;
-    const record: JsonObject = { $type: collection, text, createdAt: this.now().toISOString(),
+    const record: JsonObject = { $type: collection, text, createdAt: part.backdate ?? this.now().toISOString(),
       // Known source categories take precedence over the configured fallback. These labels moderate
       // media, not arbitrary text; the CW prefix also keeps a text-only warning visible.
       ...(labels.length ? { labels: { $type: 'com.atproto.label.defs#selfLabels', values: labels.map(val => ({ val })) } } : {}),
