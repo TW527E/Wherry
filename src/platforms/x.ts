@@ -433,7 +433,10 @@ export class XCollector implements Collector {
     }).catch(() => '');
     const body = parseTweetText(textHtml);
     const text = body.text;
-    const articleText = await article.innerText().catch(() => '');
+    // Leave the quote card's text out: a quoted reply shows its own "Replying to @x", which must not make
+    // this post a reply too (nor its "Pinned"/"Reposted by" chrome count as this post's).
+    const quoteTexts = await article.locator('[data-testid="quoteTweet"]').evaluateAll(nodes => nodes.map(node => (node as HTMLElement).innerText)).catch(() => [] as string[]);
+    const articleText = quoteTexts.reduce((rest, quoteText) => quoteText ? rest.replace(quoteText, '') : rest, await article.innerText().catch(() => ''));
     const replyMatch = articleText.match(/Replying to\s+(@[A-Za-z0-9_]{1,15})/i);
     // A link-preview card puts its destination only in the card, not the tweet text. Capture it
     // so a card-only tweet still carries its link downstream.
