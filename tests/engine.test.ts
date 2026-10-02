@@ -552,6 +552,20 @@ test('Bluesky targets and footers are assembled with the X root link only', asyn
   assert.equal(parts.at(-1)?.text, '🔗 X 原推文：https://fixupx.com/owner/status/800');
 });
 
+test('a post delivered long after it was written keeps its own time on Bluesky only', async () => {
+  const { store, engine } = setup(['bluesky', 'sharkey']);
+  engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'bluesky', 'bluesky-account'), at(700));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  assert.equal(engine.sealReady(at(900)), 1);
+  const bluesky = store.jobs(100).find(j => j.destination === 'bluesky')!;
+  const sharkey = store.jobs(100).find(j => j.destination === 'sharkey')!;
+  assert.ok((await engine.parts(bluesky, at(900))).every(p => p.backdate === undefined), 'on-time delivery publishes now');
+  const late = await engine.parts(bluesky, at(3 * 86400));
+  assert.ok(late.every(p => p.backdate === at(10)), 'the post and its footer keep the tweet time');
+  assert.ok((await engine.parts(sharkey, at(3 * 86400))).every(p => p.backdate === undefined), 'Sharkey cannot set a time');
+});
+
 test('Sharkey appends the MFM signature to each note body and adds no reply footer', async () => {
   const { store, engine } = setup(['sharkey']);
   engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));

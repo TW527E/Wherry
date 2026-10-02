@@ -136,6 +136,8 @@ export interface PublishPart {
   sourceUrl?: string;
   /** This destination's copy of the quoted X post, quoted natively (embed / renote / reply) instead of linked. */
   quote?: RemoteRef;
+  /** The source's own time to publish under instead of now, for a post delivered long after it was written. */
+  backdate?: string;
   isFooter?: boolean;
   /** Inline keyboard, one row of buttons, attached only by Telegram (e.g. the interactive reminder). */
   buttons?: InlineButton[];
