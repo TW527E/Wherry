@@ -649,6 +649,12 @@ export class Engine {
       this.store.setSetting(planKey, bodies);
     }
     const output: PublishPart[] = [];
+    // A post going out long after it was written (the service was down, it waited in review) keeps its
+    // own time on Bluesky, the one destination that lets a client set it, so a backlog lands where it
+    // belongs instead of flooding timelines. Normal delivery waits out the thread window and settle.
+    const lateMs = (this.config.threadWindowSeconds + this.config.settleSeconds + 3600) * 1000;
+    const backdate = (post: SourcePost): { backdate?: string } => job.destination === 'bluesky' && post.platform === 'x'
+      && Date.parse(now) - Date.parse(post.createdAt) > lateMs ? { backdate: post.createdAt } : {};
     if (job.kind === 'reminder') output.push({
       key: 'notice', sourcePostId: members[0]!.id,
       text: `🔔 你在 ${members[0]!.platform} 發了新內容。要不要也發到 X？\n下方是可直接複製的內容。請選擇：`,
@@ -673,7 +679,15 @@ export class Engine {
       const body = bodies?.[postIndex] ?? { text: cleanXLinks(post.text), mentions: [] };
       let text = body.text;
       const mentions = body.mentions;
-      if (post.quoteUrl) text += `\n引用：${fixupUrl(post.quoteUrl) || post.quoteUrl}`;
+      // Quoting your own already-synced X post quotes its copy on this destination. Telegram can only
+      // express that as a reply, so it needs a post that is not already replying within its thread.
+      const quotedId = post.quoteUrl?.match(/\/status\/(\d+)/)?.[1];
+      const quoted = quotedId && (job.destination !== 'telegram' || postIndex === 0)
+        ? this.store.deliveredStep(`x:${quotedId}`, job.destination, `${createHash('sha256').update(quotedId).digest('hex').slice(0, 16)}:0`) : undefined;
+      if (post.quoteUrl && !quoted) {
+        const quoteUrl = fixupUrl(post.quoteUrl) || post.quoteUrl;
+        text += `${text ? '\n\n' : ''}${job.destination === 'sharkey' ? `[引用推文](${quoteUrl})` : `引用推文：${quoteUrl}`}`;
+      }
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
       if (poll) {
         const pollText = job.destination === 'bluesky' ? formatXPoll(poll, xPollUrl(post)!)
@@ -692,7 +706,7 @@ export class Engine {
         const chunks = splitHtml(text, images.length || video ? 1024 : 4096,
           (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0), mentions);
         const caption = chunks[0] ?? '';
-        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking });
+        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking, ...(quoted ? { quote: quoted } : {}) });
         for (let i = 1; i < chunks.length; i++) {
           output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl, ...marking });
         }
@@ -719,6 +733,7 @@ export class Engine {
           const partMentions = sliceMentions(mentions, offset, offset + chunk.length);
           offset += chunk.length;
           output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: rendered, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
+            ...(quoted && index === 0 ? { quote: quoted } : {}), ...backdate(post),
             ...(partMentions.length && job.destination === 'bluesky' ? { mentions: partMentions } : {}),
             ...(poll && job.destination === 'sharkey' && index === chunks.length - 1 ? { poll } : {}) });
         });
@@ -728,7 +743,7 @@ export class Engine {
       const root = members[0]!;
       const url = fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`);
       if (!url) throw new Error('X root URL invalid');
-      output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, images: [], sourceUrl: url, isFooter: true });
+      output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, images: [], sourceUrl: url, isFooter: true, ...backdate(members.at(-1)!) });
     }
     if (job.destination !== 'bluesky') {
       for (const part of output) {

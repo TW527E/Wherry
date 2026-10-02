@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
@@ -551,6 +552,20 @@ test('Bluesky targets and footers are assembled with the X root link only', asyn
   assert.equal(parts.at(-1)?.text, '🔗 X 原推文：https://fixupx.com/owner/status/800');
 });
 
+test('a post delivered long after it was written keeps its own time on Bluesky only', async () => {
+  const { store, engine } = setup(['bluesky', 'sharkey']);
+  engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'bluesky', 'bluesky-account'), at(700));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  assert.equal(engine.sealReady(at(900)), 1);
+  const bluesky = store.jobs(100).find(j => j.destination === 'bluesky')!;
+  const sharkey = store.jobs(100).find(j => j.destination === 'sharkey')!;
+  assert.ok((await engine.parts(bluesky, at(900))).every(p => p.backdate === undefined), 'on-time delivery publishes now');
+  const late = await engine.parts(bluesky, at(3 * 86400));
+  assert.ok(late.every(p => p.backdate === at(10)), 'the post and its footer keep the tweet time');
+  assert.ok((await engine.parts(sharkey, at(3 * 86400))).every(p => p.backdate === undefined), 'Sharkey cannot set a time');
+});
+
 test('Sharkey appends the MFM signature to each note body and adds no reply footer', async () => {
   const { store, engine } = setup(['sharkey']);
   engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));
@@ -564,6 +579,32 @@ test('Sharkey appends the MFM signature to each note body and adds no reply foot
   assert.match(last.text, /^post 800\n\n<center><small>\$\[sparkle \$\[blur 這是從 X 來的推文，/);
   assert.ok(last.text.includes('[點擊此處](https://fixupx.com/owner/status/800)前往原文'), 'the {url} placeholder resolves to this note source link');
   assert.ok(last.text.includes('前往項目倉庫]]</small></center>'));
+});
+
+test('quoting your own synced post quotes its downstream copy; anything else links the tweet', async () => {
+  const { store, engine } = setup(['bluesky', 'sharkey', 'telegram']);
+  const refs = { bluesky: { id: 'at://did:plc:abc/app.bsky.feed.post/k', uri: 'at://did:plc:abc/app.bsky.feed.post/k', cid: 'bafy' },
+    sharkey: { id: 'note1' }, telegram: { id: '7', messageIds: [7], chatId: '@chan' } };
+  // Post 800 was delivered everywhere; record its first part's receipt per destination.
+  const key800 = createHash('sha256').update('800').digest('hex').slice(0, 16);
+  for (const [destination, ref] of Object.entries(refs)) {
+    const id = store.enqueue('publish', 'x:800', destination as Destination, at(0));
+    store.beginStep(id, `${key800}:0`, {}, at(0)); store.finishStep(id, `${key800}:0`, ref);
+  }
+  engine.ingest(snapshot([post({ id: '900', createdAt: at(10), text: 'look', quoteUrl: 'https://x.com/owner/status/800' }),
+    post({ id: '901', createdAt: at(11), text: 'other', quoteUrl: 'https://x.com/someone/status/1' })], at(650)), at(650));
+  engine.ingest(snapshot([], at(700), 'bluesky', 'bluesky-account'), at(700));
+  engine.ingest(snapshot([], at(700), 'sharkey', 'sharkey-account'), at(700));
+  engine.sealReady(at(900));
+  for (const [destination, ref] of Object.entries(refs)) {
+    const jobs = store.jobs(100).filter(j => j.destination === destination && j.kind === 'publish');
+    const own = (await engine.parts(jobs.find(j => j.aggregateId === 'x:900')!))[0]!;
+    assert.deepEqual(own.quote, ref, `${destination} quotes its own copy`);
+    assert.ok(own.text.startsWith('look') && !own.text.includes('引用推文'), `${destination} carries no link when quoting natively`);
+    const other = (await engine.parts(jobs.find(j => j.aggregateId === 'x:901')!))[0]!;
+    assert.equal(other.quote, undefined);
+    assert.ok(other.text.startsWith(destination === 'sharkey' ? 'other\n\n[引用推文](https://fixupx.com/someone/status/1)' : 'other\n\n引用推文：https://fixupx.com/someone/status/1'), destination);
+  }
 });
 
 test('an empty SHARKEY_SIGNATURE disables the inline attribution', async () => {

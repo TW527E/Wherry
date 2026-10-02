@@ -279,6 +279,13 @@ test('a timeline self-thread continuation is parsed as a self-reply to the tweet
   assert.equal(root.relationKnown, true);
 });
 
+test('a link into the quoted tweet (its /photo/1) does not make a quote look like a reply', () => {
+  const quote = parseTweetFacts({ id: '200', authorId: 'owner', createdAt: '2026-09-19T00:00:00.000Z', text: 'look',
+    quoteUrl: 'https://x.com/owner/status/100', statusLinks: ['https://x.com/owner/status/100', 'https://x.com/owner/status/100/photo/1'] }, 'owner');
+  assert.equal(quote.replyToId, null);
+  assert.equal(quote.quoteUrl, 'https://x.com/owner/status/100');
+});
+
 test('link cleaning rewrites X URLs but preserves other links and punctuation', () => {
   const input = 'see https://x.com/a/status/99?s=20 and https://example.com/p?q=1, ok';
   const output = cleanXLinks(input);

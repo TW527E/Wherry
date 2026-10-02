@@ -158,8 +158,11 @@ export function parseTweetFacts(input: {
   threadParentAuthor?: string;
 }, ownerHandle: string): TweetFacts {
   const ownUrl = input.url;
+  // Any link into the quoted tweet (its permalink, its /photo/1) belongs to the quote, not a reply parent.
+  let quoteId: string | undefined;
+  try { quoteId = input.quoteUrl ? new URL(input.quoteUrl, 'https://x.com').pathname.match(statusPath)?.[1] : undefined; } catch { /* no quote */ }
   const parentLink = (input.statusLinks || []).map(value => {
-    try { const url = new URL(value, 'https://x.com'); const match = url.pathname.match(statusPath); return match && match[1] !== input.id && value !== input.quoteUrl ? { url: url.href, id: match[1] } : undefined; } catch { return undefined; }
+    try { const url = new URL(value, 'https://x.com'); const match = url.pathname.match(statusPath); return match && match[1] !== input.id && match[1] !== quoteId ? { url: url.href, id: match[1] } : undefined; } catch { return undefined; }
   }).find(Boolean);
   const replying = input.replyingTo?.match(/@([A-Za-z0-9_]{1,15})/);
   const isReply = Boolean(input.threadParentId || replying || parentLink);
@@ -276,6 +279,8 @@ export class XCollector implements Collector {
   // Resolved video source per tweet id (null = looked up, nothing usable). Cached for the collector's
   // lifetime so a tweet re-read on every scan costs at most one syndication request.
   private readonly videoSources = new Map<string, XVideoSource | null>();
+  // The tweet a quote card shows, per quoting tweet id (null = looked up, unknown).
+  private readonly quotes = new Map<string, string | null>();
   constructor(
     private readonly config: AppConfig['x'],
     private readonly transport?: Transport,
@@ -293,15 +298,34 @@ export class XCollector implements Collector {
     if (!this.transport || !this.media?.video) return undefined;
     const cached = this.videoSources.get(tweetId);
     if (cached !== undefined) return cached ?? undefined;
-    let resolved: XVideoSource | undefined;
-    try {
-      const query = new URLSearchParams({ id: tweetId, token: syndicationToken(tweetId), lang: 'en' });
-      const response = await this.transport.request(`${SYNDICATION_ENDPOINT}?${query}`, { method: 'GET', timeoutMs: 10_000, maxBytes: 512_000 });
-      if (response.status === 200) resolved = pickVideoSource(JSON.parse(Buffer.from(response.body).toString('utf8')), this.media.maxDownloadBytes);
-    } catch { /* Held without a source, which is what the caller already handles. */ }
+    const payload = await this.syndication(tweetId);
+    // Held without a source, which is what the caller already handles.
+    const resolved = payload === undefined ? undefined : pickVideoSource(payload, this.media.maxDownloadBytes);
     // A lookup cut short by shutdown is not a real "nothing here"; leave it uncached so the next run retries.
     if (!signal?.aborted) this.videoSources.set(tweetId, resolved ?? null);
     return resolved;
+  }
+
+  /** The tweet this one quotes, as an x.com URL, or undefined when the embed endpoint cannot say. */
+  private async resolveQuote(tweetId: string, signal?: AbortSignal): Promise<string | undefined> {
+    if (!this.transport) return undefined;
+    const cached = this.quotes.get(tweetId);
+    if (cached !== undefined) return cached ?? undefined;
+    const quoted = (await this.syndication(tweetId) as { quoted_tweet?: { id_str?: unknown; user?: { screen_name?: unknown } } } | undefined)?.quoted_tweet;
+    const id = quoted?.id_str, handle = quoted?.user?.screen_name;
+    const url = typeof id === 'string' && /^\d+$/.test(id) && typeof handle === 'string' && /^[A-Za-z0-9_]{1,15}$/.test(handle)
+      ? `https://x.com/${handle}/status/${id}` : undefined;
+    if (!signal?.aborted) this.quotes.set(tweetId, url ?? null);
+    return url;
+  }
+
+  /** The embed endpoint's view of one tweet; every failure is undefined. */
+  private async syndication(tweetId: string): Promise<unknown> {
+    try {
+      const query = new URLSearchParams({ id: tweetId, token: syndicationToken(tweetId), lang: 'en' });
+      const response = await this.transport!.request(`${SYNDICATION_ENDPOINT}?${query}`, { method: 'GET', timeoutMs: 10_000, maxBytes: 512_000 });
+      return response.status === 200 ? JSON.parse(Buffer.from(response.body).toString('utf8')) : undefined;
+    } catch { return undefined; }
   }
 
   /**
@@ -383,8 +407,21 @@ export class XCollector implements Collector {
    */
   private async parseArticle(article: Locator, ctx: { own: string; authorId: string; threadParentId?: string; threadParentAuthor?: string }, signal?: AbortSignal): Promise<{ parsed: TweetFacts; articleText: string }> {
     const { own, authorId } = ctx;
+    // A quoted tweet renders inside this article with its own <time>. Tag its card with the testid every
+    // selector below already excludes, so the quote's text, media, poll and card never leak into this post.
+    const quoted = await article.evaluate((node: Element, id: string) => {
+      let found = false;
+      for (const time of node.querySelectorAll('time')) {
+        if (time.closest(`a[href*="/status/${id}"]`)) continue;
+        const card = time.closest('[data-testid="quoteTweet"], div[role="link"]');
+        if (card && card !== node && node.contains(card)) { card.setAttribute('data-testid', 'quoteTweet'); found = true; }
+      }
+      return found;
+    }, own).catch(() => false);
     const links = await article.locator('a[href*="/status/"]').evaluateAll(nodes => nodes.map(node => (node as HTMLAnchorElement).href));
-    const time = await article.locator('time').getAttribute('datetime').catch(() => null);
+    // Read this tweet's own timestamp: with a quote there are two <time>s, and the strict locator used
+    // to throw on both, dropping every quote tweet for lack of a createdAt.
+    const time = await article.locator(`a[href*="/status/${own}"] time`).first().getAttribute('datetime').catch(() => null);
     // X truncates a link's DISPLAY text ("youtube.com/watch…") while the real destination is the
     // anchor href. Reading innerText would sync the broken truncated string, so reconstruct the
     // text from the tweetText node: use each <a>'s href for external links, keep emoji alt text,
@@ -396,13 +433,18 @@ export class XCollector implements Collector {
     }).catch(() => '');
     const body = parseTweetText(textHtml);
     const text = body.text;
-    const articleText = await article.innerText().catch(() => '');
+    // Leave the quote card's text out: a quoted reply shows its own "Replying to @x", which must not make
+    // this post a reply too (nor its "Pinned"/"Reposted by" chrome count as this post's).
+    const quoteTexts = await article.locator('[data-testid="quoteTweet"]').evaluateAll(nodes => nodes.map(node => (node as HTMLElement).innerText)).catch(() => [] as string[]);
+    const articleText = quoteTexts.reduce((rest, quoteText) => quoteText ? rest.replace(quoteText, '') : rest, await article.innerText().catch(() => ''));
     const replyMatch = articleText.match(/Replying to\s+(@[A-Za-z0-9_]{1,15})/i);
     // A link-preview card puts its destination only in the card, not the tweet text. Capture it
     // so a card-only tweet still carries its link downstream.
-    const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]').first().getAttribute('href').catch(() => null);
-    const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
-    const hasVideo = await article.locator('[data-testid="videoPlayer"], video').count() > 0;
+    const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]')
+      .evaluateAll(nodes => nodes.find(node => !node.closest('[data-testid="quoteTweet"]'))?.getAttribute('href') ?? null).catch(() => null);
+    const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.filter(node => !node.closest('[data-testid="quoteTweet"]'))
+      .map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
+    const hasVideo = await article.locator('[data-testid="videoPlayer"], video').evaluateAll(nodes => nodes.some(node => !node.closest('[data-testid="quoteTweet"]')));
     // cardPoll is the current rendered widget; preserve its entire choice list in one read so
     // percentages cannot be paired with labels from a different render. No vote/reveal action.
     const pollRead = await article.evaluate((node: Element, selector: string) => {
@@ -435,7 +477,9 @@ export class XCollector implements Collector {
     // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
     // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
     // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
-    const quote = links.find(value => { try { const qid = new URL(value).pathname.match(statusPath)?.[1]; return Boolean(qid) && qid !== own; } catch { return false; } });
+    // The logged-in quote card is not a link at all, so ask the embed endpoint which tweet it shows.
+    const quote = links.find(value => { try { const qid = new URL(value).pathname.match(statusPath)?.[1]; return Boolean(qid) && qid !== own; } catch { return false; } })
+      ?? (quoted ? await this.resolveQuote(own, signal) : undefined);
     // A card link that is not a quoted tweet and not already in the text is the tweet's only URL;
     // append it so it survives the sync. (Quote cards are handled via quoteUrl, not here.)
     let bodyText = text;

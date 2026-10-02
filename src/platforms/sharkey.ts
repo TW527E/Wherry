@@ -290,6 +290,7 @@ export class SharkeyClient implements Publisher, Collector {
       ...(cw !== undefined ? { cw } : {}), ...(fileIds.length ? { fileIds } : {}),
       ...(part.poll ? { poll: nativePollPayload(part.poll, 'sharkey', this.now().getTime()) } : {}),
       ...(context.parent ? { replyId: context.parent.id } : {}),
+      ...(part.quote && noteId(part.quote.id) ? { renoteId: part.quote.id } : {}),
     }, true));
     const note = object(result?.createdNote);
     if (!noteId(note?.id)) throw schemaError('Sharkey note creation', true);
