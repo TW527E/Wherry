@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { isPublicAddress, SafeHttp, validatePublicUrl, HttpError } from '../src/security/http.js';
-import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape } from '../src/text.js';
+import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape, isVideoPoster } from '../src/text.js';
 import { blueskyRecordKey } from '../src/platforms/bluesky.js';
-import { fullSizeImageUrl, hasSensitiveWarning, isVideoPoster, parseTweetFacts, pickMedia, syndicationToken } from '../src/platforms/x.js';
+import { fullSizeImageUrl, hasSensitiveWarning, parseTweetFacts, pickMedia, syndicationToken } from '../src/platforms/x.js';
 import { TelegramClient } from '../src/platforms/telegram.js';
 import { SharkeyClient } from '../src/platforms/sharkey.js';
 import type { HttpOptions, HttpResponse, PreparedImage, Transport } from '../src/types.js';

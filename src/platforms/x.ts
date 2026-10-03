@@ -5,6 +5,7 @@ import type { AppConfig } from '../config.js';
 import { mapMentionText, type MentionText } from '../mentions.js';
 import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, TextMention, Transport } from '../types.js';
 import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
+import { isVideoPoster } from '../text.js';
 import { object, positiveInteger } from './parse.js';
 import { resolveBrowserPlan, verifyBrowserPlan } from './browser.js';
 import { buildSessionFile, type SessionFile, type StorageState } from './session.js';
@@ -117,11 +118,6 @@ function videoSource(media: Record<string, unknown>, maxDownloadBytes: number): 
   // so fall back to the smallest rendition instead of guessing something past the download cap.
   const affordable = renditions.findLast(r => source.durationSeconds !== undefined && (r.bitrate / 8) * source.durationSeconds <= maxDownloadBytes);
   return { ...source, url: (affordable ?? renditions[0]!).url };
-}
-
-/** A video's or GIF's poster thumbnail on pbs.twimg.com, as opposed to an attached photo (/media/). */
-export function isVideoPoster(url: string): boolean {
-  return /^https:\/\/pbs\.twimg\.com\/(?:ext_tw_video|amplify_video|tweet_video)_thumb\//.test(url);
 }
 
 /**

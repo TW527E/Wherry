@@ -54,6 +54,7 @@ export const LABELS: Record<string, string> = {
   video_exceeds_duration_limit: '影片超過 140 秒',
   // No longer produced (mixed media now syncs); kept so posts held under it before still read in zh-Hant.
   video_must_be_the_only_attachment: '影片不能與其他附件混用',
+  video_poster_repaired: '原本把影片封面誤判成圖片，已修正，可以發布',
   video_sync_disabled: '影片同步未啟用',
   x_video_has_no_downloadable_source: '影片沒有可下載的來源',
 };

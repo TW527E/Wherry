@@ -614,6 +614,34 @@ test('a mixed-media post collected before mixing was supported stays manual: its
   assert.equal(store.getBatch('x:961')?.state, 'sealed');
 });
 
+test('a plain video held because its poster was stored as a photo is repaired on startup and can be published', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'crosspost-poster-'));
+  const path = join(dataDir, 'crosspost.sqlite');
+  const video: Attachment = { kind: 'video', alt: '', url: 'https://video.twimg.com/amplify_video/1/vid/a.mp4' };
+  const poster: Attachment = { kind: 'image', alt: 'Embedded video', url: 'https://pbs.twimg.com/amplify_video_thumb/1/img/a.jpg' };
+  const photo: Attachment = { kind: 'image', alt: '', url: 'https://pbs.twimg.com/media/A?format=jpg&name=orig' };
+  const before = new Store(path);
+  for (const [id, attachments] of [['970', [poster, video]], ['971', [photo, poster, video]]] as const) {
+    before.addBatch({ id: `x:${id}`, platform: 'x', rootId: id, rootCreatedAt: at(0), cutoffAt: at(0), settleAt: at(0), state: 'review', reason: 'video_must_be_the_only_attachment' });
+    before.addPost(post({ id, createdAt: at(0), attachments: [...attachments] }), 'unsupported', 'video_must_be_the_only_attachment', at(0), `x:${id}`);
+  }
+  before.close();
+
+  const store = new Store(path);   // the upgraded service starting up
+  const engine = new Engine(store, loadConfig({ DATA_DIR: dataDir, DESTINATIONS: 'bluesky', BLUESKY_ENABLED: 'true', X_ENABLED: 'true', X_HANDLE: 'owner', VIDEO_ENABLED: 'true' }), transport);
+  assert.deepEqual(store.getPost('x', '970')?.post.attachments, [video]);
+  assert.equal(store.getBatch('x:970')?.reason, 'video_poster_repaired');
+  assert.equal(store.getPost('x', '970')?.reason, 'video_poster_repaired');
+  assert.equal(engine.holdReason('x:970'), undefined, 'the web UI now offers to publish it');
+  engine.action('approve', 'x:970', at(20));
+  assert.equal(store.getBatch('x:970')?.state, 'sealed');
+  // A real photo beside the video still came from the old collector (maybe missing later videos), so it stays manual.
+  assert.deepEqual(store.getPost('x', '971')?.post.attachments, [photo, video]);
+  assert.equal(engine.holdReason('x:971'), 'collected_before_mixed_media');
+  store.close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('Bluesky targets and footers are assembled with the X root link only', async () => {
   const { store, engine } = setup(['bluesky']);
   engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));

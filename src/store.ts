@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { cleanXLinks } from './text.js';
+import { cleanXLinks, isVideoPoster } from './text.js';
 import { normalizeMentionTarget, normalizeXHandle, type MentionTargets } from './mentions.js';
 import type { Batch, Classification, Destination, EventRecord, Job, JobState, Reminder, ReminderState, RemoteRef, ReviewNotice, ReviewNoticeState, SourcePlatform, SourcePost, StoredPost } from './types.js';
 
@@ -64,6 +64,19 @@ export class Store {
     // rejects as "Invalid DID or handle". Posts are INSERT OR IGNORE, so stored rows never refresh on their own.
     for (const table of ['posts', 'mirrors']) {
       this.db.prepare(`UPDATE ${table} SET payload=replace(replace(payload,'bsky.app/profile/did%3Aplc%3A','bsky.app/profile/did:plc:'),'bsky.app/profile/did%3Aweb%3A','bsky.app/profile/did:web:') WHERE instr(payload,'bsky.app/profile/did%3A')`).run();
+    }
+    // One-off repair: a video that had not started playing shows only its poster <img>, which the X
+    // collector used to store as a photo beside the video — so a plain video post looked mixed and was
+    // held. The poster's URL identifies it for certain, so drop it from held posts; the batch then reads
+    // as the video it is and the owner can publish it.
+    for (const row of this.db.prepare("SELECT key, payload, batch_id FROM posts WHERE platform='x' AND classification IN ('unsupported','mirror_review') AND instr(payload,'_video_thumb/')").all()) {
+      const post = JSON.parse(String(row.payload)) as SourcePost;
+      const kept = post.attachments.filter(a => !(a.kind === 'image' && a.url && isVideoPoster(a.url)));
+      if (kept.length === post.attachments.length || !kept.some(a => a.kind === 'video')) continue;
+      this.db.prepare("UPDATE posts SET payload=?, reason=CASE reason WHEN 'video_must_be_the_only_attachment' THEN 'video_poster_repaired' ELSE reason END WHERE key=?")
+        .run(JSON.stringify({ ...post, attachments: kept }), String(row.key));
+      this.db.prepare("UPDATE batches SET reason='video_poster_repaired' WHERE id=? AND reason='video_must_be_the_only_attachment'").run(row.batch_id ?? null);
+      this.event('info', 'Removed a video poster the X collector had stored as a photo; the held post is a plain video again', String(row.key));
     }
     if (path !== ':memory:') chmodSync(path, 0o600);
   }
