@@ -485,8 +485,13 @@ export class Engine {
     }
   }
 
+  /**
+   * Whether a downstream copy may already exist. Only publish jobs count: the batch's review notice is an
+   * `ops` job on the same aggregate, and once it reached Telegram it made every held batch look delivered,
+   * so the owner could neither approve nor skip the very batch the notice asked about.
+   */
   private hasInFlightDelivery(jobs: ReturnType<Store['jobsForAggregate']>): boolean {
-    return jobs.some(job => ['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id));
+    return jobs.some(job => job.kind === 'publish' && (['running', 'succeeded', 'unknown'].includes(job.state) || this.store.hasDeliveryEvidence(job.id)));
   }
 
   registerManualMirror(aggregateId: string, xId: string, now: string = new Date().toISOString()): { alreadyDelivered: boolean } {
@@ -561,7 +566,7 @@ export class Engine {
     } else {
       this.store.updateBatch(id, action === 'mirror' ? 'mirror' : 'ignored', 'owner_override');
       for (const member of this.store.batchPosts(id)) this.store.updatePost(member.key, action === 'mirror' ? 'manual_mirror' : 'ignored', 'owner_override');
-      for (const job of jobs) this.store.updateJob(job.id, 'cancelled', 'owner_override');
+      for (const job of jobs) if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'owner_override');
     }
     this.store.event('info', `Owner action: ${action}`, id);
   }

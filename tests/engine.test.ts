@@ -642,6 +642,24 @@ test('a plain video held because its poster was stored as a photo is repaired on
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('a held batch whose review notice already reached Telegram can still be approved or skipped', () => {
+  const { store, engine } = setup(['bluesky']);
+  for (const id of ['980', '981']) {
+    store.addBatch({ id: `x:${id}`, platform: 'x', rootId: id, rootCreatedAt: at(0), cutoffAt: at(0), settleAt: at(0), state: 'review', reason: 'possible_manual_mirror' });
+    store.addPost(post({ id, createdAt: at(0) }), 'mirror_review', 'possible_manual_mirror', at(0), `x:${id}`);
+    store.updateJob(store.enqueue('ops', `x:${id}`, 'telegram', at(0)), 'succeeded');   // the notice was delivered
+  }
+  engine.action('approve', 'x:980', at(10));
+  assert.equal(store.getBatch('x:980')?.state, 'sealed');
+  engine.action('skip', 'x:981', at(10));
+  assert.equal(store.getBatch('x:981')?.state, 'ignored');
+  assert.equal(store.jobsForAggregate('x:981').find(job => job.kind === 'ops')?.state, 'succeeded', 'the delivered notice keeps its record');
+  // A real downstream delivery still blocks rewriting the batch.
+  const publish = store.jobsForAggregate('x:980').find(job => job.kind === 'publish')!;
+  store.updateJob(publish.id, 'succeeded');
+  assert.throws(() => engine.action('skip', 'x:980', at(20)), /Already delivered/);
+});
+
 test('Bluesky targets and footers are assembled with the X root link only', async () => {
   const { store, engine } = setup(['bluesky']);
   engine.ingest(snapshot([post({ id: '800', createdAt: at(10) })], at(650)), at(650));
