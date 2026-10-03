@@ -235,39 +235,39 @@ export class SharkeyClient implements Publisher, Collector {
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     if (!this.config.token) throw new PlatformError('A Sharkey API token is required for publishing', { code: 'MissingCredentials' });
     if (!nonempty(context.idempotencyKey)) throw new PlatformError('A durable idempotency key is required', { code: 'MissingIdempotencyKey' });
-    if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Phase 1 accepts at most four static images', { code: 'TooManyImages' });
-    if (part.video && part.images.length) throw new PlatformError('A Sharkey note cannot carry both a video and images', { code: 'MixedMedia' });
+    if (!Array.isArray(part.media) || part.media.length > 4) throw new PlatformError('At most four images or videos per note', { code: 'TooManyImages' });
     if (part.poll) {
-      if (part.images.length || part.video) throw new PlatformError('An X poll cannot be combined with media', { code: 'MixedMedia' });
+      if (part.media.length) throw new PlatformError('An X poll cannot be combined with media', { code: 'MixedMedia' });
       nativePollPayload(part.poll, 'sharkey', this.now().getTime());
     }
-    if (typeof part.text !== 'string' || (!part.text.trim() && !part.images.length && !part.video && !part.poll)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
+    if (typeof part.text !== 'string' || (!part.text.trim() && !part.media.length && !part.poll)) throw new PlatformError('Cannot publish an empty Sharkey note', { code: 'EmptyPost' });
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Sharkey CW must be text', { code: 'InvalidCW' });
     const cw = contentWarning(part);
     const sensitive = isSensitiveContent(part);
     if (context.parent && !noteId(context.parent.id)) throw new PlatformError('Sharkey replies require a note ID', { code: 'InvalidReply' });
     if (context.root && !context.parent) throw new PlatformError('A thread root without a parent is not a valid reply', { code: 'InvalidReply' });
-    for (const image of part.images) validateImage(image);
+    for (const item of part.media) if (item.mimeType !== 'video/mp4') validateImage(item);
     const limits = await this.getLimits();
     if (!limits.canPublicNote) throw new PlatformError('The account role cannot create public notes', { code: 'PublicNotesNotAllowed' });
     if (part.text.length > limits.maxNoteTextLength || (cw?.length ?? 0) > limits.maxCwLength) throw new PlatformError('Split text/CW to the Sharkey instance limits before publishing', { code: 'TextTooLong' });
-    for (const image of part.images) {
-      validateImage(image, limits.maxFileBytes);
-      if (image.alt.length > limits.maxAltTextLength) throw new PlatformError('Image alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
-    }
-    if (part.video) {
-      if (limits.maxFileBytes !== undefined && part.video.size > limits.maxFileBytes) throw new PlatformError('Video exceeds the Sharkey instance file size limit', { code: 'VideoTooLarge' });
-      if (part.video.alt.length > limits.maxAltTextLength) throw new PlatformError('Video alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
+    for (const item of part.media) {
+      if (item.mimeType === 'video/mp4') {
+        if (limits.maxFileBytes !== undefined && item.size > limits.maxFileBytes) throw new PlatformError('Video exceeds the Sharkey instance file size limit', { code: 'VideoTooLarge' });
+        if (item.alt.length > limits.maxAltTextLength) throw new PlatformError('Video alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
+      } else {
+        validateImage(item, limits.maxFileBytes);
+        if (item.alt.length > limits.maxAltTextLength) throw new PlatformError('Image alt text exceeds the Sharkey instance limit', { code: 'AltTooLong' });
+      }
     }
     const fileIds: string[] = [];
-    const folderId = (part.images.length || part.video) ? await this.resolveFolder() : null;
+    const folderId = part.media.length ? await this.resolveFolder() : null;
     const uploadStamp = this.now().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-    // A video never shares a note with images (checked above), so this is either the images or the one video.
-    const uploads = part.video
-      ? [{ ext: 'mp4', alt: part.video.alt, mimeType: part.video.mimeType, bytes: await readFile(part.video.path) }]
-      : part.images.map(image => ({ ext: image.mimeType === 'image/png' ? 'png' : 'jpg', alt: image.alt, mimeType: image.mimeType, bytes: image.bytes }));
-    const operation = part.video ? 'Sharkey video upload' : 'Sharkey image upload';
-    for (const [index, upload] of uploads.entries()) {
+    // Images and videos share one note in source order; a video is read from disk only when its turn comes.
+    for (const [index, item] of part.media.entries()) {
+      const video = item.mimeType === 'video/mp4';
+      const upload = video ? { ext: 'mp4', alt: item.alt, mimeType: item.mimeType, bytes: await readFile(item.path) }
+        : { ext: item.mimeType === 'image/png' ? 'png' : 'jpg', alt: item.alt, mimeType: item.mimeType, bytes: item.bytes };
+      const operation = video ? 'Sharkey video upload' : 'Sharkey image upload';
       const form = multipart({ i: this.config.token, comment: upload.alt, isSensitive: String(sensitive), force: 'true', ...(folderId ? { folderId } : {}) }, [
         { field: 'file', filename: this.uploadFilename(index, upload.ext, uploadStamp), mimeType: upload.mimeType, bytes: upload.bytes },
       ]);
@@ -281,7 +281,7 @@ export class SharkeyClient implements Publisher, Collector {
       // Misskey/Sharkey stores an empty comment as null and echoes it back as null, so treat null and
       // '' as the same "no alt" value; only a genuine mismatch of non-empty image alt text is a real error.
       if (!noteId(file?.id) || (sensitive && file.isSensitive !== true)
-        || (!part.video && file.comment !== undefined && (file.comment ?? '') !== upload.alt)) throw schemaError(operation, false);
+        || (!video && file.comment !== undefined && (file.comment ?? '') !== upload.alt)) throw schemaError(operation, false);
       fileIds.push(file.id);
     }
     // Sharkey does not promise a notes/create idempotency nonce. Never automatically replay an uncertain mutation.

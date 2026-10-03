@@ -174,13 +174,13 @@ X 貼文 tag 的 `@帳號` 到了 Bluesky／Sharkey／Telegram 不一定存在�
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
-| `VIDEO_ENABLED` | `false` | 設 true 後，單一且解析得到可下載來源的影片會轉成 MP4，再交給下游 publisher。開啟時每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（公開嵌入端點）取 MP4。GIF、混合附件、只有 HLS 沒有 MP4、超過 140 秒的影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
+| `VIDEO_ENABLED` | `false` | 設 true 後，解析得到可下載來源的影片會轉成 MP4，再交給下游 publisher；同一則推文可以像 X 一樣混合圖片與影片（合計最多 4 個）。開啟時每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（公開嵌入端點）取 MP4 與完整媒體順序。GIF 在 X 上本身就是 MP4，照影片流程同步：Bluesky 以 GIF 呈現（`presentation: gif`）、Telegram 單獨一個時用 `sendAnimation`（相簿裡則當影片）、Sharkey 上傳 MP4。只有 HLS 沒有 MP4、超過 140 秒的影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
 | `FFMPEG_PATH` | `ffmpeg` | 轉碼程式名（由 `PATH` 搜尋）或執行檔路徑；不是 shell 命令或額外參數欄位。 | 從系統套件管理器安裝 FFmpeg，確認包含 H.264／AAC 編碼器。 |
 | `FFPROBE_PATH` | `ffprobe` | 探測影片資訊的程式名或執行檔路徑。一般文字與靜態圖片同步不會呼叫。 | 通常隨 FFmpeg 套件提供；自行確認實際安裝路徑。 |
 
-影片管線已接入 Engine 與 Bluesky／Sharkey／Telegram。輸入必須是可下載的自含媒體檔，或位於 `DATA_DIR/media` 內的本機檔案，並受 `MAX_DOWNLOAD_BYTES` 限制；不接受播放清單另開網路或其他本機檔案。輸出保留比例、最長邊不超過 1280、30 fps、H.264／AAC、最長 140 秒。Bluesky 使用專用影片服務。
+影片管線已接入 Engine 與 Bluesky／Sharkey／Telegram。圖片與影片混合的推文照原順序發布：Telegram 合成一個相簿、Sharkey 放在同一則 note；Bluesky 一則貼文只能放圖片或一支影片，所以連續的圖片共用一則、每支影片各占一則，依序接成串文（各組依序放在內文分段的每一則上，內文只有一則時，其餘各組以只有媒體的回覆接在後面）。輸入必須是可下載的自含媒體檔，或位於 `DATA_DIR/media` 內的本機檔案，並受 `MAX_DOWNLOAD_BYTES` 限制；不接受播放清單另開網路或其他本機檔案。輸出保留比例、最長邊不超過 1280、30 fps、H.264／AAC、最長 140 秒。Bluesky 使用專用影片服務。
 
-X 的影片來源由公開嵌入端點 `cdn.syndication.twimg.com/tweet-result` 解析：X 自己的播放器串 `blob:` 的 HLS，頁面裡沒有可下載的 URL，該端點則會回傳同一則推文的漸進式 MP4 各畫質版本。程式挑「估算大小仍塞得進 `MAX_DOWNLOAD_BYTES` 的最高 bitrate」——X 最高給到 4K（單支可達數百 MB），而管線無論如何都會重新編碼到最長邊 1280，取最大版本只是白花下載預算。這個端點未公開文件化，行為可能隨時改變；解析不到任何 MP4 時（推文已刪、受保護、回應格式改變、或只有 HLS）影片就照舊保留為 `x_video_has_no_downloadable_source`，不會誤發。保留理由另有 `animated_video_not_supported`（GIF 在 X 上也是 `<video>`）與 `video_exceeds_duration_limit`（超過 140 秒，在下載前就判定）。真實平台配額與上傳能力需另行驗證。
+X 的影片來源由公開嵌入端點 `cdn.syndication.twimg.com/tweet-result` 解析：X 自己的播放器串 `blob:` 的 HLS，頁面裡沒有可下載的 URL，該端點則會回傳同一則推文的漸進式 MP4 各畫質版本。含影片的推文整份媒體清單（圖片、影片與順序、替代文字）都以該端點為準。程式挑「估算大小仍塞得進 `MAX_DOWNLOAD_BYTES` 的最高 bitrate」——X 最高給到 4K（單支可達數百 MB），而管線無論如何都會重新編碼到最長邊 1280，取最大版本只是白花下載預算。這個端點未公開文件化，行為可能隨時改變；解析不到任何 MP4 時（推文已刪、受保護、回應格式改變、或只有 HLS）影片就照舊保留為 `x_video_has_no_downloadable_source`，不會誤發。保留理由另有 `video_exceeds_duration_limit`（超過 140 秒，在下載前就判定）。GIF 的 MP4 只有一個版本、沒有時長資訊，下載後轉碼時才檢查長度。真實平台配額與上傳能力需另行驗證。
 
 <a id="credentials"></a>
 ## 官方憑證與帳號資料取得
@@ -346,7 +346,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | `/session` 被拒絕 | 核對 owner/private chat、live、輪詢、X enabled、明確的 `/session` 指令／caption、本工具匯出格式與 256 KiB 上限；勿反覆把登入檔傳到其他 chat。 |
 | `unknown` 或送出後連線中斷 | 先人工確認遠端是否已有內容並處理對帳。`/retry`、`/resync`、CLI retry 都不是強制重送 unknown 的後門，不能靠重啟解決。 |
 | 429／暫時失敗 | 已確認安全重試的工作會按伺服器延遲／退避處理，至 `MAX_ATTEMPTS` 上限；不要密集手動重試。送出結果不明則另走對帳。 |
-| 影片／GIF／超過四張圖不發布 | 靜態圖片最多四張。影片需 `VIDEO_ENABLED=true`、FFmpeg，且嵌入端點解析得到 MP4；解析不到、只有 HLS、超過 140 秒或是 GIF 都會保留，理由寫在事件與網頁的貼文列表裡。 |
+| 影片／GIF／超過四個附件不發布 | 圖片、影片與 GIF 合計最多四個，可混合。影片與 GIF 需 `VIDEO_ENABLED=true`、FFmpeg，且嵌入端點解析得到每一個的 MP4；任何一個解析不到、只有 HLS 或超過 140 秒，整則都會保留，理由寫在事件與網頁的貼文列表裡。 |
 | 想知道某則為什麼沒同步 | 看網頁介面的「最近讀到的貼文」，每則都列出分類與原因；`self_reply_outside_new_batch` 若伴隨 `never collected` 的 warn 事件，代表上一則沒被收集到（可提高 `X_MAX_PAGES` 或縮短 `POLL_SECONDS`）。 |
 | 外部 URL 被拒絕 | API／媒體通道會拒絕私有、loopback、保留／metadata 位址、不允許的埠與不安全重導向。先核對服務 URL，不要停用防護或嵌入帳密。 |
 | Web 寫入回 401 | 設 token 後須在 UI 填入相同值；未設 token 的 loopback 仍要求 JSON／同來源。不要為了方便把服務直接公開。 |

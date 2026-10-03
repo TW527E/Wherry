@@ -106,7 +106,12 @@ export interface PreparedVideo {
   durationSeconds: number;
   size: number;
   sha256: string;
+  /** An X GIF: publishers present it as a looping, silent animation where they can, not as a clip. */
+  animated?: boolean;
 }
+
+/** One prepared attachment; `mimeType` tells an image (bytes in memory) from a video (file on disk). */
+export type PreparedMedia = PreparedImage | PreparedVideo;
 
 export interface InlineButton {
   text: string;
@@ -126,13 +131,13 @@ export interface PublishPart {
   sensitive?: boolean;
   /** Preserve known source categories; publishers use the configured fallback only when these are absent. */
   sensitiveLabels?: SensitiveLabel[];
-  images: PreparedImage[];
   /**
-   * A single transcoded video, mutually exclusive with images (X and Bluesky both forbid mixing).
-   * Only ever set on the first part, and only when VIDEO_ENABLED and a downloadable source exists —
-   * X's HLS/blob video has no direct URL, so those posts are held rather than reaching here.
+   * Attachments in source order, images and transcoded videos alike (an X post may mix up to four).
+   * Bluesky cannot mix them in one post, so its parts each carry one run of images or a single video.
+   * Videos appear only when VIDEO_ENABLED and a downloadable source exists — X's HLS/blob video has no
+   * direct URL, so those posts are held rather than reaching here.
    */
-  video?: PreparedVideo;
+  media: PreparedMedia[];
   sourceUrl?: string;
   /** This destination's copy of the quoted X post, quoted natively (embed / renote / reply) instead of linked. */
   quote?: RemoteRef;

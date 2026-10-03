@@ -67,15 +67,15 @@ test('the X video lookup asks syndication once per tweet, skips it when video is
     variants: [{ content_type: 'video/mp4', bitrate: 800_000, url: mp4 }] } }] };
   const calls: string[] = [];
   const collector = new XCollector(xConfig(), { async request(url) { calls.push(url); return json(payload); } }, media);
-  assert.equal((await collector['resolveVideo']('123'))?.url, mp4);
-  await collector['resolveVideo']('123');
+  assert.equal((await collector['resolveMedia']('123'))?.[0]?.url, mp4);
+  await collector['resolveMedia']('123');
   assert.equal(calls.length, 1, 'the answer is cached per tweet id, not re-fetched on every scan');
   // A wrong parameter name here would 404 every lookup and be indistinguishable from "no video source".
   assert.match(calls[0]!, /^https:\/\/cdn\.syndication\.twimg\.com\/tweet-result\?id=123&token=[0-9a-z]+&lang=en$/);
 
   // With video sync off the post is held as video_sync_disabled regardless, so nothing is requested.
   const off = new XCollector(xConfig(), { async request(url) { calls.push(url); return json(payload); } }, { ...media, video: false });
-  assert.equal(await off['resolveVideo']('456'), undefined);
+  assert.equal(await off['resolveMedia']('456'), undefined);
   assert.equal(calls.length, 1);
 
   // Every failure path must land on "no source", which is the behaviour that existed before this lookup.
@@ -86,7 +86,7 @@ test('the X video lookup asks syndication once per tweet, skips it when video is
     { async request() { throw new Error('offline'); } },
   ];
   for (const transport of failing) {
-    assert.equal(await new XCollector(xConfig(), transport, media)['resolveVideo']('789'), undefined);
+    assert.equal(await new XCollector(xConfig(), transport, media)['resolveMedia']('789'), undefined);
   }
 });
 
@@ -116,7 +116,7 @@ test('Bluesky retains rotated sessions without a persistence callback and retrie
   } };
   const client = new BlueskyClient(loadConfig({ BLUESKY_IDENTIFIER: did, BLUESKY_APP_PASSWORD: 'offline' }).bluesky, transport);
   for (const key of ['first-post', 'next-post']) {
-    const ref = await client.publish({ key, sourcePostId: key, text: key, images: [] }, { idempotencyKey: key });
+    const ref = await client.publish({ key, sourcePostId: key, text: key, media: [] }, { idempotencyKey: key });
     // bsky.app rejects a percent-encoded DID ("Invalid DID or handle").
     assert.ok(ref.url?.startsWith(`https://bsky.app/profile/${did}/post/`), ref.url);
   }

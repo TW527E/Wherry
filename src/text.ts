@@ -87,3 +87,8 @@ export function similarity(a: string, b: string): number {
   if (union.size === 0) return 0;
   return [...left].filter(v => right.has(v)).length / union.size;
 }
+
+/** A video's or GIF's poster thumbnail on pbs.twimg.com, as opposed to an attached photo (/media/). */
+export function isVideoPoster(url: string): boolean {
+  return /^https:\/\/pbs\.twimg\.com\/(?:ext_tw_video|amplify_video|tweet_video)_thumb\//.test(url);
+}

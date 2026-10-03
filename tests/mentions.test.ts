@@ -163,9 +163,9 @@ test('Bluesky publishes a mapped handle as a mention facet and refuses an unreso
   const bodies = [{ text: 'hi @alice.bsky.social', mentions: [{ handle: 'alice.bsky.social', start: 3, end: 21 }] }];
   await resolveBlueskyMentions(bodies, 'https://public.api.bsky.app', transport);
   assert.equal(bodies[0]!.mentions[0]!.did, 'did:web:alice.example');
-  await client.publish({ key: 'k', sourcePostId: '1', text: bodies[0]!.text, mentions: bodies[0]!.mentions, images: [] }, { idempotencyKey: 'k' });
+  await client.publish({ key: 'k', sourcePostId: '1', text: bodies[0]!.text, mentions: bodies[0]!.mentions, media: [] }, { idempotencyKey: 'k' });
   assert.deepEqual(records[0]!.facets, [{ index: { byteStart: 3, byteEnd: 21 }, features: [{ $type: 'app.bsky.richtext.facet#mention', did: 'did:web:alice.example' }] }]);
   const unresolved = bodies[0]!.mentions.map(({ handle, start, end }) => ({ handle, start, end }));
-  await assert.rejects(client.publish({ key: 'k2', sourcePostId: '2', text: bodies[0]!.text, mentions: unresolved, images: [] }, { idempotencyKey: 'k2' }), /resolved DIDs/);
+  await assert.rejects(client.publish({ key: 'k2', sourcePostId: '2', text: bodies[0]!.text, mentions: unresolved, media: [] }, { idempotencyKey: 'k2' }), /resolved DIDs/);
   assert.equal(records.length, 1, 'an unresolved mention never reaches the createRecord mutation');
 });
