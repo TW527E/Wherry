@@ -481,7 +481,9 @@ export class BlueskyClient implements Publisher, Collector {
     }
     const videoBlob = video ? await this.uploadVideoBlob(video, session) : undefined;
     const media = video && videoBlob
-      ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: video.width, height: video.height }, ...(video.alt ? { alt: video.alt } : {}) }
+      ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: video.width, height: video.height }, ...(video.alt ? { alt: video.alt } : {}),
+        // Bluesky's own GIF presentation: looping and silent, like the X original.
+        ...(video.animated ? { presentation: 'gif' } : {}) }
       : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;
     const quote = part.quote && strong({ uri: part.quote.uri ?? part.quote.id, cid: part.quote.cid });
     const quoteEmbed = quote && { $type: 'app.bsky.embed.record', record: quote };

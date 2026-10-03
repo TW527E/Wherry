@@ -106,6 +106,8 @@ export interface PreparedVideo {
   durationSeconds: number;
   size: number;
   sha256: string;
+  /** An X GIF: publishers present it as a looping, silent animation where they can, not as a clip. */
+  animated?: boolean;
 }
 
 /** One prepared attachment; `mimeType` tells an image (bytes in memory) from a video (file on disk). */

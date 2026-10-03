@@ -195,7 +195,7 @@ test('the X sensitive-media warning is recognised but ordinary post chrome is no
   }
 });
 
-test('an X video resolves to the best MP4 the download budget can afford; a GIF resolves to none', () => {
+test('an X video resolves to the best MP4 the download budget can afford; a GIF to its one MP4', () => {
   // Shape taken verbatim from a live syndication tweet-result payload: one HLS entry with no bitrate
   // plus progressive MP4 renditions up to 4K. X serves no downloadable video in the page itself.
   const payload = (type: string): unknown => ({ mediaDetails: [{ type, original_info: { width: 3840, height: 2160 },
@@ -216,11 +216,11 @@ test('an X video resolves to the best MP4 the download budget can afford; a GIF 
   assert.deepEqual([chosen?.width, chosen?.height], [3840, 2160]);
   // A tighter budget steps down rather than picking something that cannot be downloaded.
   assert.equal(pickMedia(payload('video'), 3_000_000)?.[0]?.url, 'https://video.twimg.com/amplify_video/1/vid/avc1/640x360/b.mp4');
-  // An animated GIF also renders as a <video> on X, but this project publishes no animations, so it
-  // must come back with no url and stay held instead of being transcoded into one.
-  const gif = pickMedia(payload('animated_gif'), 20_000_000)?.[0];
-  assert.equal(gif?.animated, true);
-  assert.equal(gif?.url, undefined);
+  // A GIF on X is a single MP4 rendition at bitrate 0 with no duration (shape from a live payload). It
+  // must still resolve, marked animated so publishers loop it rather than post an ordinary clip.
+  const gif = pickMedia({ mediaDetails: [{ type: 'animated_gif', original_info: { width: 498, height: 280 },
+    video_info: { variants: [{ content_type: 'video/mp4', bitrate: 0, url: 'https://video.twimg.com/tweet_video/AbC.mp4' }] } }] }, 20_000_000)?.[0];
+  assert.deepEqual([gif?.kind, gif?.animated, gif?.url], ['video', true, 'https://video.twimg.com/tweet_video/AbC.mp4']);
 });
 
 test('a video source is only accepted from X media hosts over https', () => {

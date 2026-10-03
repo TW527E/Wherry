@@ -82,12 +82,14 @@ export class TelegramClient implements Publisher {
     let sent: TelegramMessage[];
     if (part.media.length === 1) {
       const item = part.media[0]!;
-      sent = await this.upload(kind(item) === 'video' ? 'sendVideo' : 'sendPhoto', { chat_id: chatId, caption: rendered, parse_mode: 'HTML',
-        ...(kind(item) === 'video' ? { supports_streaming: 'true' } : {}), ...spoiler, ...replyField }, [await file(item, kind(item), 'crosspost')]);
+      // A lone X GIF goes out as an animation, which Telegram loops silently like the original.
+      const [method, field] = item.mimeType !== 'video/mp4' ? ['sendPhoto', 'photo'] : item.animated ? ['sendAnimation', 'animation'] : ['sendVideo', 'video'];
+      sent = await this.upload(method, { chat_id: chatId, caption: rendered, parse_mode: 'HTML',
+        ...(method === 'sendVideo' ? { supports_streaming: 'true' } : {}), ...spoiler, ...replyField }, [await file(item, field, 'crosspost')]);
     } else if (part.media.length > 1) {
       // Several photos and videos from one tweet post as a single album (Telegram mixes the two in one
-      // media group), caption (with the link) on the first item — the whole group is one durable step so
-      // a retry replays the same album.
+      // media group, but takes no animations there, so a GIF rides along as a video), caption (with the
+      // link) on the first item — the whole group is one durable step so a retry replays the same album.
       const media = part.media.map((item, index) => ({
         type: kind(item), media: `attach://${kind(item)}${index}`,
         ...(kind(item) === 'video' ? { supports_streaming: true } : {}),

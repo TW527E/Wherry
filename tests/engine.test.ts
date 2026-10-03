@@ -382,8 +382,9 @@ test('a held X video names the reason that actually applies', () => {
   const video = (extra: Partial<Attachment>): SourcePost => post({ id: '1', createdAt: at(0), attachments: [{ kind: 'video', alt: '', ...extra }] });
   const mp4 = 'https://video.twimg.com/amplify_video/1/vid/a.mp4';
   assert.equal(unsupportedReason(video({ url: mp4 }), false), 'video_sync_disabled');
-  // An X GIF renders as a <video> too; publishing it as one would silently change the content.
-  assert.equal(unsupportedReason(video({ url: mp4, animated: true }), true), 'animated_video_not_supported');
+  // An X GIF is a looping MP4 and syncs like any video; publishers present it as a GIF.
+  assert.equal(unsupportedReason(video({ url: mp4, animated: true }), true), undefined);
+  assert.equal(unsupportedReason(video({ animated: true }), true), 'x_video_has_no_downloadable_source');
   // prepareVideo enforces the same ceiling, but only after the bytes are already downloaded.
   assert.equal(unsupportedReason(video({ url: mp4, durationSeconds: 141 }), true), 'video_exceeds_duration_limit');
   assert.equal(unsupportedReason(video({}), true), 'x_video_has_no_downloadable_source');
@@ -544,7 +545,8 @@ test('video gating: disabled holds video, enabled needs a downloadable source fo
   assert.equal(unsupportedReason(mixed, true), undefined);
   // Every video in a mix is checked, not only the first, and the rest of the mix must still be publishable.
   assert.equal(unsupportedReason(withVideo([{ kind: 'video', alt: '', url: mp4 }, { kind: 'video', alt: '' }]), true), 'x_video_has_no_downloadable_source');
-  assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4, animated: true }]), true), 'animated_video_not_supported');
+  assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4, animated: true }]), true), undefined, 'a GIF mixes like any video');
+  assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg, animated: true }]), true), 'only_static_images_or_video', 'an animated image file is still not supported');
   assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4, durationSeconds: 141 }]), true), 'video_exceeds_duration_limit');
   assert.equal(unsupportedReason(withVideo([{ kind: 'video', alt: '', url: mp4 }, { kind: 'unknown', alt: '' }]), true), 'only_static_images_or_video');
   assert.equal(unsupportedReason(withVideo(Array.from({ length: 5 }, () => ({ kind: 'video' as const, alt: '', url: mp4 }))), true), 'more_than_four_images');

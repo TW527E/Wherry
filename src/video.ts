@@ -108,7 +108,7 @@ export async function prepareVideo(attachment: Attachment, config: VideoConfig, 
     return {
       path: target, mimeType: 'video/mp4', alt: attachment.alt || '',
       width: plan.width, height: plan.height, durationSeconds: Math.round(probe.durationSeconds),
-      size: outBytes.length, sha256,
+      size: outBytes.length, sha256, ...(attachment.animated ? { animated: true } : {}),
     };
   } finally {
     await rm(workspace, { recursive: true, force: true });

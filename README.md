@@ -30,7 +30,7 @@
 - ❌ 自動登入 X、選檔、按 Post。程式碼中沒有任何 X 寫入路徑。
 - ❌ 反偵測、輪換代理、繞過驗證或速率限制。
 - ❌ 同步回覆他人、晚發的自回覆、轉貼、引用或非公開內容。
-- ❌ 純音訊、GIF、X Premium 長文：一律**保留**並通知原因。長文可由通知手動放行（發布時自動分段），其餘沒有發布路徑。
+- ❌ 純音訊、動態圖片檔（APNG 等）、X Premium 長文：一律**保留**並通知原因。長文可由通知手動放行（發布時自動分段），其餘沒有發布路徑。
 
 投票不在上面兩類：Sharkey／Telegram 各建一份**獨立**原生投票（票數不與 X 或彼此合併，沿用 X 的截止時間）；Bluesky 沒有原生投票，改以文字列出選項並附 X 原投票連結。資料不完整、已過期或敏感的投票仍會保留。
 
@@ -163,8 +163,8 @@ npm run cli -- import-session            # 安裝 X_SESSION_FILE 的登入
 | 回覆一串早已同步完成的舊推文 | `self_reply_outside_new_batch` |
 | 自回覆的上一則從未被收集到 | `self_reply_outside_new_batch`，並記一筆 `warn` 說明收集缺口 |
 | 串文分支（非線性） | 保留待審，不強行攤平 |
-| 轉貼、引用、非公開、GIF、超過 4 個附件 | 保留或忽略，不會靜默降級 |
-| 影片 | `VIDEO_ENABLED=true`、每支都解析得到 MP4、長度 ≤140 秒才同步；否則保留並說明理由 |
+| 轉貼、引用、非公開、超過 4 個附件 | 保留或忽略，不會靜默降級 |
+| 影片、GIF | `VIDEO_ENABLED=true`、每支都解析得到 MP4、長度 ≤140 秒才同步；否則保留並說明理由。GIF 在 X 上本身就是 MP4，照影片流程同步：Bluesky 以 GIF 呈現（`presentation: gif`）、Telegram 單獨一個時用 `sendAnimation`（相簿裡則當影片）、Sharkey 上傳 MP4。 |
 | 圖片與影片混合 | 照原順序同步：Telegram 一個相簿、Sharkey 一則 note；Bluesky 不能混放，連續圖片共用一則、每支影片各一則，依序接成串文 |
 | 投票 | 見[會做與不會做](#scope)；資料不完整／已過期／敏感才保留 |
 | 敏感內容（標了敏感的媒體、來源 CW） | 照常同步，見下方 |
@@ -224,7 +224,7 @@ SQLite 在 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取在 `
 ## 媒體與網路
 
 - 預設只支援**靜態圖片**，每篇最多 4 張；依平台限制壓縮（Bluesky 上限 2 MB），先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
-- 動畫 GIF／APNG 不處理。`VIDEO_ENABLED=true` 時，影片從公開嵌入端點取能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質 MP4，經 FFmpeg 轉碼後同步，可與圖片或其他影片混在同一則（合計最多 4 個，[限制](docs/configuration.md#video)）。
+- 動態圖片檔（APNG 等）不處理。`VIDEO_ENABLED=true` 時，影片與 GIF 從公開嵌入端點取能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質 MP4，經 FFmpeg 轉碼後同步，可與圖片或其他影片混在同一則（合計最多 4 個，[限制](docs/configuration.md#video)）。
 
 API、媒體下載與上傳都經過同一個受保護的 HTTP 通道：
 
@@ -289,7 +289,7 @@ session 過期或被要求重新驗證時，重跑本機 `login` + `export-sessi
 - **X 前端改版可能讓選擇器失效。** 解析失敗時保留檢查點並回報錯誤，不會誤判成「沒有新內容」。
 - **Telegram 頻道內的回覆外觀**受頻道設定與 linked discussion 影響。工具保證送出正確的 reply 參照，實際呈現請在你的頻道驗證一次。
 - **dvd.chat 的上傳上限**由實例與角色政策決定，程式不寫死，以伺服器回應為準。
-- **影片**：嵌入端點未公開文件化，解析失敗（推文已刪、受保護、格式改變、只有 HLS）就保留為 `x_video_has_no_downloadable_source`；超過 140 秒在下載前以 `video_exceeds_duration_limit` 保留；GIF 以 `animated_video_not_supported` 保留。
+- **影片**：嵌入端點未公開文件化，解析失敗（推文已刪、受保護、格式改變、只有 HLS）就保留為 `x_video_has_no_downloadable_source`；超過 140 秒在下載前以 `video_exceeds_duration_limit` 保留。
 - **網頁介面**已有文字排程、待決批次與失敗工作的批量處理、最近讀到的貼文（含分類與原因）；排程附件與批次編輯尚未實作。
 
 ---

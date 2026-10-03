@@ -10,6 +10,7 @@ export const LABELS: Record<string, string> = {
   // Post classifications
   baseline: '基準快照', collecting: '收集中', ready: '會同步', manual_mirror: '手動鏡像', mirror_review: '待確認', unsupported: '不支援',
   // Reasons
+  // No longer produced (GIFs now sync as video); kept so posts held under it before still read in zh-Hant.
   animated_video_not_supported: 'GIF 動畫不支援',
   branch_in_thread: '串文出現分支',
   collected_before_mixed_media: '升級前收集的圖片影片混合貼文，媒體可能不完整，請手動發布',

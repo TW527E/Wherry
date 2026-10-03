@@ -76,11 +76,11 @@ export function syndicationToken(id: string): string {
  * without a network. Returns undefined when the payload lists no video at all; anything it cannot read
  * comes back as an `unknown` attachment, which holds the post rather than dropping that item.
  *
- * An animated GIF reports `animated: true` with NO url on purpose: on X a GIF also renders as a
- * `<video>`, but this project publishes no animations, so it must stay held rather than be quietly
- * transcoded into one. The rendition picked is the highest bitrate whose estimated bytes still fit the
- * download budget — X offers up to 4K (hundreds of MB) while the pipeline re-encodes to a 1280 long
- * edge regardless, so taking the largest would spend the whole budget to produce the same output.
+ * An animated GIF is an MP4 on X too (one rendition at bitrate 0, no duration) and comes back marked
+ * `animated`, so publishers can present it as a looping GIF rather than an ordinary clip. The rendition
+ * picked is the highest bitrate whose estimated bytes still fit the download budget — X offers up to 4K
+ * (hundreds of MB) while the pipeline re-encodes to a 1280 long edge regardless, so taking the largest
+ * would spend the whole budget to produce the same output.
  */
 export function pickMedia(payload: unknown, maxDownloadBytes: number): Attachment[] | undefined {
   const details = object(payload)?.mediaDetails;
@@ -106,10 +106,11 @@ function videoSource(media: Record<string, unknown>, maxDownloadBytes: number): 
     // Rounded up: a clip a fraction over the ceiling must not round down under it.
     ...(typeof millis === 'number' && Number.isFinite(millis) && millis > 0 ? { durationSeconds: Math.ceil(millis / 1000) } : {}),
   };
-  if (source.animated || !Array.isArray(info?.variants)) return source;
+  if (!Array.isArray(info?.variants)) return source;
   const renditions = info.variants.map(object).flatMap(variant => {
     const url = variant?.content_type === 'video/mp4' ? validMediaUrl(typeof variant.url === 'string' ? variant.url : undefined) : undefined;
-    return url && positiveInteger(variant?.bitrate) ? [{ url, bitrate: variant.bitrate }] : [];
+    const bitrate = variant?.bitrate;
+    return url && typeof bitrate === 'number' && Number.isInteger(bitrate) && bitrate >= 0 ? [{ url, bitrate }] : [];
   }).sort((a, b) => a.bitrate - b.bitrate);
   if (!renditions.length) return source;
   // bitrate is bits per second, so bytes ≈ bitrate / 8 × seconds. With no duration there is no estimate,

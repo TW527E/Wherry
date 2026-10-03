@@ -274,6 +274,29 @@ test('mixed photos and videos go out as one Telegram album and one Sharkey note 
   assert.equal(records.length, 0, 'the engine splits a mix before Bluesky ever sees one');
 });
 
+test('an X GIF is presented as a looping GIF where the platform has one, and as a video inside an album', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'wherry-video-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const gif = { ...videoFixture(join(directory, 'gif.mp4')), animated: true };
+  const calls: Array<{ method: string; body: string }> = [];
+  const telegram = new TelegramClient(loadConfig({ TELEGRAM_BOT_TOKEN: 'offline', TELEGRAM_OWNER_ID: '1', TELEGRAM_PUBLIC_CHAT_ID: '2' }).telegram, mock(async (url, options) => {
+    calls.push({ method: url.slice(url.lastIndexOf('/') + 1), body: bodyText(options) });
+    return json({ ok: true, result: url.endsWith('sendMediaGroup') ? [{ message_id: 1 }, { message_id: 2 }] : { message_id: 1 } });
+  }));
+  await telegram.publish(part({ media: [gif] }), { idempotencyKey: 'gif' });
+  await telegram.publish(part({ media: [image(1), gif] }), { idempotencyKey: 'album' });
+  assert.deepEqual(calls.map(call => call.method), ['sendAnimation', 'sendMediaGroup']);
+  assert.match(calls[0]!.body, /name="animation"; filename="crosspost\.mp4"/);
+  assert.equal(field(calls[0]!.body, 'supports_streaming'), undefined);
+  // Albums take no animations, so there the GIF goes as a video.
+  assert.deepEqual(JSON.parse(field(calls[1]!.body, 'media')!).map((item: Record<string, any>) => item.type), ['photo', 'video']);
+
+  const { client: bluesky, records } = blueskyFixture();
+  await bluesky.publish(part({ media: [gif] }), { idempotencyKey: 'gif' });
+  await bluesky.publish(part({ media: [videoFixture(join(directory, 'clip.mp4'))] }), { idempotencyKey: 'clip' });
+  assert.deepEqual(records.map(record => record.embed.presentation), ['gif', undefined]);
+});
+
 test('Bluesky warning prefixes fit on every split part and preserve the complete source text', async t => {
   const sourceText = '中'.repeat(400);
   const { engine, job } = engineFixture(t, { text: sourceText, cw: '醫療照片，請斟酌觀看', sensitiveLabels: ['graphic-media'] }, 'bluesky');

@@ -106,15 +106,12 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
   if (post.attachments.length > 4) return 'more_than_four_images';
   const videos = post.attachments.filter(a => a.kind === 'video');
   if (videos.length) {
-    // Videos may sit beside images or each other, as X allows (up to four in all), but only when the
-    // operator opted in. An X video is an HLS stream behind a blob: URL, so the collector resolves a
-    // progressive MP4 through the public syndication endpoint; when that yields nothing the attachment
-    // arrives with neither url nor path and the post is held with a clear reason instead of being
-    // force-published without it.
+    // Videos (an X GIF is one too, a looping MP4) may sit beside images or each other, as X allows (up to
+    // four in all), but only when the operator opted in. An X video is an HLS stream behind a blob: URL,
+    // so the collector resolves a progressive MP4 through the public syndication endpoint; when that
+    // yields nothing the attachment arrives with neither url nor path and the post is held with a clear
+    // reason instead of being force-published without it.
     if (!videoEnabled) return 'video_sync_disabled';
-    // An X animated GIF also renders as a <video>; this project publishes no animations, so holding it
-    // here keeps it from being silently transcoded into one.
-    if (videos.some(video => video.animated)) return 'animated_video_not_supported';
     // Reject an over-length source before spending the download budget on it. prepareVideo enforces the
     // same ceiling, but only once the bytes are already on disk.
     if (videos.some(video => video.durationSeconds !== undefined && video.durationSeconds > MAX_VIDEO_SECONDS)) return 'video_exceeds_duration_limit';
