@@ -70,11 +70,11 @@ export function syndicationToken(id: string): string {
   return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
 }
 
-type XVideoSource = Pick<Attachment, 'url' | 'durationSeconds' | 'width' | 'height' | 'animated'>;
-
 /**
- * Choose a downloadable MP4 rendition from a syndication `tweet-result` payload. Pure, so the variant
- * choice is tested without a network. Returns undefined when the tweet carries no video at all.
+ * A video tweet's own attachments, in display order, from a syndication `tweet-result` payload, so a
+ * post that mixes photos and videos keeps every one of them in place. Pure, so the choice is tested
+ * without a network. Returns undefined when the payload lists no video at all; anything it cannot read
+ * comes back as an `unknown` attachment, which holds the post rather than dropping that item.
  *
  * An animated GIF reports `animated: true` with NO url on purpose: on X a GIF also renders as a
  * `<video>`, but this project publishes no animations, so it must stay held rather than be quietly
@@ -82,15 +82,24 @@ type XVideoSource = Pick<Attachment, 'url' | 'durationSeconds' | 'width' | 'heig
  * download budget — X offers up to 4K (hundreds of MB) while the pipeline re-encodes to a 1280 long
  * edge regardless, so taking the largest would spend the whole budget to produce the same output.
  */
-export function pickVideoSource(payload: unknown, maxDownloadBytes: number): XVideoSource | undefined {
+export function pickMedia(payload: unknown, maxDownloadBytes: number): Attachment[] | undefined {
   const details = object(payload)?.mediaDetails;
   if (!Array.isArray(details)) return undefined;
-  const media = details.map(object).find(entry => entry?.type === 'video' || entry?.type === 'animated_gif');
-  if (!media) return undefined;
+  const entries = details.map(object);
+  if (!entries.some(entry => entry?.type === 'video' || entry?.type === 'animated_gif')) return undefined;
+  return entries.map((entry): Attachment => {
+    const alt = typeof entry?.ext_alt_text === 'string' ? entry.ext_alt_text : '';
+    const url = entry?.type === 'photo' ? fullSizeImageUrl(typeof entry.media_url_https === 'string' ? entry.media_url_https : undefined) : undefined;
+    if (url) return { kind: 'image', url, alt };
+    return entry?.type === 'video' || entry?.type === 'animated_gif' ? { kind: 'video', alt, ...videoSource(entry, maxDownloadBytes) } : { kind: 'unknown', alt: '' };
+  });
+}
+
+function videoSource(media: Record<string, unknown>, maxDownloadBytes: number): Pick<Attachment, 'url' | 'durationSeconds' | 'width' | 'height' | 'animated'> {
   const geometry = object(media.original_info);
   const info = object(media.video_info);
   const millis = info?.duration_millis;
-  const source: XVideoSource = {
+  const source = {
     animated: media.type === 'animated_gif',
     ...(positiveInteger(geometry?.width) ? { width: geometry.width } : {}),
     ...(positiveInteger(geometry?.height) ? { height: geometry.height } : {}),
@@ -107,6 +116,11 @@ export function pickVideoSource(payload: unknown, maxDownloadBytes: number): XVi
   // so fall back to the smallest rendition instead of guessing something past the download cap.
   const affordable = renditions.findLast(r => source.durationSeconds !== undefined && (r.bitrate / 8) * source.durationSeconds <= maxDownloadBytes);
   return { ...source, url: (affordable ?? renditions[0]!).url };
+}
+
+/** A video's or GIF's poster thumbnail on pbs.twimg.com, as opposed to an attached photo (/media/). */
+export function isVideoPoster(url: string): boolean {
+  return /^https:\/\/pbs\.twimg\.com\/(?:ext_tw_video|amplify_video|tweet_video)_thumb\//.test(url);
 }
 
 /**
@@ -276,9 +290,9 @@ export class XCollector implements Collector {
   // Resolved t.co → real URL, kept for the collector's lifetime: the same short link appears across
   // many tweets (and re-appears every scan), so resolve each destination at most once.
   private readonly shortLinks = new Map<string, string | null>();
-  // Resolved video source per tweet id (null = looked up, nothing usable). Cached for the collector's
-  // lifetime so a tweet re-read on every scan costs at most one syndication request.
-  private readonly videoSources = new Map<string, XVideoSource | null>();
+  // Resolved media of a video tweet, per tweet id (null = looked up, nothing usable). Cached for the
+  // collector's lifetime so a tweet re-read on every scan costs at most one syndication request.
+  private readonly videoMedia = new Map<string, Attachment[] | null>();
   // The tweet a quote card shows, per quoting tweet id (null = looked up, unknown).
   private readonly quotes = new Map<string, string | null>();
   constructor(
@@ -290,19 +304,19 @@ export class XCollector implements Collector {
   ) {}
 
   /**
-   * Ask the syndication endpoint for a downloadable source for this tweet's video. Every failure —
-   * network, non-200, unparseable body, deleted or protected tweet — returns undefined, which leaves
-   * the attachment without a url and the post held exactly as it was before this existed.
+   * Ask the syndication endpoint for this video tweet's media with downloadable video sources. Every
+   * failure — network, non-200, unparseable body, deleted or protected tweet — returns undefined, which
+   * leaves the video without a url and the post held exactly as it was before this existed.
    */
-  private async resolveVideo(tweetId: string, signal?: AbortSignal): Promise<XVideoSource | undefined> {
+  private async resolveMedia(tweetId: string, signal?: AbortSignal): Promise<Attachment[] | undefined> {
     if (!this.transport || !this.media?.video) return undefined;
-    const cached = this.videoSources.get(tweetId);
+    const cached = this.videoMedia.get(tweetId);
     if (cached !== undefined) return cached ?? undefined;
     const payload = await this.syndication(tweetId);
     // Held without a source, which is what the caller already handles.
-    const resolved = payload === undefined ? undefined : pickVideoSource(payload, this.media.maxDownloadBytes);
+    const resolved = payload === undefined ? undefined : pickMedia(payload, this.media.maxDownloadBytes);
     // A lookup cut short by shutdown is not a real "nothing here"; leave it uncached so the next run retries.
-    if (!signal?.aborted) this.videoSources.set(tweetId, resolved ?? null);
+    if (!signal?.aborted) this.videoMedia.set(tweetId, resolved ?? null);
     return resolved;
   }
 
@@ -442,9 +456,15 @@ export class XCollector implements Collector {
     // so a card-only tweet still carries its link downstream.
     const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]')
       .evaluateAll(nodes => nodes.find(node => !node.closest('[data-testid="quoteTweet"]'))?.getAttribute('href') ?? null).catch(() => null);
-    const images = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.filter(node => !node.closest('[data-testid="quoteTweet"]'))
-      .map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '' })));
-    const hasVideo = await article.locator('[data-testid="videoPlayer"], video').evaluateAll(nodes => nodes.some(node => !node.closest('[data-testid="quoteTweet"]')));
+    const pictures = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.filter(node => !node.closest('[data-testid="quoteTweet"]'))
+      .map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '',
+        poster: node.closest('[data-testid="previewInterstitial"], [data-testid="videoPlayer"]') !== null })));
+    // A video that has not started playing renders only its poster — an <img> in tweetPhoto, under
+    // previewInterstitial — and no <video> at all. That poster IS the video: it is not a photo to publish,
+    // and it is how a not-yet-playing (or GIF) post is known to carry a video in the first place.
+    const images = pictures.filter(picture => !picture.poster && !isVideoPoster(picture.url));
+    const hasVideo = images.length < pictures.length || await article.locator('[data-testid="videoPlayer"], [data-testid="previewInterstitial"], video')
+      .evaluateAll(nodes => nodes.some(node => !node.closest('[data-testid="quoteTweet"]')));
     // cardPoll is the current rendered widget; preserve its entire choice list in one read so
     // percentages cannot be paired with labels from a different render. No vote/reveal action.
     const pollRead = await article.evaluate((node: Element, selector: string) => {
@@ -472,8 +492,11 @@ export class XCollector implements Collector {
     }).catch(() => '');
     const sensitive = hasSensitiveWarning(chromeText);
     // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
-    const media: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
-    if (hasVideo) media.push({ kind: 'video', alt: '', ...await this.resolveVideo(own, signal) });
+    const shown: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
+    // The page has no downloadable video and no reliable order between photos and videos, so a video
+    // tweet takes its whole media list from the embed endpoint. Without that, the page's photos plus a
+    // source-less video stay held exactly as before.
+    const media = hasVideo ? await this.resolveMedia(own, signal) ?? [...shown, { kind: 'video', alt: '' }] : shown;
     // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
     // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
     // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.

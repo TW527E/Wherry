@@ -27,7 +27,6 @@ const collection = 'app.bsky.feed.post';
 // Bluesky routes video through a separate async service (never inline uploadBlob): a scoped service
 // auth token, an upload that returns a job, then polling until the blob is ready. Fixed public host,
 // so the SSRF-guarded transport still governs the request.
-const videoServiceDid = 'did:web:video.bsky.app';
 const videoServiceUrl = 'https://video.bsky.app';
 const didValid = (value: unknown): value is string => typeof value === 'string' &&
   (/^did:plc:[a-z2-7]{24}$/.test(value) || /^did:web:[^\s/?#]+$/.test(value));
@@ -382,15 +381,16 @@ export class BlueskyClient implements Publisher, Collector {
 
   /**
    * Upload a video through Bluesky's async video service and return its blob. Flow: mint a service
-   * auth token scoped to the video service, POST the bytes (which starts a processing job), then poll
+   * auth token for the account's own PDS uploadBlob (the video service stores the processed blob there
+   * with it, as the official app does), POST the bytes (which starts a processing job), then poll
    * the job until the blob is ready. Pre-publish like uploadBlob — an uncertain failure can only
    * orphan a job/blob, never create a visible post — so it stays a plain transient (mutation=false),
    * leaving the record create afterwards as the one idempotent mutation.
    */
-  private async uploadVideoBlob(video: PreparedVideo, did: string): Promise<JsonObject> {
+  private async uploadVideoBlob(video: PreparedVideo, { did, pds }: BlueskySession): Promise<JsonObject> {
     const exp = Math.floor(this.now().getTime() / 1000) + 30 * 60;
     const auth = object(await this.authenticated(
-      `com.atproto.server.getServiceAuth?${new URLSearchParams({ aud: videoServiceDid, lxm: 'app.bsky.video.uploadVideo', exp: String(exp) })}`,
+      `com.atproto.server.getServiceAuth?${new URLSearchParams({ aud: `did:web:${new URL(pds).host}`, lxm: 'com.atproto.repo.uploadBlob', exp: String(exp) })}`,
       { method: 'GET', maxBytes: 64_000 }, 'Bluesky video service auth', false));
     if (!nonempty(auth?.token)) throw schemaError('Bluesky video service auth', false);
     const serviceToken = auth.token as string;
@@ -426,9 +426,12 @@ export class BlueskyClient implements Publisher, Collector {
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     if (part.poll) throw new PlatformError('Bluesky has no native polls; render the X options and link before publishing', { code: 'PollNotSupported' });
     const key = blueskyRecordKey(context.idempotencyKey);
-    if (part.video && part.images.length) throw new PlatformError('A Bluesky post cannot carry both a video and images', { code: 'MixedMedia' });
-    if (!Array.isArray(part.images) || part.images.length > 4) throw new PlatformError('Bluesky accepts at most four images per part', { code: 'TooManyImages' });
-    for (const image of part.images) validateImage(image, 2_000_000);
+    if (!Array.isArray(part.media) || part.media.length > 4) throw new PlatformError('Bluesky accepts at most four images per part', { code: 'TooManyImages' });
+    const pictures = part.media.filter(item => item.mimeType !== 'video/mp4');
+    const videos = part.media.filter(item => item.mimeType === 'video/mp4');
+    if (videos.length > 1 || (videos.length && pictures.length)) throw new PlatformError('A Bluesky post embeds either images or a single video', { code: 'MixedMedia' });
+    const video = videos[0];
+    for (const image of pictures) validateImage(image, 2_000_000);
     if (typeof part.text !== 'string') throw new PlatformError('Bluesky text must be a string', { code: 'InvalidText' });
     if (part.cw !== undefined && typeof part.cw !== 'string') throw new PlatformError('Bluesky CW must be text', { code: 'InvalidCW' });
     if (part.sensitiveLabels !== undefined && (!Array.isArray(part.sensitiveLabels)
@@ -452,7 +455,7 @@ export class BlueskyClient implements Publisher, Collector {
       facets.push({ index: { byteStart, byteEnd }, features: [{ $type: 'app.bsky.richtext.facet#mention', did: mention.did! }] });
     }
     facets.sort((a, b) => a.index.byteStart - b.index.byteStart);
-    if (!text.trim() && !part.images.length && !part.video) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
+    if (!text.trim() && !part.media.length) throw new PlatformError('Cannot publish an empty Bluesky post', { code: 'EmptyPost' });
     if (Buffer.byteLength(text) > 3000 || graphemes(text).length > 300) throw new PlatformError('Split Bluesky parts before publishing (300 graphemes / 3000 UTF-8 bytes)', { code: 'TextTooLong' });
     let reply: { root: StrongRef; parent: StrongRef } | undefined;
     if (context.parent) {
@@ -465,7 +468,7 @@ export class BlueskyClient implements Publisher, Collector {
 
     const session = await this.login();
     const images: JsonObject[] = [];
-    for (const image of part.images) {
+    for (const image of pictures) {
       // A blob upload is a PRE-publish step: the post record is only created afterwards, and it carries
       // a deterministic rkey so the create itself is idempotent. An uncertain blob upload leaves at most
       // an unreferenced blob, never a visible duplicate, so it is a plain transient error safe to retry —
@@ -476,9 +479,9 @@ export class BlueskyClient implements Publisher, Collector {
       if (!uploaded || uploaded.mimeType !== image.mimeType || uploaded.size !== image.bytes.length) throw schemaError('Bluesky image upload', false);
       images.push({ alt: image.alt, image: uploaded, aspectRatio: { width: image.width, height: image.height } });
     }
-    const videoBlob = part.video ? await this.uploadVideoBlob(part.video, session.did) : undefined;
-    const media = videoBlob
-      ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: part.video!.width, height: part.video!.height }, ...(part.video!.alt ? { alt: part.video!.alt } : {}) }
+    const videoBlob = video ? await this.uploadVideoBlob(video, session) : undefined;
+    const media = video && videoBlob
+      ? { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: { width: video.width, height: video.height }, ...(video.alt ? { alt: video.alt } : {}) }
       : images.length ? { $type: 'app.bsky.embed.images', images } : undefined;
     const quote = part.quote && strong({ uri: part.quote.uri ?? part.quote.id, cid: part.quote.cid });
     const quoteEmbed = quote && { $type: 'app.bsky.embed.record', record: quote };

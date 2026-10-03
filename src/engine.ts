@@ -11,7 +11,7 @@ import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
 import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
-import type { Attachment, Batch, Collector, Destination, Job, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, TextRange, Transport } from './types.js';
+import type { Attachment, Batch, Collector, Destination, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
 
 // Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
 // output is re-validated on the way in. zod's `.url()` accepts ANY scheme, so `javascript:` and
@@ -104,24 +104,23 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
     if (!xPollUrl(post)) return 'poll_source_url_invalid';
   }
   if (post.attachments.length > 4) return 'more_than_four_images';
-  const video = post.attachments.find(a => a.kind === 'video');
-  if (video) {
-    // A single video only, never mixed with images, and only when the operator opted in. An X video is
-    // an HLS stream behind a blob: URL, so the collector resolves a progressive MP4 through the public
-    // syndication endpoint; when that yields nothing the attachment arrives with neither url nor path
-    // and the post is held with a clear reason instead of being force-published text-only.
+  const videos = post.attachments.filter(a => a.kind === 'video');
+  if (videos.length) {
+    // Videos may sit beside images or each other, as X allows (up to four in all), but only when the
+    // operator opted in. An X video is an HLS stream behind a blob: URL, so the collector resolves a
+    // progressive MP4 through the public syndication endpoint; when that yields nothing the attachment
+    // arrives with neither url nor path and the post is held with a clear reason instead of being
+    // force-published without it.
     if (!videoEnabled) return 'video_sync_disabled';
-    if (post.attachments.length > 1) return 'video_must_be_the_only_attachment';
     // An X animated GIF also renders as a <video>; this project publishes no animations, so holding it
     // here keeps it from being silently transcoded into one.
-    if (video.animated) return 'animated_video_not_supported';
+    if (videos.some(video => video.animated)) return 'animated_video_not_supported';
     // Reject an over-length source before spending the download budget on it. prepareVideo enforces the
     // same ceiling, but only once the bytes are already on disk.
-    if (video.durationSeconds !== undefined && video.durationSeconds > MAX_VIDEO_SECONDS) return 'video_exceeds_duration_limit';
-    if (!video.url && !video.path) return 'x_video_has_no_downloadable_source';
-  } else if (post.attachments.some(a => a.kind !== 'image' || a.animated)) {
-    return 'only_static_images_or_video';
+    if (videos.some(video => video.durationSeconds !== undefined && video.durationSeconds > MAX_VIDEO_SECONDS)) return 'video_exceeds_duration_limit';
+    if (videos.some(video => !video.url && !video.path)) return 'x_video_has_no_downloadable_source';
   }
+  if (post.attachments.some(a => a.kind !== 'video' && (a.kind !== 'image' || a.animated))) return 'only_static_images_or_video';
   // Hold a long post only when BOTH hold: X itself counted it as beyond a normal post, and publishing
   // it would really be split into several downstream posts. Either condition alone over-holds — a short
   // tweet whose t.co link expanded into a long URL is not a long post, and a non-Latin post that X
@@ -129,6 +128,20 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
   if (post.platform === 'x' && exceedsXLimit(post.text) && requiresSplit(post.text)) return 'long_x_post_requires_manual_review';
   if (!post.text.trim() && !post.attachments.length && !post.pollData) return 'empty_content';
   return undefined;
+}
+
+/**
+ * Bluesky embeds up to four images or one video per post, never both, so a mixed X post keeps its order
+ * across consecutive posts: each run of images shares one, each video gets its own.
+ */
+function blueskyMediaGroups(media: PreparedMedia[]): PreparedMedia[][] {
+  const groups: PreparedMedia[][] = [];
+  for (const item of media) {
+    const last = groups.at(-1);
+    if (last && item.mimeType !== 'video/mp4' && last[0]!.mimeType !== 'video/mp4') last.push(item);
+    else groups.push([item]);
+  }
+  return groups;
 }
 
 function compatibleMedia(a: Attachment[], b: Attachment[]): 'same' | 'possible' | 'different' {
@@ -199,6 +212,8 @@ export class Engine {
     const identity = this.store.setting<string | undefined>(`account:${snapshot.platform}`, undefined);
     if (identity && identity !== snapshot.accountId) throw new Error('Collector account changed; manual reconfiguration required');
     return this.store.transaction(() => {
+      // Marks when this collector began storing mixed media correctly; see collectedBeforeMixedMedia.
+      if (!this.store.setting<string | undefined>('mixed_media_since', undefined)) this.store.setSetting('mixed_media_since', now);
       this.store.setSetting(`account:${snapshot.platform}`, snapshot.accountId);
       const baselineAt = this.store.setting<string | undefined>(`baseline:${snapshot.platform}`, undefined);
       let added = 0;
@@ -340,8 +355,21 @@ export class Engine {
   }
 
   /** The content reason that keeps this batch out of the automatic publish path, if any. */
-  holdReason(posts: SourcePost[]): string | undefined {
-    return posts.map(p => unsupportedReason(p, this.config.media.video)).find(Boolean);
+  holdReason(batchId: string): string | undefined {
+    const members = this.store.batchPosts(batchId);
+    if (members.some(member => this.collectedBeforeMixedMedia(member))) return 'collected_before_mixed_media';
+    return members.map(member => unsupportedReason(member.post, this.config.media.video)).find(Boolean);
+  }
+
+  /**
+   * An X video beside other media, collected before mixed media synced. The old collector stored the
+   * page's photos (which could include a video's poster) and only the first video, and a stored post is
+   * never re-read, so publishing it could send the wrong media: it stays a manual post.
+   */
+  private collectedBeforeMixedMedia(member: StoredPost): boolean {
+    const since = this.store.setting<string | undefined>('mixed_media_since', undefined);
+    const { platform, attachments } = member.post;
+    return platform === 'x' && attachments.length > 1 && attachments.some(a => a.kind === 'video') && (!since || member.firstSeenAt < since);
   }
 
   /**
@@ -529,6 +557,7 @@ export class Engine {
       const held = members.map(m => unsupportedReason(m.post, this.config.media.video)).filter(Boolean);
       if (held.some(reason => !holdIsApprovable(reason))) throw new Error('Unsupported/private/incomplete content cannot be force-published');
       if (members.some(m => !m.post.relationKnown)) throw new Error('Unknown reply relationship cannot be force-published');
+      if (members.some(m => this.collectedBeforeMixedMedia(m))) throw new Error('This post was collected before mixed media was supported and its media list may be wrong; post it manually, then skip it');
       this.store.updateBatch(id, 'sealed', 'owner_confirmed_new_content');
       for (const member of members) this.store.updatePost(member.key, 'ready', 'owner_confirmed_new_content');
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now);
@@ -584,7 +613,7 @@ export class Engine {
     const root = posts[0];
     const url = root ? fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`) : undefined;
     const excerpt = root ? Array.from(cleanXLinks(root.text)).slice(0, 100).join('') : '';
-    const hold = this.holdReason(posts);
+    const hold = this.holdReason(batch.id);
     // Plain text only: the Telegram notice path HTML-escapes the whole body before sending, so any
     // markup here would render as literal tags. Mirror codes stay copyable as plain text.
     const lines = hold ? [
@@ -622,11 +651,11 @@ export class Engine {
     if (job.kind === 'ops') {
       const batch = this.store.getBatch(job.aggregateId);
       if (!batch) throw new Error('Job source not found');
-      const hold = this.holdReason(this.store.batchPosts(batch.id).map(p => p.post));
+      const hold = this.holdReason(batch.id);
       const approvable = !hold || holdIsApprovable(hold);
       return [{
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
-        images: [], buttons: [
+        media: [], buttons: [
           // Incomplete polls and unsupported media have no publish path, even with owner approval.
           ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: 'rev:a' }] : []),
           { text: '🚫 略過', data: 'rev:s' },
@@ -658,7 +687,7 @@ export class Engine {
     if (job.kind === 'reminder') output.push({
       key: 'notice', sourcePostId: members[0]!.id,
       text: `🔔 你在 ${members[0]!.platform} 發了新內容。要不要也發到 X？\n下方是可直接複製的內容。請選擇：`,
-      images: [], buttons: [{ text: '1️⃣ 要發', data: 'rem:y' }, { text: '2️⃣ 不發', data: 'rem:n' }],
+      media: [], buttons: [{ text: '1️⃣ 要發', data: 'rem:y' }, { text: '2️⃣ 不發', data: 'rem:n' }],
     });
     for (const [postIndex, post] of members.entries()) {
       const unsupported = unsupportedReason(post, this.config.media.video);
@@ -671,11 +700,14 @@ export class Engine {
         if (post.attachments.length) throw new Error('A native X poll cannot be combined with media');
         if (job.destination === 'telegram' && sensitive) throw new Error('Telegram cannot hide native poll questions/options with a spoiler; sensitive polls require review');
       }
-      const videoAttachment = this.config.media.video ? post.attachments.find(a => a.kind === 'video') : undefined;
-      const video = videoAttachment
-        ? await prepareVideo(videoAttachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)
-        : undefined;
-      const images = video ? [] : await prepareImages(post.attachments, this.config, this.transport);
+      // Source order, one at a time: the hold check above already admitted only static images and
+      // downloadable videos (videos only with VIDEO_ENABLED), and each video is a transcode.
+      const media: PreparedMedia[] = [];
+      for (const attachment of post.attachments) {
+        media.push(...attachment.kind === 'video'
+          ? [await prepareVideo(attachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)]
+          : await prepareImages([attachment], this.config, this.transport));
+      }
       const body = bodies?.[postIndex] ?? { text: cleanXLinks(post.text), mentions: [] };
       let text = body.text;
       const mentions = body.mentions;
@@ -698,23 +730,23 @@ export class Engine {
       const prefix = warningPrefix(marking);
       const key = createHash('sha256').update(post.id).digest('hex').slice(0, 16);
       if (job.destination === 'telegram') {
-        // A tweet's images belong to ONE post, so send them as a single album (sendMediaGroup)
-        // with the whole caption on the first photo — not one message per image, which stranded
-        // every image after the first with an empty caption and a repeated footer link. Telegram
+        // A tweet's photos and videos belong to ONE post, so send them as a single album
+        // (sendMediaGroup) with the whole caption on the first item — not one message per item, which
+        // stranded every item after the first with an empty caption and a repeated footer link. Telegram
         // counts rendered HTML and caps an album caption at 1024, a text message at 4096, so the
         // caption chunk fits the album and any overflow continues as plain follow-up messages.
-        const chunks = splitHtml(text, images.length || video ? 1024 : 4096,
+        const chunks = splitHtml(text, media.length ? 1024 : 4096,
           (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0), mentions);
         const caption = chunks[0] ?? '';
-        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, images, video, sourceUrl, ...marking, ...(quoted ? { quote: quoted } : {}) });
+        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, media, sourceUrl, ...marking, ...(quoted ? { quote: quoted } : {}) });
         for (let i = 1; i < chunks.length; i++) {
-          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, images: [], sourceUrl, ...marking });
+          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, media: [], sourceUrl, ...marking });
         }
         if (poll) {
           const question = body.text.trim();
           output.push({ key: `${key}:poll`, sourcePostId: post.id,
             text: !question ? '🗳️ X 投票' : Array.from(question).length <= 300 ? question : '🗳️ 請參閱上一則貼文的投票問題',
-            images: [], poll, sourceUrl: xPollUrl(post)! });
+            media: [], poll, sourceUrl: xPollUrl(post)! });
         }
       } else {
         // Sharkey renders MFM, so instead of a trailing reply carrying the X link (Bluesky's footer),
@@ -727,23 +759,27 @@ export class Engine {
         const chunks = splitText(text, job.destination === 'bluesky'
           ? { graphemes: 300 - graphemes(prefix).length, utf8Bytes: 3000 - Buffer.byteLength(prefix, 'utf8') }
           : { utf16 }, mentions);
+        // Sharkey takes the whole mix on one note. Bluesky's groups ride on successive text parts, and any
+        // left over follow as media-only replies, so the thread stays in source order either way.
+        const groups = job.destination === 'bluesky' ? blueskyMediaGroups(media) : media.length ? [media] : [];
         let offset = 0;
-        chunks.forEach((chunk, index) => {
+        for (let index = 0; index < Math.max(chunks.length, groups.length); index++) {
+          const chunk = chunks[index] ?? '';
           const rendered = signature && index === chunks.length - 1 ? `${chunk}\n\n${signature}` : chunk;
           const partMentions = sliceMentions(mentions, offset, offset + chunk.length);
           offset += chunk.length;
-          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: rendered, images: index === 0 ? images : [], video: index === 0 ? video : undefined, sourceUrl, ...marking,
+          output.push({ key: `${key}:${index}`, sourcePostId: post.id, text: rendered, media: groups[index] ?? [], sourceUrl, ...marking,
             ...(quoted && index === 0 ? { quote: quoted } : {}), ...backdate(post),
             ...(partMentions.length && job.destination === 'bluesky' ? { mentions: partMentions } : {}),
             ...(poll && job.destination === 'sharkey' && index === chunks.length - 1 ? { poll } : {}) });
-        });
+        }
       }
     }
     if (batch?.platform === 'x' && job.destination !== 'telegram' && job.destination !== 'sharkey') {
       const root = members[0]!;
       const url = fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`);
       if (!url) throw new Error('X root URL invalid');
-      output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, images: [], sourceUrl: url, isFooter: true, ...backdate(members.at(-1)!) });
+      output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, media: [], sourceUrl: url, isFooter: true, ...backdate(members.at(-1)!) });
     }
     if (job.destination !== 'bluesky') {
       for (const part of output) {
@@ -817,7 +853,7 @@ export class Worker {
             continue;
           }
           if (prior?.state === 'started') throw Object.assign(new Error('Uncertain previous remote delivery; reconciliation required'), { uncertain: true });
-          store.beginStep(job.id, part.key, { text: part.text, sourcePostId: part.sourcePostId, imageHashes: part.images.map(i => i.sha256), ...(part.poll ? { poll: part.poll } : {}) }, now);
+          store.beginStep(job.id, part.key, { text: part.text, sourcePostId: part.sourcePostId, mediaHashes: part.media.map(m => m.sha256), ...(part.poll ? { poll: part.poll } : {}) }, now);
           const ref = await publisher.publish(part, {
             root: part.key === 'notice' ? undefined : root,
             parent: part.key === 'notice' ? undefined : parent,

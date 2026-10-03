@@ -26,7 +26,7 @@ const body = (options?: HttpOptions): Record<string, any> => JSON.parse(String(o
 const mock = (request: Transport['request']): Transport => ({ request });
 const noNetwork = mock(async () => { throw new Error('Network is unavailable in tests'); });
 const part = (overrides: Partial<PublishPart> = {}): PublishPart => ({ key: 'poll', sourcePostId: '123', text: source.text,
-  images: [], poll, sourceUrl: 'https://x.com/owner/status/123', ...overrides });
+  media: [], poll, sourceUrl: 'https://x.com/owner/status/123', ...overrides });
 
 function engineFixture(t: { after(fn: () => void): void }, posts: SourcePost[] = [source], destinations: Destination[] = ['bluesky', 'sharkey', 'telegram']) {
   const directory = mkdtempSync(join(tmpdir(), 'wherry-poll-'));

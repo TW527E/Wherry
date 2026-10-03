@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { isPublicAddress, SafeHttp, validatePublicUrl, HttpError } from '../src/security/http.js';
 import { cleanXLinks, fixupUrl, splitText, graphemes, normalizeText, similarity, htmlEscape } from '../src/text.js';
 import { blueskyRecordKey } from '../src/platforms/bluesky.js';
-import { fullSizeImageUrl, hasSensitiveWarning, parseTweetFacts, pickVideoSource, syndicationToken } from '../src/platforms/x.js';
+import { fullSizeImageUrl, hasSensitiveWarning, isVideoPoster, parseTweetFacts, pickMedia, syndicationToken } from '../src/platforms/x.js';
 import { TelegramClient } from '../src/platforms/telegram.js';
 import { SharkeyClient } from '../src/platforms/sharkey.js';
 import type { HttpOptions, HttpResponse, PreparedImage, Transport } from '../src/types.js';
@@ -92,7 +92,7 @@ test('several images from one post go out as a single Telegram album with the ca
   );
   const image = (n: number): PreparedImage => ({ bytes: new Uint8Array([n]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: String(n) });
   const ref = await client.publish(
-    { key: 'k:0', sourcePostId: '9', text: '我的內文', images: [image(1), image(2), image(3)], sourceUrl: 'https://fixupx.com/owner/status/9', sensitive: true },
+    { key: 'k:0', sourcePostId: '9', text: '我的內文', media: [image(1), image(2), image(3)], sourceUrl: 'https://fixupx.com/owner/status/9', sensitive: true },
     { audience: 'public', idempotencyKey: 'k:0' },
   );
   assert.equal(captured.length, 1, 'three images are one album call, not three messages');
@@ -132,7 +132,7 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
   const client = new SharkeyClient(config, transport, { now: () => new Date('2026-09-21T15:30:00.000Z') });
   const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
   const ref = await client.publish(
-    { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9', sensitive: true },
+    { key: 'k:0', sourcePostId: '9', text: 'hello', media: [image], sourceUrl: 'https://fixupx.com/owner/status/9', sensitive: true },
     { audience: 'public', idempotencyKey: 'k:0' },
   );
   assert.equal(ref.id, 'note1');
@@ -144,7 +144,7 @@ test('Sharkey uploads media into the configured Drive folder, creating it once w
 
   // A second publish on the same client reuses the cached folder id — no second find/create.
   await client.publish(
-    { key: 'k:1', sourcePostId: '10', text: 'again', images: [image], sourceUrl: 'https://fixupx.com/owner/status/10' },
+    { key: 'k:1', sourcePostId: '10', text: 'again', media: [image], sourceUrl: 'https://fixupx.com/owner/status/10' },
     { audience: 'public', idempotencyKey: 'k:1' },
   );
   assert.equal(findCalls, 1, 'the folder is resolved once and cached for later publishes');
@@ -176,7 +176,7 @@ test('an empty SHARKEY_DRIVE_FOLDER uploads to the drive root with no folder loo
   const client = new SharkeyClient(config, transport);
   const image: PreparedImage = { bytes: new Uint8Array([1]), mimeType: 'image/jpeg', alt: '', width: 4, height: 4, sha256: '1' };
   await client.publish(
-    { key: 'k:0', sourcePostId: '9', text: 'hello', images: [image], sourceUrl: 'https://fixupx.com/owner/status/9' },
+    { key: 'k:0', sourcePostId: '9', text: 'hello', media: [image], sourceUrl: 'https://fixupx.com/owner/status/9' },
     { audience: 'public', idempotencyKey: 'k:0' },
   );
   assert.ok(!calls.includes('drive/folders/find'), 'an empty folder name skips folder resolution entirely');
@@ -208,16 +208,17 @@ test('an X video resolves to the best MP4 the download budget can afford; a GIF 
 
   // 20s at 2.176 Mbit/s ≈ 5.4 MB and fits; the 4K rendition ≈ 63 MB and must never be chosen, or a
   // single clip would eat the whole download budget to produce the same 1280-capped output.
-  const chosen = pickVideoSource(payload('video'), 20_000_000);
+  const chosen = pickMedia(payload('video'), 20_000_000)?.[0];
   assert.equal(chosen?.url, 'https://video.twimg.com/amplify_video/1/vid/avc1/1280x720/c.mp4');
   assert.equal(chosen?.durationSeconds, 20);
+  assert.equal(chosen?.kind, 'video');
   assert.equal(chosen?.animated, false);
   assert.deepEqual([chosen?.width, chosen?.height], [3840, 2160]);
   // A tighter budget steps down rather than picking something that cannot be downloaded.
-  assert.equal(pickVideoSource(payload('video'), 3_000_000)?.url, 'https://video.twimg.com/amplify_video/1/vid/avc1/640x360/b.mp4');
+  assert.equal(pickMedia(payload('video'), 3_000_000)?.[0]?.url, 'https://video.twimg.com/amplify_video/1/vid/avc1/640x360/b.mp4');
   // An animated GIF also renders as a <video> on X, but this project publishes no animations, so it
   // must come back with no url and stay held instead of being transcoded into one.
-  const gif = pickVideoSource(payload('animated_gif'), 20_000_000);
+  const gif = pickMedia(payload('animated_gif'), 20_000_000)?.[0];
   assert.equal(gif?.animated, true);
   assert.equal(gif?.url, undefined);
 });
@@ -226,17 +227,44 @@ test('a video source is only accepted from X media hosts over https', () => {
   const withUrl = (url: string): unknown => ({ mediaDetails: [{ type: 'video',
     video_info: { duration_millis: 5_000, variants: [{ content_type: 'video/mp4', bitrate: 100_000, url }] } }] });
   for (const url of ['http://video.twimg.com/a.mp4', 'https://evil.example/a.mp4', 'file:///a.mp4', 'not a url']) {
-    assert.equal(pickVideoSource(withUrl(url), 20_000_000)?.url, undefined, url);
+    assert.equal(pickMedia(withUrl(url), 20_000_000)?.[0]?.url, undefined, url);
   }
-  assert.equal(pickVideoSource(withUrl('https://video.twimg.com/amplify_video/1/vid/a.mp4'), 20_000_000)?.url,
+  assert.equal(pickMedia(withUrl('https://video.twimg.com/amplify_video/1/vid/a.mp4'), 20_000_000)?.[0]?.url,
     'https://video.twimg.com/amplify_video/1/vid/a.mp4');
   // Anything that is not a video tweet yields nothing at all, so the caller holds it as before.
   for (const payload of [{ mediaDetails: [{ type: 'photo' }] }, { mediaDetails: [] }, {}, 'nonsense', null]) {
-    assert.equal(pickVideoSource(payload, 20_000_000), undefined);
+    assert.equal(pickMedia(payload, 20_000_000), undefined);
   }
   // An HLS-only tweet has no progressive rendition, so there is still nothing to download.
-  assert.equal(pickVideoSource({ mediaDetails: [{ type: 'video', video_info: { duration_millis: 5_000,
-    variants: [{ content_type: 'application/x-mpegURL', url: 'https://video.twimg.com/1/pl/a.m3u8' }] } }] }, 20_000_000)?.url, undefined);
+  assert.equal(pickMedia({ mediaDetails: [{ type: 'video', video_info: { duration_millis: 5_000,
+    variants: [{ content_type: 'application/x-mpegURL', url: 'https://video.twimg.com/1/pl/a.m3u8' }] } }] }, 20_000_000)?.[0]?.url, undefined);
+});
+
+test('a video tweet that also carries photos and more videos keeps every item, in order', () => {
+  const clip = (n: number): Record<string, unknown> => ({ type: 'video', video_info: { duration_millis: 5_000,
+    variants: [{ content_type: 'video/mp4', bitrate: 800_000, url: `https://video.twimg.com/amplify_video/${n}/vid/a.mp4` }] } });
+  const media = pickMedia({ mediaDetails: [
+    { type: 'photo', media_url_https: 'https://pbs.twimg.com/media/A.jpg', ext_alt_text: 'first' },
+    clip(1),
+    { type: 'photo', media_url_https: 'https://pbs.twimg.com/media/B.png' },
+    { ...clip(2), ext_alt_text: 'clip alt' },
+  ] }, 20_000_000);
+  assert.deepEqual(media?.map(item => [item.kind, item.url, item.alt]), [
+    ['image', 'https://pbs.twimg.com/media/A.jpg?name=orig', 'first'],
+    ['video', 'https://video.twimg.com/amplify_video/1/vid/a.mp4', ''],
+    ['image', 'https://pbs.twimg.com/media/B.png?name=orig', ''],
+    ['video', 'https://video.twimg.com/amplify_video/2/vid/a.mp4', 'clip alt'],
+  ]);
+  // A photo it cannot fetch, or a kind it does not know, stays in place as `unknown` so the post is
+  // held rather than published one item short.
+  assert.deepEqual(pickMedia({ mediaDetails: [{ type: 'photo', media_url_https: 'https://evil.example/a.jpg' }, { type: 'model3d' }, clip(3)] }, 20_000_000)
+    ?.map(item => item.kind), ['unknown', 'unknown', 'video']);
+});
+
+test('a not-yet-playing video or GIF poster is told apart from an attached photo', () => {
+  for (const url of ['https://pbs.twimg.com/amplify_video_thumb/1/img/a.jpg', 'https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/a.jpg?name=small',
+    'https://pbs.twimg.com/tweet_video_thumb/AbC.jpg']) assert.equal(isVideoPoster(url), true, url);
+  for (const url of ['https://pbs.twimg.com/media/AbC?format=jpg&name=small', 'https://evil.example/amplify_video_thumb/1.jpg']) assert.equal(isVideoPoster(url), false, url);
 });
 
 test('the syndication token stays on the formula the endpoint accepts', () => {

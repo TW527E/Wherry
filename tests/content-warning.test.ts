@@ -23,7 +23,7 @@ const bodyText = (options?: HttpOptions): string => typeof options?.body === 'st
 const requestBody = (options?: HttpOptions): Record<string, any> => JSON.parse(bodyText(options));
 const field = (body: string, name: string): string | undefined => body.match(new RegExp(`name="${name}"\\r\\n\\r\\n([\\s\\S]*?)\\r\\n--`))?.[1];
 const image = (index = 1): PreparedImage => ({ bytes: new Uint8Array([index]), mimeType: 'image/jpeg', alt: `alt ${index}`, width: 4, height: 4, sha256: String(index) });
-const part = (overrides: Partial<PublishPart> = {}): PublishPart => ({ key: 'part', sourcePostId: '123', text: 'example body', images: [], ...overrides });
+const part = (overrides: Partial<PublishPart> = {}): PublishPart => ({ key: 'part', sourcePostId: '123', text: 'example body', media: [], ...overrides });
 const mock = (request: Transport['request']): Transport => ({ request });
 const noNetwork = mock(async () => { throw new Error('Network is not available in this test'); });
 
@@ -34,7 +34,7 @@ function videoFixture(path: string): PreparedVideo {
 }
 
 function blueskyFixture(label = 'graphic-media') {
-  const records: Record<string, any>[] = [];
+  const records: Record<string, any>[] = [], serviceAuth: URLSearchParams[] = [];
   const transport = mock(async (url, options) => {
     if (url === 'https://author.example/.well-known/did.json') {
       return json({ id: did, service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: pds }] });
@@ -42,7 +42,7 @@ function blueskyFixture(label = 'graphic-media') {
     if (url === `${pds}/xrpc/com.atproto.repo.uploadBlob`) {
       return json({ blob: { $type: 'blob', ref: { $link: 'bafkrei-offline-image' }, mimeType: 'image/jpeg', size: (options!.body as Uint8Array).length } });
     }
-    if (url.startsWith(`${pds}/xrpc/com.atproto.server.getServiceAuth?`)) return json({ token: 'offline-service' });
+    if (url.startsWith(`${pds}/xrpc/com.atproto.server.getServiceAuth?`)) { serviceAuth.push(new URL(url).searchParams); return json({ token: 'offline-service' }); }
     if (url.startsWith('https://video.bsky.app/xrpc/app.bsky.video.uploadVideo?')) {
       return json({ jobStatus: { blob: { $type: 'blob', ref: { $link: 'bafkrei-offline-video' }, mimeType: 'video/mp4', size: (options!.body as Uint8Array).length } } });
     }
@@ -54,7 +54,7 @@ function blueskyFixture(label = 'graphic-media') {
     throw new Error(`Unexpected offline request: ${url}`);
   });
   const client = new BlueskyClient(loadConfig({ BLUESKY_SENSITIVE_LABEL: label }).bluesky, transport, { session, now: () => new Date(instant) });
-  return { client, records };
+  return { client, records, serviceAuth };
 }
 
 function engineFixture(t: { after(fn: () => void): void }, source: Partial<SourcePost>, destination: 'bluesky' | 'sharkey' | 'telegram') {
@@ -113,11 +113,14 @@ test('Bluesky sensitive labels accompany both image and video embeds', async t =
   const directory = mkdtempSync(join(tmpdir(), 'wherry-video-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const video = videoFixture(join(directory, 'clip.mp4'));
-  const { client, records } = blueskyFixture();
-  await client.publish(part({ sensitive: true, images: [image()] }), { idempotencyKey: 'image' });
-  await client.publish(part({ sensitive: true, video }), { idempotencyKey: 'video' });
+  const { client, records, serviceAuth } = blueskyFixture();
+  await client.publish(part({ sensitive: true, media: [image()] }), { idempotencyKey: 'image' });
+  await client.publish(part({ sensitive: true, media: [video] }), { idempotencyKey: 'video' });
   assert.equal(records[0]!.embed.$type, 'app.bsky.embed.images');
   assert.equal(records[1]!.embed.$type, 'app.bsky.embed.video');
+  // The video service stores the processed blob on the account's PDS with this token, so it must be
+  // scoped to that PDS's uploadBlob (as the official app mints it), not to the video service itself.
+  assert.deepEqual(serviceAuth.map(query => [query.get('aud'), query.get('lxm')]), [['did:web:pds.example', 'com.atproto.repo.uploadBlob']]);
   for (const record of records) assert.deepEqual(record.labels.values, [{ val: 'graphic-media' }]);
 });
 
@@ -171,8 +174,8 @@ test('Sharkey sends default or source CW and marks every uploaded file, includin
     throw new Error(`Unexpected offline request: ${url}`);
   });
   const client = new SharkeyClient(loadConfig({ SHARKEY_TOKEN: 'offline', SHARKEY_USERNAME: 'owner', SHARKEY_DRIVE_FOLDER: '' }).sharkey, transport);
-  await client.publish(part({ sensitive: true, images: [image(1), image(2)] }), { idempotencyKey: 'images' });
-  await client.publish(part({ cw: '來源 CW', video }), { idempotencyKey: 'video' });
+  await client.publish(part({ sensitive: true, media: [image(1), image(2)] }), { idempotencyKey: 'images' });
+  await client.publish(part({ cw: '來源 CW', media: [video] }), { idempotencyKey: 'video' });
   await client.publish(part({ sensitive: true }), { idempotencyKey: 'text' });
   await client.publish(part(), { idempotencyKey: 'plain' });
   assert.deepEqual(notes.map(note => note.cw), [DEFAULT_CONTENT_WARNING, '來源 CW', DEFAULT_CONTENT_WARNING, undefined]);
@@ -192,7 +195,7 @@ test('Sharkey refuses an upload that loses the sensitive marker before creating 
     throw new Error('Unexpected request');
   });
   const client = new SharkeyClient(loadConfig({ SHARKEY_TOKEN: 'offline', SHARKEY_USERNAME: 'owner', SHARKEY_DRIVE_FOLDER: '' }).sharkey, transport);
-  await assert.rejects(client.publish(part({ sensitive: true, images: [image()] }), { idempotencyKey: 'lost-marker' }));
+  await assert.rejects(client.publish(part({ sensitive: true, media: [image()] }), { idempotencyKey: 'lost-marker' }));
   assert.equal(noteCreated, false);
 });
 
@@ -208,9 +211,9 @@ test('Telegram marks photos, every album item, videos and text without leaking a
   });
   const client = new TelegramClient(loadConfig({ TELEGRAM_BOT_TOKEN: 'offline', TELEGRAM_OWNER_ID: '1', TELEGRAM_PUBLIC_CHAT_ID: '2' }).telegram, transport);
   const warning = { cw: '警告 <醫療> & 注意', text: '<hidden body> & https://example.com', sourceUrl: 'https://fixupx.com/owner/status/123' };
-  await client.publish(part({ ...warning, images: [image()] }), { idempotencyKey: 'photo' });
-  await client.publish(part({ ...warning, images: [image(1), image(2)] }), { idempotencyKey: 'album' });
-  await client.publish(part({ ...warning, video }), { idempotencyKey: 'video' });
+  await client.publish(part({ ...warning, media: [image()] }), { idempotencyKey: 'photo' });
+  await client.publish(part({ ...warning, media: [image(1), image(2)] }), { idempotencyKey: 'album' });
+  await client.publish(part({ ...warning, media: [video] }), { idempotencyKey: 'video' });
   await client.publish(part(warning), { idempotencyKey: 'text' });
   await client.publish(part(), { idempotencyKey: 'plain' });
   assert.deepEqual(calls.map(call => call.method), ['sendPhoto', 'sendMediaGroup', 'sendVideo', 'sendMessage', 'sendMessage']);
@@ -226,6 +229,49 @@ test('Telegram marks photos, every album item, videos and text without leaking a
   assert.deepEqual(text.link_preview_options, { is_disabled: true });
   assert.equal(JSON.parse(calls[4]!.body).text, 'example body');
   assert.equal(JSON.parse(calls[4]!.body).link_preview_options, undefined);
+});
+
+test('mixed photos and videos go out as one Telegram album and one Sharkey note in order; a Bluesky post refuses the mix', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'wherry-video-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const video = videoFixture(join(directory, 'clip.mp4'));
+  const mixed = [video, image(1), video];
+
+  const calls: Array<{ method: string; body: string }> = [];
+  const telegram = new TelegramClient(loadConfig({ TELEGRAM_BOT_TOKEN: 'offline', TELEGRAM_OWNER_ID: '1', TELEGRAM_PUBLIC_CHAT_ID: '2' }).telegram, mock(async (url, options) => {
+    calls.push({ method: url.slice(url.lastIndexOf('/') + 1), body: bodyText(options) });
+    return json({ ok: true, result: [{ message_id: 1 }, { message_id: 2 }, { message_id: 3 }] });
+  }));
+  const ref = await telegram.publish(part({ sensitive: true, media: mixed, sourceUrl: 'https://fixupx.com/owner/status/123' }), { idempotencyKey: 'mixed' });
+  assert.deepEqual(calls.map(call => call.method), ['sendMediaGroup'], 'photos and videos share one album');
+  const album = JSON.parse(field(calls[0]!.body, 'media')!);
+  assert.deepEqual(album.map((item: Record<string, any>) => [item.type, item.media]), [['video', 'attach://video0'], ['photo', 'attach://photo1'], ['video', 'attach://video2']]);
+  assert.ok(album.every((item: Record<string, any>) => item.has_spoiler === true), 'every item, video included, is hidden');
+  assert.match(album[0].caption, /原文連結/);
+  assert.match(calls[0]!.body, /filename="crosspost-0\.mp4"[\s\S]*filename="crosspost-1\.jpg"[\s\S]*filename="crosspost-2\.mp4"/);
+  assert.deepEqual(ref.messageIds, [1, 2, 3]);
+
+  const notes: Record<string, any>[] = [], uploads: string[] = [];
+  const sharkey = new SharkeyClient(loadConfig({ SHARKEY_TOKEN: 'offline', SHARKEY_USERNAME: 'owner', SHARKEY_DRIVE_FOLDER: '' }).sharkey, mock(async (url, options) => {
+    const method = url.split('/api/')[1];
+    if (method === 'users/show') return json({ id: 'user1', username: 'owner', host: null });
+    if (method === 'meta') return json({ maxNoteTextLength: 3000, maxCwLength: 500, maxFileCommentLength: 2000 });
+    if (method === 'drive/files/create') {
+      const body = bodyText(options); uploads.push(body);
+      return json({ id: `file${uploads.length}`, comment: field(body, 'comment'), isSensitive: false });
+    }
+    if (method === 'notes/create') { notes.push(requestBody(options)); return json({ createdNote: { id: 'note1' } }); }
+    throw new Error(`Unexpected offline request: ${url}`);
+  }));
+  await sharkey.publish(part({ media: mixed }), { idempotencyKey: 'mixed' });
+  assert.deepEqual(uploads.map(body => body.match(/filename="[^"]*\.(\w+)"/)?.[1]), ['mp4', 'jpg', 'mp4']);
+  assert.deepEqual(notes[0]!.fileIds, ['file1', 'file2', 'file3']);
+
+  const { client: bluesky, records } = blueskyFixture();
+  for (const media of [[image(1), video], [video, video]]) {
+    await assert.rejects(bluesky.publish(part({ media }), { idempotencyKey: 'mixed' }), /either images or a single video/);
+  }
+  assert.equal(records.length, 0, 'the engine splits a mix before Bluesky ever sees one');
 });
 
 test('Bluesky warning prefixes fit on every split part and preserve the complete source text', async t => {

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
 import { isSensitiveContent, warningPrefix } from '../content-warning.js';
 import { nativePollPayload } from '../poll.js';
-import type { PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
+import type { PreparedMedia, PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
 import { fixupUrl, htmlEscape, splitText } from '../text.js';
 import { PlatformError, multipart, nonempty, object, positiveInteger, requestJson, schemaError, type MultipartFile } from './parse.js';
 
@@ -27,7 +27,11 @@ export class TelegramClient implements Publisher {
   /** sendVideo / sendPhoto / sendMediaGroup: one multipart request, one or more sent messages back. */
   private async upload(method: string, fields: Record<string, string>, files: MultipartFile[]): Promise<TelegramMessage[]> {
     const form = multipart(fields, files);
-    const response = await requestJson(this.transport, this.endpoint(method), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000 }, `Telegram ${method}`, true) as TelegramResponse<TelegramMessage | TelegramMessage[]>;
+    // An album carries every file in this one request, so give it 30 s for Telegram to answer plus
+    // transfer time at 0.5 MB/s, rather than a flat 30 s a few videos could outrun mid-upload — a timeout
+    // here is an uncertain delivery the owner has to reconcile by hand.
+    const response = await requestJson(this.transport, this.endpoint(method), { method: 'POST', headers: { 'content-type': form.contentType }, body: form.body, maxBytes: 2_000_000,
+      timeoutMs: 30_000 + Math.ceil(form.body.length / 500) }, `Telegram ${method}`, true) as TelegramResponse<TelegramMessage | TelegramMessage[]>;
     const messages = [response.result ?? []].flat();
     if (!response.ok || !messages.length) throw schemaError(`Telegram ${method}`, true);
     return messages;
@@ -42,7 +46,7 @@ export class TelegramClient implements Publisher {
     const sensitive = isSensitiveContent(part);
     if (part.poll) {
       if (sensitive) throw new PlatformError('Telegram native polls cannot hide their questions/options with a spoiler', { code: 'SensitivePollUnsupported' });
-      if (part.images.length || part.video || part.buttons?.length) throw new PlatformError('A native poll must be a separate durable Telegram step', { code: 'InvalidPollPart' });
+      if (part.media.length || part.buttons?.length) throw new PlatformError('A native poll must be a separate durable Telegram step', { code: 'InvalidPollPart' });
       const poll = nativePollPayload(part.poll, 'telegram', this.now().getTime());
       if (typeof part.text !== 'string' || !part.text.trim() || Array.from(part.text).length > 300) throw new PlatformError('Telegram poll questions must be 1–300 characters', { code: 'InvalidPollQuestion' });
       const sourceUrl = part.sourceUrl && fixupUrl(part.sourceUrl)?.replace('https://fixupx.com/', 'https://x.com/');
@@ -66,31 +70,33 @@ export class TelegramClient implements Publisher {
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
     const body = htmlEscape(part.text);
     const rendered = `${htmlEscape(warningPrefix(part))}${sensitive && body ? `<tg-spoiler>${body}</tg-spoiler>` : body}${link}`;
-    if (part.images.length > 4) throw new Error('Telegram publisher accepts at most four images per durable step');
-    const withMedia = Boolean(part.video || part.images.length);
+    if (part.media.length > 4) throw new Error('Telegram publisher accepts at most four images or videos per durable step');
+    const withMedia = part.media.length > 0;
     if (rendered.length > (withMedia ? MAX_CAPTION : MAX_TEXT)) throw new Error(`Telegram ${withMedia ? 'caption' : 'message'} requires core text splitter before publish`);
     const replyField: Record<string, string> = reply ? { reply_parameters: JSON.stringify(reply) } : {};
     const spoiler: Record<string, string> = sensitive ? { has_spoiler: 'true' } : {};
-    const extension = (mimeType: string): string => mimeType === 'image/png' ? 'png' : 'jpg';
+    const kind = (item: PreparedMedia): 'video' | 'photo' => item.mimeType === 'video/mp4' ? 'video' : 'photo';
+    const file = async (item: PreparedMedia, field: string, filename: string): Promise<MultipartFile> => item.mimeType === 'video/mp4'
+      ? { field, filename: `${filename}.mp4`, mimeType: item.mimeType, bytes: await readFile(item.path) }
+      : { field, filename: `${filename}.${item.mimeType === 'image/png' ? 'png' : 'jpg'}`, mimeType: item.mimeType, bytes: item.bytes };
     let sent: TelegramMessage[];
-    if (part.video) {
-      sent = await this.upload('sendVideo', { chat_id: chatId, caption: rendered, parse_mode: 'HTML', supports_streaming: 'true', ...spoiler, ...replyField },
-        [{ field: 'video', filename: 'crosspost.mp4', mimeType: part.video.mimeType, bytes: await readFile(part.video.path) }]);
-    } else if (part.images.length === 1) {
-      const image = part.images[0]!;
-      sent = await this.upload('sendPhoto', { chat_id: chatId, caption: rendered, parse_mode: 'HTML', ...spoiler, ...replyField },
-        [{ field: 'photo', filename: `crosspost.${extension(image.mimeType)}`, mimeType: image.mimeType, bytes: image.bytes }]);
-    } else if (part.images.length > 1) {
-      // Several photos from one tweet post as a single album, caption (with the link) on the
-      // first item — the whole group is one durable step so a retry replays the same album.
-      const media = part.images.map((_image, index) => ({
-        type: 'photo', media: `attach://photo${index}`,
+    if (part.media.length === 1) {
+      const item = part.media[0]!;
+      sent = await this.upload(kind(item) === 'video' ? 'sendVideo' : 'sendPhoto', { chat_id: chatId, caption: rendered, parse_mode: 'HTML',
+        ...(kind(item) === 'video' ? { supports_streaming: 'true' } : {}), ...spoiler, ...replyField }, [await file(item, kind(item), 'crosspost')]);
+    } else if (part.media.length > 1) {
+      // Several photos and videos from one tweet post as a single album (Telegram mixes the two in one
+      // media group), caption (with the link) on the first item — the whole group is one durable step so
+      // a retry replays the same album.
+      const media = part.media.map((item, index) => ({
+        type: kind(item), media: `attach://${kind(item)}${index}`,
+        ...(kind(item) === 'video' ? { supports_streaming: true } : {}),
         ...(sensitive ? { has_spoiler: true } : {}),
         ...(index === 0 ? { caption: rendered, parse_mode: 'HTML' } : {}),
       }));
-      sent = await this.upload('sendMediaGroup', { chat_id: chatId, media: JSON.stringify(media), ...replyField }, part.images.map((image, index) => ({
-        field: `photo${index}`, filename: `crosspost-${index}.${extension(image.mimeType)}`, mimeType: image.mimeType, bytes: image.bytes,
-      })));
+      const files: MultipartFile[] = [];
+      for (const [index, item] of part.media.entries()) files.push(await file(item, `${kind(item)}${index}`, `crosspost-${index}`));
+      sent = await this.upload('sendMediaGroup', { chat_id: chatId, media: JSON.stringify(media), ...replyField }, files);
     } else {
       const markup = part.buttons?.length ? { reply_markup: { inline_keyboard: [part.buttons.map(b => ({ text: b.text, callback_data: b.data }))] } } : {};
       sent = [await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: rendered, parse_mode: 'HTML',

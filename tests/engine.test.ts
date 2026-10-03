@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import sharp from 'sharp';
 import { loadConfig } from '../src/config.js';
 import { Store } from '../src/store.js';
 import { Engine, collectCycle, decideMirror, exceedsXLimit, holdIsApprovable, unsupportedReason } from '../src/engine.js';
@@ -526,19 +527,89 @@ test('unsupported phase-one content is held instead of being silently degraded',
   assert.equal(store.jobs(100).filter(j => j.kind === 'publish').length, 0);
 });
 
-test('video gating: disabled holds video, enabled needs a downloadable source and forbids mixing', () => {
+test('video gating: disabled holds video, enabled needs a downloadable source for every video, mixing is fine', () => {
   const withVideo = (attachments: SourcePost['attachments']): SourcePost => post({ id: '900', createdAt: at(10), attachments });
+  const mp4 = 'https://example.com/v.mp4', jpg = 'https://example.com/i.jpg';
   const hlsOnly = withVideo([{ kind: 'video', alt: '' }]);                         // X: no url/path (HLS/blob)
-  const realVideo = withVideo([{ kind: 'video', alt: 'clip', url: 'https://example.com/v.mp4' }]);
-  const mixed = withVideo([{ kind: 'video', alt: '', url: 'https://example.com/v.mp4' }, { kind: 'image', alt: '', url: 'https://example.com/i.jpg' }]);
+  const realVideo = withVideo([{ kind: 'video', alt: 'clip', url: mp4 }]);
+  const mixed = withVideo([{ kind: 'video', alt: '', url: mp4 }, { kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4 }]);
   // Opt-out (default): any video is held with the disabled reason.
   assert.equal(unsupportedReason(hlsOnly, false), 'video_sync_disabled');
   assert.equal(unsupportedReason(realVideo, false), 'video_sync_disabled');
+  assert.equal(unsupportedReason(mixed, false), 'video_sync_disabled');
   // Opt-in: an X-style HLS video (no fetchable source) is still held, with a source-specific reason.
   assert.equal(unsupportedReason(hlsOnly, true), 'x_video_has_no_downloadable_source');
-  // Opt-in with a real downloadable source is supported; mixing video and images never is.
+  // Opt-in with real downloadable sources is supported, alone or mixed with images and other videos, as X allows.
   assert.equal(unsupportedReason(realVideo, true), undefined);
-  assert.equal(unsupportedReason(mixed, true), 'video_must_be_the_only_attachment');
+  assert.equal(unsupportedReason(mixed, true), undefined);
+  // Every video in a mix is checked, not only the first, and the rest of the mix must still be publishable.
+  assert.equal(unsupportedReason(withVideo([{ kind: 'video', alt: '', url: mp4 }, { kind: 'video', alt: '' }]), true), 'x_video_has_no_downloadable_source');
+  assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4, animated: true }]), true), 'animated_video_not_supported');
+  assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4, durationSeconds: 141 }]), true), 'video_exceeds_duration_limit');
+  assert.equal(unsupportedReason(withVideo([{ kind: 'video', alt: '', url: mp4 }, { kind: 'unknown', alt: '' }]), true), 'only_static_images_or_video');
+  assert.equal(unsupportedReason(withVideo(Array.from({ length: 5 }, () => ({ kind: 'video' as const, alt: '', url: mp4 }))), true), 'more_than_four_images');
+});
+
+test('a post mixing photos and videos keeps every item in order: Bluesky spreads them over replies, the others take them at once', async t => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'crosspost-mixed-'));
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
+  const media = join(dataDir, 'media');
+  mkdirSync(media);
+  const photo = join(media, 'photo.jpg'), clip = join(media, 'clip.mp4'), tool = join(dataDir, 'media-tool');
+  writeFileSync(photo, await sharp({ create: { width: 4, height: 4, channels: 3, background: '#c33' } }).jpeg().toBuffer());
+  writeFileSync(clip, 'source');
+  // Stands in for ffprobe and ffmpeg so the test needs neither installed.
+  writeFileSync(tool, `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args.includes('-show_entries')) process.stdout.write(JSON.stringify({ streams: [{ width: 4, height: 4 }], format: { duration: '1' } }));
+else require('node:fs').writeFileSync(args.at(-1), 'prepared');
+`, { mode: 0o700 });
+  const config = loadConfig({ DATA_DIR: dataDir, DESTINATIONS: 'bluesky,sharkey,telegram', BLUESKY_ENABLED: 'true', SHARKEY_ENABLED: 'true',
+    X_ENABLED: 'true', X_HANDLE: 'owner', VIDEO_ENABLED: 'true', FFMPEG_PATH: tool, FFPROBE_PATH: tool });
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const engine = new Engine(store, config, transport);
+  const video: Attachment = { kind: 'video', alt: 'clip', path: clip }, image: Attachment = { kind: 'image', alt: 'photo', path: photo };
+  store.addBatch({ id: 'x:950', platform: 'x', rootId: '950', rootCreatedAt: at(0), cutoffAt: at(0), settleAt: at(0), state: 'sealed', reason: 'thread_closed' });
+  store.addPost(post({ id: '950', createdAt: at(0), text: 'mixed', attachments: [video, image, image, video] }), 'ready', 'thread_closed', at(0), 'x:950');
+  const kinds = (part: { media: Array<{ mimeType: string }> }): string[] => part.media.map(item => item.mimeType === 'video/mp4' ? 'video' : 'image');
+  const partsFor = async (destination: Destination) => engine.parts(store.getJob(store.enqueue('publish', 'x:950', destination, at(0)))!, at(1));
+
+  // Bluesky embeds images or one video, never both: each run of images shares a post, each video gets its own.
+  const bluesky = await partsFor('bluesky');
+  assert.deepEqual(bluesky.map(part => [part.text, kinds(part)]), [['mixed', ['video']], ['', ['image', 'image']], ['', ['video']], ['🔗 X 原推文：https://fixupx.com/owner/status/950', []]]);
+  assert.ok(bluesky.slice(1, 3).every(part => !part.quote && part.sourcePostId === '950'), 'the media-only replies belong to the same tweet');
+  // Sharkey and Telegram carry the whole mix on one note / one album, in source order.
+  for (const destination of ['sharkey', 'telegram'] as const) {
+    const parts = await partsFor(destination);
+    assert.equal(parts.length, 1, destination);
+    assert.deepEqual(kinds(parts[0]!), ['video', 'image', 'image', 'video'], destination);
+  }
+});
+
+test('a mixed-media post collected before mixing was supported stays manual: its stored media came from the old collector', () => {
+  const config = loadConfig({ DATA_DIR: mkdtempSync(join(tmpdir(), 'crosspost-')), DESTINATIONS: 'bluesky', BLUESKY_ENABLED: 'true', X_ENABLED: 'true', X_HANDLE: 'owner', VIDEO_ENABLED: 'true' });
+  const store = new Store(':memory:');
+  const engine = new Engine(store, config, transport);
+  // What the old collector stored: the page's photos (possibly a video poster) plus only the first video.
+  const attachments: Attachment[] = [{ kind: 'image', alt: '', url: 'https://pbs.twimg.com/media/A.jpg' }, { kind: 'video', alt: '', url: 'https://video.twimg.com/a.mp4' }];
+  const held = (id: string, reason: string, seenAt: string): void => {
+    store.addBatch({ id: `x:${id}`, platform: 'x', rootId: id, rootCreatedAt: at(0), cutoffAt: at(0), settleAt: at(0), state: 'review', reason });
+    store.addPost(post({ id, createdAt: at(0), attachments }), 'unsupported', reason, seenAt, `x:${id}`);
+  };
+  // Held as a mix, or sitting unchecked in a branched thread, before the upgrade...
+  held('960', 'video_must_be_the_only_attachment', at(0));
+  held('962', 'thread_is_not_linear', at(0));
+  engine.ingest(snapshot([], at(5)), at(5));   // ...the first scan after it...
+  held('961', 'possible_manual_mirror', at(10)); // ...and the same media collected since.
+  for (const id of ['x:960', 'x:962']) {
+    assert.equal(engine.holdReason(id), 'collected_before_mixed_media', 'the web UI, /pending and the notice offer no approve');
+    assert.throws(() => engine.action('approve', id, at(20)), /collected before mixed media was supported/);
+  }
+  assert.equal(store.jobs(100).length, 0);
+  assert.equal(engine.holdReason('x:961'), undefined);
+  engine.action('approve', 'x:961', at(20));
+  assert.equal(store.getBatch('x:961')?.state, 'sealed');
 });
 
 test('Bluesky targets and footers are assembled with the X root link only', async () => {

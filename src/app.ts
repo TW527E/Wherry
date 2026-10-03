@@ -235,7 +235,7 @@ function ago(iso: string): string {
 function heldBatches(engine: Engine) {
   return engine.store.batches(100).filter(b => b.state === 'review' || b.state === 'open').map(b => {
     const posts = engine.store.batchPosts(b.id).map(p => p.post);
-    const hold = engine.holdReason(posts);
+    const hold = engine.holdReason(b.id);
     return { ...b, approvable: !hold || holdIsApprovable(hold), count: posts.length, text: posts[0]?.text ?? '', url: posts[0]?.url };
   });
 }
