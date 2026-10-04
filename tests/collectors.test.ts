@@ -90,7 +90,8 @@ test('the X video lookup asks syndication once per tweet, skips it when video is
   }
 });
 
-test('Bluesky retains rotated sessions without a persistence callback and retries with the refreshed token', async () => {
+// The real PDS answers an expired access token with HTTP 400 ExpiredToken; 401 is kept for other servers.
+for (const expiredStatus of [400, 401]) test(`Bluesky retains rotated sessions without a persistence callback and retries with the refreshed token (HTTP ${expiredStatus})`, async () => {
   const requests: Array<{ method: string; token?: string }> = [];
   let loginCalls = 0, refreshCalls = 0, createCalls = 0;
   const transport: Transport = { async request(url, options) {
@@ -107,7 +108,7 @@ test('Bluesky retains rotated sessions without a persistence callback and retrie
       return json({ did, handle: 'author.example', accessJwt: 'second', refreshJwt: 'refresh-second' });
     }
     if (method === 'com.atproto.repo.createRecord') {
-      if (++createCalls === 1) return json({ error: 'ExpiredToken' }, 401);
+      if (++createCalls === 1) return json({ error: 'ExpiredToken', message: 'Token has expired' }, expiredStatus);
       assert.equal(options?.headers?.authorization, 'Bearer second');
       const request = JSON.parse(String(options?.body));
       return json({ uri: `at://${did}/app.bsky.feed.post/${request.rkey}`, cid: 'offline-cid', validationStatus: 'valid' });
