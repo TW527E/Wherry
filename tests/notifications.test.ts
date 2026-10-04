@@ -100,3 +100,13 @@ test('forwarded error events reach Telegram in the same zh-Hant as the Web UI', 
   assert.match(text, /貼文暫停同步：貼文資料不完整/);
   assert.doesNotMatch(text, /Native post held/);
 });
+
+test('plain Telegram replies mark "/command <id>" as code so one tap copies the whole command', async t => {
+  const { calls, telegram } = fixture(t);
+  const text = '待你決定：0 批（/pending 查看）\n  /retry 9549-acde\n  /cancel 9549-acde\n  /approve x:1 · /skip x:1 · /mirror x:1\n請先 /session 或 /mirror <id> <X_URL>，見 https://x.com/a/status/1';
+  await telegram.sendPlain(text, 'private');
+  const { entities } = calls.at(-1)!.body;
+  assert.deepEqual(entities.map((e: { offset: number; length: number }) => text.slice(e.offset, e.offset + e.length)),
+    ['/retry 9549-acde', '/cancel 9549-acde', '/approve x:1', '/skip x:1', '/mirror x:1']);
+  assert.ok(entities.every((e: { type: string }) => e.type === 'code'));
+});

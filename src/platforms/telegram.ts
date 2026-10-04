@@ -10,6 +10,8 @@ export type TelegramAudience = 'private' | 'ops' | 'public';
 interface TelegramResponse<T> { ok: boolean; result?: T; description?: string; parameters?: { retry_after?: number } }
 interface TelegramMessage { message_id: number; chat: { id: number | string }; media_group_id?: string }
 const MAX_TEXT = 4096; const MAX_CAPTION = 1024;
+/** A slash command followed by ID-like arguments, e.g. "/retry 9549-…" or "/approve batch-1". */
+const COPYABLE_COMMAND = /(?<=^|[\s（(])\/[a-z]+(?: [\w:.-]+)+/gm;
 
 export class TelegramClient implements Publisher {
   readonly destination = 'telegram' as const;
@@ -110,7 +112,9 @@ export class TelegramClient implements Publisher {
   async sendPlain(text: string, audience: TelegramAudience = 'ops'): Promise<RemoteRef> {
     const chatId = this.chat(audience); const messageIds: number[] = [];
     for (const chunk of splitText(text, { utf16: MAX_TEXT })) {
-      const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: chunk, link_preview_options: { is_disabled: true } });
+      // "/retry <id>" as a bot-command link would send only "/retry"; a code entity makes one tap copy the whole command.
+      const entities = Array.from(chunk.matchAll(COPYABLE_COMMAND), match => ({ type: 'code', offset: match.index, length: match[0].length }));
+      const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: chunk, link_preview_options: { is_disabled: true }, ...(entities.length ? { entities } : {}) });
       messageIds.push(result.message_id);
     }
     return { id: String(messageIds[0]), messageIds, chatId };
