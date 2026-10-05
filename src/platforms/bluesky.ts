@@ -370,7 +370,8 @@ export class BlueskyClient implements Publisher, Collector {
     try { return await request(session); }
     catch (error) {
       const info = object(error);
-      if (info?.uncertain !== false || info.status !== 401 || !['ExpiredToken', 'InvalidToken'].includes(String(info.code))) throw error;
+      // The PDS reports an expired access token as HTTP 400 ExpiredToken (not 401), so key on the code.
+      if (info?.uncertain !== false || (info.status !== 400 && info.status !== 401) || !['ExpiredToken', 'InvalidToken'].includes(String(info.code))) throw error;
       // Another task may have already rotated the token; reuse it. But close() can null the session
       // concurrently, so only reuse a session that actually exists — otherwise refresh (which re-logs in).
       const current = this.session;
