@@ -304,6 +304,14 @@ export class SharkeyClient implements Publisher, Collector {
     return { id: note.id, uri: webUrl(note.uri), url: `${this.baseUrl}/notes/${encodeURIComponent(note.id)}` };
   }
 
+  async retract(ref: RemoteRef): Promise<void> {
+    if (!noteId(ref.id)) throw new PlatformError('Not a Sharkey note reference', { code: 'InvalidReference' });
+    // Success is 204 No Content, which requestJson reports as an unparseable (InvalidResponse) 2xx.
+    await this.api('notes/delete', { noteId: ref.id }).catch(error => {
+      if (!['InvalidResponse', 'NO_SUCH_NOTE'].includes(String(object(error)?.code))) throw error;
+    });
+  }
+
   async collect(since?: string): Promise<SourceSnapshot> {
     const fetchedAt = this.now().toISOString();
     let accountId = this.config.userId || this.config.username;

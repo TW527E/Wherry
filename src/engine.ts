@@ -11,6 +11,7 @@ import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
 import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
+import { xPostExists } from './platforms/x.js';
 import type { Attachment, Batch, Collector, Destination, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
 
 // Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
@@ -456,6 +457,43 @@ export class Engine {
     return count;
   }
 
+  /**
+   * X has no deletion feed, so synced posts are re-read through the embed endpoint (see
+   * xPostsToRecheck for how often). A post found gone is marked deleted and every downstream copy is
+   * queued for removal. "Gone" is only trusted while a post this very scan saw live on the timeline
+   * still reads as existing, so a broken endpoint, a rate limit or a locked account deletes nothing.
+   */
+  async retractDeleted(snapshot: SourceSnapshot, now: string = new Date().toISOString()): Promise<number> {
+    const due = this.store.xPostsToRecheck(now);
+    if (!due.length) return 0;
+    const live = snapshot.posts.filter(post => !post.repost).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+    if (!live || await xPostExists(this.transport, live.id) !== true) {
+      this.store.event('warn', 'X deletion check skipped: the embed endpoint did not confirm a post that is live on the timeline');
+      return 0;
+    }
+    let deleted = 0;
+    for (const member of due) {
+      const exists = await xPostExists(this.transport, member.post.id);
+      if (exists === undefined) continue;
+      this.store.markChecked(member.key, now);
+      if (exists) continue;
+      this.store.transaction(() => {
+        this.store.updatePost(member.key, 'deleted', 'x_post_deleted');
+        const destinations = [...new Set(this.store.deliveredCopies(member.post.id).map(copy => copy.destination))];
+        for (const destination of destinations) this.store.enqueue('retract', member.key, destination, now);
+        // Nothing left to publish: stop a delivery that has not gone out (or failed) from ever running.
+        if (member.batchId && this.store.batchPosts(member.batchId).every(post => post.classification === 'deleted')) {
+          for (const job of this.store.jobsForAggregate(member.batchId)) {
+            if (job.kind === 'publish' && ['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'x_post_deleted');
+          }
+        }
+        this.store.event('info', `X post ${member.post.id} was deleted; removing its copies from ${destinations.join(', ') || 'nowhere (none delivered)'}`, member.key);
+      });
+      deleted++;
+    }
+    return deleted;
+  }
+
   schedule(input: { text: string; attachments?: Attachment[]; dueAt: string }, now: string = new Date().toISOString()): string {
     const due = new Date(input.dueAt).toISOString();
     if (due < now) throw new Error('Schedule must be in the future');
@@ -666,7 +704,8 @@ export class Engine {
       }];
     }
     const batch = job.kind === 'publish' ? this.store.getBatch(job.aggregateId) : undefined;
-    const members = job.kind === 'publish' ? this.store.batchPosts(job.aggregateId).map(p => p.post) : [this.store.postByKey(job.aggregateId)?.post].filter((p): p is SourcePost => Boolean(p));
+    // A post deleted on X is never (re)sent, e.g. by a retry on a destination that failed the first time.
+    const members = job.kind === 'publish' ? this.store.batchPosts(job.aggregateId).filter(p => p.classification !== 'deleted').map(p => p.post) : [this.store.postByKey(job.aggregateId)?.post].filter((p): p is SourcePost => Boolean(p));
     if (!members.length) throw new Error('Job source not found');
     const planKey = `mention-plan:${job.id}`;
     let bodies = this.store.setting<MentionText[] | undefined>(planKey, undefined);
@@ -825,6 +864,10 @@ export class Worker {
         store.event('error', `No publisher configured for ${job.destination}`, job.id);
         continue;
       }
+      if (job.kind === 'retract') {
+        if (store.claimJob(job.id) && await this.retract(job, publisher, now)) count++;
+        continue;
+      }
       if (job.kind === 'publish' && store.getBatch(job.aggregateId)?.state !== 'sealed') continue;
       if (!store.claimJob(job.id)) continue;
       let activeKey: string | undefined;
@@ -892,6 +935,29 @@ export class Worker {
     }
     return count;
   }
+
+  /** Delete every downstream copy of a post deleted on X. Deleting is idempotent, so any failure just retries. */
+  private async retract(job: Job, publisher: Publisher, now: string): Promise<boolean> {
+    const { store } = this.engine;
+    try {
+      if (!publisher.retract) throw new Error(`${job.destination} cannot delete posts`);
+      for (const copy of store.deliveredCopies(job.aggregateId.slice('x:'.length), job.destination)) {
+        await publisher.retract(copy.ref);
+        store.retractStep(copy.jobId, copy.key);
+      }
+      store.updateJob(job.id, 'succeeded');
+      store.event('info', `${job.destination}: removed the copies of a post deleted on X`, job.id);
+      return true;
+    } catch (error) {
+      const value = error as { status?: number; retryAfter?: number };
+      const transient = value.status === undefined || value.status === 429 || value.status >= 500;
+      if (transient && job.attempts + 1 < this.engine.config.maxAttempts) {
+        store.updateJob(job.id, 'pending', safeError(error), new Date(Date.parse(now) + Math.max(value.retryAfter || 0, 30 * 2 ** job.attempts) * 1000).toISOString());
+      } else store.updateJob(job.id, 'failed', safeError(error));
+      store.event('error', `${job.destination}: could not remove a copy of a post deleted on X: ${safeError(error)}`, job.id);
+      return false;
+    }
+  }
 }
 
 export function safeError(error: unknown): string {
@@ -925,10 +991,14 @@ export async function collectCycle(engine: Engine, collectors: Collector[], now?
     // and can tell whether it closed the whole gap since the previous scan.
     const since = engine.store.setting<string | undefined>(`fresh:${collector.platform}`, undefined);
     try {
-      engine.ingest(await collector.collect(since, signal), now);
+      const snapshot = await collector.collect(since, signal);
+      engine.ingest(snapshot, now);
       // A clean collect resets the consecutive-failure counter, restoring the strict seal-freshness gate.
       engine.store.setSetting(`collect_failures:${collector.platform}`, 0);
-      if (collector.platform === 'x') engine.store.setSetting('x:session_state', 'authenticated');
+      if (collector.platform === 'x') {
+        engine.store.setSetting('x:session_state', 'authenticated');
+        await engine.retractDeleted(snapshot, now);
+      }
     } catch (error) {
       // A shutdown aborts the in-flight collect; that is a clean stop, not a failure. Don't count it
       // and don't alert — it self-recovers on the next start.
