@@ -21,6 +21,9 @@ class PreviewPublisher implements Publisher {
     this.store.event('info', `[preview] ${this.destination} ${part.isFooter ? 'footer' : 'part'}: ${part.text.slice(0, 120)}`);
     return { id, url: `preview://${this.destination}/${encodeURIComponent(id)}` };
   }
+  async retract(ref: RemoteRef): Promise<void> {
+    this.store.event('info', `[preview] ${this.destination} delete: ${ref.id}`);
+  }
 }
 
 export type Runtime = ReturnType<typeof createRuntime>;
@@ -505,7 +508,7 @@ input[type=checkbox]{width:1.05rem;height:1.05rem;margin:0;accent-color:var(--ac
 <script>
 const L=${JSON.stringify(LABELS)};
 const PLATFORM=${JSON.stringify(PLATFORM_NAMES)};
-const KIND={publish:'發布',reminder:'X 提醒',ops:'待決通知'};
+const KIND={publish:'發布',reminder:'X 提醒',ops:'待決通知',retract:'刪除副本'};
 const SESSION={authenticated:['X 已登入','ok'],error:['X 登入失效','err'],unknown:['X 登入未確認',''],disabled:['X 讀取未啟用','']};
 const TONE={succeeded:'ok',sealed:'ok',ready:'ok',manual_mirror:'ok',mirror:'ok',open:'info',collecting:'info',pending:'info',running:'info',review:'warn',mirror_review:'warn',failed:'err',unknown:'err',unsupported:'err'};
 const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄'};

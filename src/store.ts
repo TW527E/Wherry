@@ -40,6 +40,9 @@ export class Store {
     if (!this.db.prepare('PRAGMA table_info(mirrors)').all().some(row => row.name === 'matched_x_id')) {
       this.db.prepare('ALTER TABLE mirrors ADD COLUMN matched_x_id TEXT').run();
     }
+    if (!this.db.prepare('PRAGMA table_info(posts)').all().some(row => row.name === 'checked_at')) {
+      this.db.prepare('ALTER TABLE posts ADD COLUMN checked_at TEXT').run();
+    }
     if (!this.db.prepare('PRAGMA table_info(reminders)').all().some(row => row.name === 'revision')) {
       this.transaction(() => {
         this.db.prepare('ALTER TABLE reminders RENAME TO reminders_legacy').run();
@@ -147,7 +150,7 @@ export class Store {
   }
   static postKey(platform: SourcePlatform, id: string): string { return `${platform}:${id}`; }
   addPost(post: SourcePost, classification: Classification, reason: string, now: string, batchId?: string): boolean {
-    return Number(this.db.prepare('INSERT OR IGNORE INTO posts VALUES(?,?,?,?,?,?,?,?)').run(Store.postKey(post.platform, post.id), post.platform, post.id, JSON.stringify(post), classification, reason, batchId || null, now).changes) > 0;
+    return Number(this.db.prepare('INSERT OR IGNORE INTO posts(key,platform,external_id,payload,classification,reason,batch_id,first_seen_at) VALUES(?,?,?,?,?,?,?,?)').run(Store.postKey(post.platform, post.id), post.platform, post.id, JSON.stringify(post), classification, reason, batchId || null, now).changes) > 0;
   }
   private postRow(row: Row): StoredPost {
     return { key: String(row.key), post: decode<SourcePost>(row.payload), classification: row.classification as Classification,
@@ -164,6 +167,18 @@ export class Store {
   updatePost(key: string, classification: Classification, reason: string): void {
     this.db.prepare('UPDATE posts SET classification=?,reason=? WHERE key=?').run(classification, reason, key);
   }
+  /**
+   * Synced X posts due for a deletion check, young ones most often: a post is due once a tenth of its
+   * age has passed since its last check (at least 5 minutes), for 30 days after it was first seen.
+   */
+  xPostsToRecheck(now: string, limit = 5): StoredPost[] {
+    const t = Date.parse(now);
+    return this.db.prepare("SELECT * FROM posts WHERE platform='x' AND classification='ready' AND first_seen_at>=? ORDER BY checked_at IS NOT NULL, checked_at")
+      .all(new Date(t - 30 * 86400_000).toISOString()).map(row => ({ checked: row.checked_at ? Date.parse(String(row.checked_at)) : undefined, stored: this.postRow(row) }))
+      .filter(({ checked, stored }) => checked === undefined || t - checked >= Math.max(5 * 60_000, (t - Date.parse(stored.post.createdAt)) / 10))
+      .slice(0, limit).map(({ stored }) => stored);
+  }
+  markChecked(key: string, now: string): void { this.db.prepare('UPDATE posts SET checked_at=? WHERE key=?').run(now, key); }
   posts(limit = 100): StoredPost[] { return this.db.prepare('SELECT * FROM posts ORDER BY first_seen_at DESC, key DESC LIMIT ?').all(limit).map(r => this.postRow(r)); }
   batchPosts(id: string): StoredPost[] {
     return this.db.prepare('SELECT * FROM posts WHERE batch_id=?').all(id).map(r => this.postRow(r)).sort((a, b) => a.post.createdAt.localeCompare(b.post.createdAt) || a.post.id.localeCompare(b.post.id));
@@ -296,6 +311,13 @@ export class Store {
       .get(aggregateId, destination, key);
     return row ? decode<RemoteRef>(row.result) : undefined;
   }
+  /** Every downstream copy still standing of one source post (its parts, plus the footer for a thread root). */
+  deliveredCopies(sourcePostId: string, destination?: Destination): Array<{ jobId: string; key: string; destination: Destination; ref: RemoteRef }> {
+    return this.db.prepare("SELECT s.job_id,s.step_key,j.destination,s.result FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.kind='publish' AND s.state='succeeded' AND s.result IS NOT NULL AND json_extract(s.content,'$.sourcePostId')=? AND (? IS NULL OR j.destination=?)")
+      .all(sourcePostId, destination ?? null, destination ?? null)
+      .map(row => ({ jobId: String(row.job_id), key: String(row.step_key), destination: row.destination as Destination, ref: decode<RemoteRef>(row.result) }));
+  }
+  retractStep(jobId: string, key: string): void { this.db.prepare("UPDATE steps SET state='retracted' WHERE job_id=? AND step_key=?").run(jobId, key); }
   finishStep(jobId: string, key: string, ref: RemoteRef): void { this.db.prepare("UPDATE steps SET state='succeeded',result=? WHERE job_id=? AND step_key=?").run(JSON.stringify(ref), jobId, key); }
   rejectStep(jobId: string, key: string): void { this.db.prepare("UPDATE steps SET state='rejected' WHERE job_id=? AND step_key=?").run(jobId, key); }
   /** Reconciliation: discard the uncertain (started-but-unconfirmed) steps of a job so a retry re-runs

@@ -26,10 +26,10 @@ const snapshot = (posts: SourcePost[], fetchedAt: string, platform: 'x' | 'blues
   ({ platform, accountId, posts: posts.map(p => ({ ...p, platform })), fetchedAt, complete: true, warnings: [] });
 
 /** A sealed three-part batch: root, a self reply, and the trailing X source link. */
-function sealedBatch() {
+function sealedBatch(net: Transport = transport) {
   const cfg = config();
   const store = new Store(':memory:');
-  const engine = new Engine(store, cfg, transport);
+  const engine = new Engine(store, cfg, net);
   engine.ingest(snapshot([], at(-1000)), at(-1000));
   engine.ingest(snapshot([], at(0), 'bluesky', 'bluesky-account'), at(0));
   engine.ingest(snapshot([
@@ -94,6 +94,37 @@ test('a retry after a partial failure never repeats an already delivered part', 
   assert.deepEqual(publisher.calls, [expectedKeys[0], expectedKeys[1], expectedKeys[1], expectedKeys[2]]);
   const keys = publisher.calls;
   assert.equal(new Set(keys).size, 3, 'each part key is published at most once per successful step');
+});
+
+test('a post deleted on X is removed downstream, but only while a live post still reads as existing', async () => {
+  const gone = new Set<string>(); let endpointUp = false;
+  const embed: Transport = { async request(url) {
+    const id = new URL(url).searchParams.get('id')!;
+    return endpointUp && !gone.has(id) ? { status: 200, headers: {}, body: Buffer.from(JSON.stringify({ id_str: id })) } : { status: 404, headers: {}, body: new Uint8Array() };
+  } };
+  const { store, engine } = sealedBatch(embed);
+  const retracted: string[] = [];
+  const publisher = Object.assign(new RecordingPublisher('bluesky', () => undefined), { async retract(ref: RemoteRef) { retracted.push(ref.id); } });
+  const worker = new Worker(engine, new Map<Destination, Publisher>([['bluesky', publisher]]));
+  await worker.run(at(950));
+  const live = snapshot([post({ id: '11', createdAt: at(60), replyToId: '10', replyToAuthorId: 'owner' })], at(2000));
+
+  gone.add('10');
+  assert.equal(await engine.retractDeleted(live, at(2000)), 0, 'an endpoint that cannot see a live post proves nothing');
+  assert.equal(store.getPost('x', '10')?.classification, 'ready');
+
+  endpointUp = true;
+  const copies = store.deliveredCopies('10').map(copy => copy.ref.id).sort();
+  assert.equal(copies.length, 2, 'the root part and the footer that links to it');
+  assert.equal(await engine.retractDeleted(live, at(2000)), 1);
+  assert.equal(store.getPost('x', '10')?.classification, 'deleted');
+  assert.equal(store.getPost('x', '11')?.classification, 'ready');
+  await worker.run(at(2001));
+  assert.deepEqual(retracted.sort(), copies);
+  assert.equal(store.deliveredCopies('10').length, 0);
+  assert.equal(store.deliveredCopies('11').length, 1, 'the surviving reply stays');
+  const job = store.jobs(10).find(j => j.kind === 'publish')!;
+  assert.ok(!(await engine.parts(job)).some(part => part.sourcePostId === '10' && !part.isFooter), 'a deleted post is never sent again');
 });
 
 test('an uncertain transport outcome is parked for reconciliation instead of being retried', async () => {

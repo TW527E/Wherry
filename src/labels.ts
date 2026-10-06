@@ -8,7 +8,7 @@ export const LABELS: Record<string, string> = {
   open: '收集串文中', sealed: '已封存', review: '等你決定', mirror: '手動鏡像', ignored: '不同步',
   pending: '等待發送', running: '發送中', succeeded: '已送達', failed: '失敗', unknown: '結果不明', cancelled: '已取消',
   // Post classifications
-  baseline: '基準快照', collecting: '收集中', ready: '會同步', manual_mirror: '手動鏡像', mirror_review: '待確認', unsupported: '不支援',
+  baseline: '基準快照', collecting: '收集中', ready: '會同步', manual_mirror: '手動鏡像', mirror_review: '待確認', unsupported: '不支援', deleted: 'X 原文已刪除',
   // Reasons
   // No longer produced (GIFs now sync as video); kept so posts held under it before still read in zh-Hant.
   animated_video_not_supported: 'GIF 動畫不支援',
@@ -56,6 +56,7 @@ export const LABELS: Record<string, string> = {
   video_must_be_the_only_attachment: '影片不能與其他附件混用',
   video_poster_repaired: '原本把影片封面誤判成圖片，已修正，可以發布',
   video_sync_disabled: '影片同步未啟用',
+  x_post_deleted: 'X 原文已刪除，其他平台的副本也會刪除',
   x_video_has_no_downloadable_source: '影片沒有可下載的來源',
 };
 
@@ -81,6 +82,11 @@ const EVENTS: Array<[RegExp, (...m: string[]) => string]> = [
   [/^(\w+): (\d+) new records from (\d+) collected( \(baseline only\))?; newest=\S+ baseline=\S+(?: — ([\s\S]*))?$/,
     (p, added, seen, base, warn) => `${P(p)}：讀到 ${seen} 則，${base ? '首次掃描，只建立基準' : added === '0' ? '沒有新貼文' : `新增 ${added} 則`}${warn ? `；警告：${warn}` : ''}`],
   [/^(\w+): delivered (\d+) parts$/, (d, n) => `${P(d)}：已送出 ${n} 則`],
+  [/^\[preview\] (\w+) delete: /, d => `預覽：本來會刪除 ${P(d)} 上的副本`],
+  [/^X post (\d+) was deleted; removing its copies from (.+)$/, (id, list) => `X 原文 ${id} 已刪除，${list.startsWith('nowhere') ? '還沒同步出去，不會再發' : `正在刪除 ${list.split(', ').map(P).join('、')} 上的副本`}`],
+  [/^(\w+): removed the copies of a post deleted on X$/, d => `${P(d)}：已刪除 X 原文已刪的副本`],
+  [/^(\w+): could not remove a copy of a post deleted on X: ([\s\S]*)$/, (d, e) => `${P(d)}：X 原文已刪，但副本刪不掉（Telegram 超過 48 小時只能手動刪）：${e}`],
+  [/^X deletion check skipped/, () => '這次沒檢查 X 原文是否被刪：嵌入端點連一則確定存在的貼文都查不到'],
   [/^(\w+) collection failed: ([\s\S]*)$/, (p, e) => `讀取 ${P(p)} 失敗：${e}`],
   [/^Service started in (\w+) mode on \S+$/, m => `服務已啟動（${m === 'live' ? '正式模式' : '預覽模式'}）`],
   [/^Service cycle failed: ([\s\S]*)$/, e => `定期檢查失敗：${e}`],
