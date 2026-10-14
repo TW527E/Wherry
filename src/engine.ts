@@ -11,7 +11,7 @@ import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
 import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
-import { xPostExists } from './platforms/x.js';
+import { xPostState } from './platforms/x.js';
 import type { Attachment, Batch, Collector, Destination, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
 
 // Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
@@ -462,23 +462,26 @@ export class Engine {
    * xPostsToRecheck for how often). A post found gone is marked deleted and every downstream copy is
    * queued for removal. "Gone" is only trusted while a post this very scan saw live on the timeline
    * still reads as existing, so a broken endpoint, a rate limit or a locked account deletes nothing.
+   * An edit on X is a new tweet that syncs on its own; the old version it supersedes is removed the
+   * same way, so the copies downstream end up showing only the edited text.
    */
   async retractDeleted(snapshot: SourceSnapshot, now: string = new Date().toISOString()): Promise<number> {
     const due = this.store.xPostsToRecheck(now);
     if (!due.length) return 0;
     const live = snapshot.posts.filter(post => !post.repost).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
-    if (!live || await xPostExists(this.transport, live.id) !== true) {
+    const liveState = live && await xPostState(this.transport, live.id);
+    if (!liveState || liveState.state === 'gone') {
       this.store.event('warn', 'X deletion check skipped: the embed endpoint did not confirm a post that is live on the timeline');
       return 0;
     }
     let deleted = 0;
     for (const member of due) {
-      const exists = await xPostExists(this.transport, member.post.id);
-      if (exists === undefined) continue;
+      const result = await xPostState(this.transport, member.post.id);
+      if (!result) continue;
       this.store.markChecked(member.key, now);
-      if (exists) continue;
+      if (result.state === 'live') continue;
       this.store.transaction(() => {
-        this.store.updatePost(member.key, 'deleted', 'x_post_deleted');
+        this.store.updatePost(member.key, 'deleted', result.state === 'edited' ? 'x_post_edited' : 'x_post_deleted');
         const destinations = [...new Set(this.store.deliveredCopies(member.post.id).map(copy => copy.destination))];
         for (const destination of destinations) this.store.enqueue('retract', member.key, destination, now);
         // Nothing left to publish: stop a delivery that has not gone out (or failed) from ever running.
@@ -487,7 +490,8 @@ export class Engine {
             if (job.kind === 'publish' && ['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'x_post_deleted');
           }
         }
-        this.store.event('info', `X post ${member.post.id} was deleted; removing its copies from ${destinations.join(', ') || 'nowhere (none delivered)'}`, member.key);
+        const what = result.state === 'edited' ? `was edited (now ${result.latestId})` : 'was deleted';
+        this.store.event('info', `X post ${member.post.id} ${what}; removing its copies from ${destinations.join(', ') || 'nowhere (none delivered)'}`, member.key);
       });
       deleted++;
     }

@@ -77,18 +77,25 @@ function syndicationRequest(transport: Transport, tweetId: string): Promise<Http
 }
 
 /**
- * Whether a tweet still exists, per the embed endpoint: false only on its "not found" (HTTP 404 or an
- * empty object). A tombstone is NOT gone — the endpoint also serves one for live age-restricted posts.
+ * A tweet's state per the embed endpoint: 'gone' only on its "not found" (HTTP 404 or an empty object).
+ * A tombstone is NOT gone — the endpoint also serves one for live age-restricted posts. An edit on X
+ * makes a new tweet and leaves the old one readable, listing every version's id in
+ * `edit_control.edit_tweet_ids`; a tweet with a newer version there is 'edited' (superseded).
  * Undefined when it cannot tell (network, rate limit, unexpected body).
  */
-export async function xPostExists(transport: Transport, tweetId: string): Promise<boolean | undefined> {
+export async function xPostState(transport: Transport, tweetId: string): Promise<{ state: 'live' | 'gone' } | { state: 'edited'; latestId: string } | undefined> {
   try {
     const response = await syndicationRequest(transport, tweetId);
-    if (response.status === 404) return false;
+    if (response.status === 404) return { state: 'gone' };
     if (response.status !== 200) return undefined;
     const payload = object(JSON.parse(Buffer.from(response.body).toString('utf8')));
-    if (payload && !Object.keys(payload).length) return false;
-    return payload?.id_str === tweetId ? true : undefined;
+    if (payload && !Object.keys(payload).length) return { state: 'gone' };
+    if (payload?.id_str !== tweetId) return undefined;
+    const versions = object(payload.edit_control)?.edit_tweet_ids;
+    // Tweet ids are time-ordered snowflakes, so the largest id is the newest version.
+    const latestId = Array.isArray(versions) ? versions.filter((id): id is string => typeof id === 'string' && /^\d+$/.test(id))
+      .reduce((a, b) => (BigInt(b) > BigInt(a) ? b : a), tweetId) : tweetId;
+    return latestId === tweetId ? { state: 'live' } : { state: 'edited', latestId };
   } catch { return undefined; }
 }
 
