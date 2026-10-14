@@ -127,6 +127,29 @@ test('a post deleted on X is removed downstream, but only while a live post stil
   assert.ok(!(await engine.parts(job)).some(part => part.sourcePostId === '10' && !part.isFooter), 'a deleted post is never sent again');
 });
 
+test('a post edited on X has the copies of its old version removed', async () => {
+  // X keeps an edited tweet's old version readable and lists every version in edit_control.
+  const embed: Transport = { async request(url) {
+    const id = new URL(url).searchParams.get('id')!;
+    const body = id === '10' ? { id_str: '10', edit_control: { edit_tweet_ids: ['10', '12'] } } : { id_str: id };
+    return { status: 200, headers: {}, body: Buffer.from(JSON.stringify(body)) };
+  } };
+  const { store, engine } = sealedBatch(embed);
+  const retracted: string[] = [];
+  const publisher = Object.assign(new RecordingPublisher('bluesky', () => undefined), { async retract(ref: RemoteRef) { retracted.push(ref.id); } });
+  const worker = new Worker(engine, new Map<Destination, Publisher>([['bluesky', publisher]]));
+  await worker.run(at(950));
+  const copies = store.deliveredCopies('10').map(copy => copy.ref.id).sort();
+  const live = snapshot([post({ id: '12', createdAt: at(1500) })], at(2000));
+
+  assert.equal(await engine.retractDeleted(live, at(2000)), 1);
+  assert.equal(store.getPost('x', '10')?.classification, 'deleted');
+  assert.equal(store.getPost('x', '10')?.reason, 'x_post_edited');
+  assert.equal(store.getPost('x', '11')?.classification, 'ready', 'an unedited post stays');
+  await worker.run(at(2001));
+  assert.deepEqual(retracted.sort(), copies);
+});
+
 test('an uncertain transport outcome is parked for reconciliation instead of being retried', async () => {
   const { store, engine } = sealedBatch();
   const publisher = new RecordingPublisher('bluesky', () => { throw Object.assign(new Error('socket closed after send'), { uncertain: true }); });
