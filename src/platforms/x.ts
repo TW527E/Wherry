@@ -3,7 +3,7 @@ import { load } from 'cheerio';
 import type { AnyNode } from 'domhandler';
 import type { AppConfig } from '../config.js';
 import { mapMentionText, type MentionText } from '../mentions.js';
-import type { Attachment, Collector, PollSnapshot, SourcePost, SourceSnapshot, TextMention, Transport } from '../types.js';
+import type { Attachment, Collector, HttpResponse, PollSnapshot, SourcePost, SourceSnapshot, TextMention, Transport } from '../types.js';
 import { parseXPoll, X_POLL_SELECTOR } from './x-poll.js';
 import { isVideoPoster } from '../text.js';
 import { object, positiveInteger } from './parse.js';
@@ -69,6 +69,34 @@ const SYNDICATION_ENDPOINT = 'https://cdn.syndication.twimg.com/tweet-result';
 /** The token the embed endpoint expects: base36 of the tweet id scaled by pi, with 0s and the dot cut. */
 export function syndicationToken(id: string): string {
   return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+function syndicationRequest(transport: Transport, tweetId: string): Promise<HttpResponse> {
+  const query = new URLSearchParams({ id: tweetId, token: syndicationToken(tweetId), lang: 'en' });
+  return transport.request(`${SYNDICATION_ENDPOINT}?${query}`, { method: 'GET', timeoutMs: 10_000, maxBytes: 512_000 });
+}
+
+/**
+ * A tweet's state per the embed endpoint: 'gone' only on its "not found" (HTTP 404 or an empty object).
+ * A tombstone is NOT gone — the endpoint also serves one for live age-restricted posts. An edit on X
+ * makes a new tweet and leaves the old one readable, listing every version's id in
+ * `edit_control.edit_tweet_ids`; a tweet with a newer version there is 'edited' (superseded).
+ * Undefined when it cannot tell (network, rate limit, unexpected body).
+ */
+export async function xPostState(transport: Transport, tweetId: string): Promise<{ state: 'live' | 'gone' } | { state: 'edited'; latestId: string } | undefined> {
+  try {
+    const response = await syndicationRequest(transport, tweetId);
+    if (response.status === 404) return { state: 'gone' };
+    if (response.status !== 200) return undefined;
+    const payload = object(JSON.parse(Buffer.from(response.body).toString('utf8')));
+    if (payload && !Object.keys(payload).length) return { state: 'gone' };
+    if (payload?.id_str !== tweetId) return undefined;
+    const versions = object(payload.edit_control)?.edit_tweet_ids;
+    // Tweet ids are time-ordered snowflakes, so the largest id is the newest version.
+    const latestId = Array.isArray(versions) ? versions.filter((id): id is string => typeof id === 'string' && /^\d+$/.test(id))
+      .reduce((a, b) => (BigInt(b) > BigInt(a) ? b : a), tweetId) : tweetId;
+    return latestId === tweetId ? { state: 'live' } : { state: 'edited', latestId };
+  } catch { return undefined; }
 }
 
 /**
@@ -333,8 +361,7 @@ export class XCollector implements Collector {
   /** The embed endpoint's view of one tweet; every failure is undefined. */
   private async syndication(tweetId: string): Promise<unknown> {
     try {
-      const query = new URLSearchParams({ id: tweetId, token: syndicationToken(tweetId), lang: 'en' });
-      const response = await this.transport!.request(`${SYNDICATION_ENDPOINT}?${query}`, { method: 'GET', timeoutMs: 10_000, maxBytes: 512_000 });
+      const response = await syndicationRequest(this.transport!, tweetId);
       return response.status === 200 ? JSON.parse(Buffer.from(response.body).toString('utf8')) : undefined;
     } catch { return undefined; }
   }

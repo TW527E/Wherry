@@ -517,6 +517,13 @@ export class BlueskyClient implements Publisher, Collector {
     }
   }
 
+  async retract(ref: RemoteRef): Promise<void> {
+    const target = parseUri(ref.uri ?? ref.id);
+    if (!target) throw new PlatformError('Not a Bluesky post reference', { code: 'InvalidReference' });
+    // Deleting a record that is already gone succeeds, so a retry after a lost response is harmless.
+    await this.authenticated('com.atproto.repo.deleteRecord', jsonBody({ repo: target.did, collection, rkey: target.key }), 'Bluesky post deletion', false);
+  }
+
   async collect(since?: string): Promise<SourceSnapshot> {
     const fetchedAt = this.now().toISOString();
     const warnings: string[] = [];

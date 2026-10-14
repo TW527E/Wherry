@@ -1,7 +1,7 @@
 export type SourcePlatform = 'x' | 'bluesky' | 'sharkey' | 'local';
 export type Destination = 'bluesky' | 'sharkey' | 'telegram';
 export type SensitiveLabel = 'porn' | 'sexual' | 'nudity' | 'graphic-media';
-export type Classification = 'baseline' | 'collecting' | 'ready' | 'manual_mirror' | 'mirror_review' | 'ignored' | 'unsupported';
+export type Classification = 'baseline' | 'collecting' | 'ready' | 'manual_mirror' | 'mirror_review' | 'ignored' | 'unsupported' | 'deleted';
 export type JobState = 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'review' | 'cancelled';
 
 export interface Attachment {
@@ -167,6 +167,8 @@ export interface PublishContext {
 export interface Publisher {
   readonly destination: Destination;
   publish(part: PublishPart, context: PublishContext): Promise<RemoteRef>;
+  /** Delete a copy this publisher made; one already gone counts as deleted. */
+  retract?(ref: RemoteRef): Promise<void>;
 }
 
 export interface Collector {
@@ -203,7 +205,7 @@ export interface Transport {
 
 export interface Job {
   id: string;
-  kind: 'publish' | 'reminder' | 'ops';
+  kind: 'publish' | 'reminder' | 'ops' | 'retract';
   aggregateId: string;
   destination: Destination;
   state: JobState;

@@ -154,6 +154,13 @@ export class TelegramClient implements Publisher {
    * then a plain GET fetches the bytes from the file endpoint. Capped so a stray large upload
    * cannot exhaust memory. The bot token is in the URL, so this stays on the SafeHttp transport.
    */
+  /** Telegram lets a bot delete its messages for 48 hours; past that this fails and the owner deletes by hand. */
+  async retract(ref: RemoteRef): Promise<void> {
+    if (!ref.chatId || !ref.messageIds?.length) throw new PlatformError('Not a Telegram message reference', { code: 'InvalidReference' });
+    for (const id of ref.messageIds) {
+      await this.deleteMessage(ref.chatId, id).catch(error => { if (!/message to delete not found/i.test(String(object(error)?.message))) throw error; });
+    }
+  }
   async downloadFile(fileId: string, maxBytes: number): Promise<Uint8Array> {
     const meta = await this.call<{ file_path?: string; file_size?: number }>('getFile', { file_id: fileId });
     if (!meta.file_path) throw new Error('Telegram getFile returned no file_path');
