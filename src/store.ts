@@ -167,16 +167,31 @@ export class Store {
   updatePost(key: string, classification: Classification, reason: string): void {
     this.db.prepare('UPDATE posts SET classification=?,reason=? WHERE key=?').run(classification, reason, key);
   }
-  /**
-   * Synced X posts due for a deletion check, young ones most often: a post is due once a tenth of its
-   * age has passed since its last check (at least 5 minutes), for 30 days after it was first seen.
-   */
+  telegramPostsToRecheck(now: string): StoredPost[] {
+    const t = Date.parse(now);
+    // Each Telegram part gets a final check from hour 47, ahead of the normal five-post quota.
+    return this.db.prepare(`SELECT p.* FROM steps s JOIN jobs j ON j.id=s.job_id
+      JOIN posts p ON p.platform='x' AND p.external_id=json_extract(s.content,'$.sourcePostId')
+      WHERE p.classification='ready' AND j.kind='publish' AND j.destination='telegram'
+      AND s.state='succeeded' AND s.result IS NOT NULL
+      AND json_array_length(json_extract(s.result,'$.messageIds'))>0
+      AND COALESCE(json_extract(s.result,'$.sentAt'),s.started_at)<=?
+      AND COALESCE(json_extract(s.result,'$.sentAt'),s.started_at)>?
+      AND (p.checked_at IS NULL OR julianday(p.checked_at)<julianday(COALESCE(json_extract(s.result,'$.sentAt'),s.started_at))+47.0/24)
+      GROUP BY p.key ORDER BY MIN(COALESCE(json_extract(s.result,'$.sentAt'),s.started_at))`)
+      .all(new Date(t - 47 * 3600_000).toISOString(), new Date(t - 48 * 3600_000).toISOString()).map(row => this.postRow(row));
+  }
+  /** Normal checks back off with source age for 30 days; Telegram deadlines take priority. */
   xPostsToRecheck(now: string, limit = 5): StoredPost[] {
     const t = Date.parse(now);
-    return this.db.prepare("SELECT * FROM posts WHERE platform='x' AND classification='ready' AND first_seen_at>=? ORDER BY checked_at IS NOT NULL, checked_at")
+    const urgent = this.telegramPostsToRecheck(now);
+    const urgentKeys = new Set(urgent.map(post => post.key));
+    const regular = this.db.prepare("SELECT * FROM posts WHERE platform='x' AND classification='ready' AND first_seen_at>=? ORDER BY checked_at IS NOT NULL, checked_at")
       .all(new Date(t - 30 * 86400_000).toISOString()).map(row => ({ checked: row.checked_at ? Date.parse(String(row.checked_at)) : undefined, stored: this.postRow(row) }))
+      .filter(({ stored }) => !urgentKeys.has(stored.key))
       .filter(({ checked, stored }) => checked === undefined || t - checked >= Math.max(5 * 60_000, (t - Date.parse(stored.post.createdAt)) / 10))
       .slice(0, limit).map(({ stored }) => stored);
+    return [...urgent, ...regular];
   }
   markChecked(key: string, now: string): void { this.db.prepare('UPDATE posts SET checked_at=? WHERE key=?').run(now, key); }
   posts(limit = 100): StoredPost[] { return this.db.prepare('SELECT * FROM posts ORDER BY first_seen_at DESC, key DESC LIMIT ?').all(limit).map(r => this.postRow(r)); }
@@ -290,7 +305,10 @@ export class Store {
   jobsForAggregate(id: string): Job[] { return this.db.prepare('SELECT * FROM jobs WHERE aggregate_id=?').all(id).map(r => this.jobRow(r)); }
   hasDeliveryEvidence(jobId: string): boolean { return Boolean(this.db.prepare("SELECT 1 FROM steps WHERE job_id=? AND state IN ('started','succeeded') LIMIT 1").get(jobId)); }
   jobs(limit = 100): Job[] { return this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit).map(r => this.jobRow(r)); }
-  dueJobs(now: string): Job[] { return this.db.prepare("SELECT * FROM jobs WHERE state='pending' AND due_at<=? ORDER BY due_at,created_at LIMIT 20").all(now).map(r => this.jobRow(r)); }
+  telegramDeletionFailures(): Job[] {
+    return this.db.prepare("SELECT * FROM jobs WHERE kind='retract' AND destination='telegram' AND state IN ('failed','review','unknown') ORDER BY created_at").all().map(row => this.jobRow(row));
+  }
+  dueJobs(now: string): Job[] { return this.db.prepare("SELECT * FROM jobs WHERE state='pending' AND due_at<=? ORDER BY kind='retract' DESC,due_at,created_at LIMIT 20").all(now).map(r => this.jobRow(r)); }
   claimJob(id: string): boolean { return Number(this.db.prepare("UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=? AND state='pending'").run(id).changes) === 1; }
   updateJob(id: string, state: JobState, error?: string, dueAt?: string): void {
     this.db.prepare('UPDATE jobs SET state=?,error=?,due_at=COALESCE(?,due_at) WHERE id=?').run(state, error || null, dueAt || null, id);

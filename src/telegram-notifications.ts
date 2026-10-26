@@ -3,9 +3,18 @@ import { Engine, Worker, safeError } from './engine.js';
 import { Store } from './store.js';
 import { readableEvent } from './labels.js';
 import { TelegramClient, type TelegramCallbackQuery, type TelegramUpdateMessage } from './platforms/telegram.js';
-import type { Reminder, ReviewNotice } from './types.js';
+import type { InlineButton, Job, Reminder, ReviewNotice } from './types.js';
 
 export interface ReminderContext { config: AppConfig; telegram: TelegramClient; store: Store; engine: Engine; worker: Worker }
+
+export function deletionButtons(job: Job): InlineButton[] {
+  return [{ text: '重試', data: `del:r:${job.id}` }, { text: '取消', data: `del:c:${job.id}` }, { text: '我已手動刪除', data: `del:d:${job.id}` }];
+}
+
+export function deletionNotice(job: Job, engine: Engine): string {
+  const links = engine.telegramDeletionLinks(job);
+  return `Telegram 副本刪除失敗\n${job.aggregateId}\n${job.error ?? ''}\n\n${links.length ? links.join('\n') : '此聊天不支援訊息連結，請到 Telegram 聊天中查看。'}\n\n請手動刪除以上所有訊息後，再按「我已手動刪除」。取消只會停止重試，會保留 Telegram 訊息。`;
+}
 
 /** When to retry a failed Telegram call: the server's retry_after, but never sooner than a minute. */
 const retryAt = (error: unknown): string =>
@@ -60,6 +69,23 @@ export async function handleCallback(query: TelegramCallbackQuery, context: Remi
     await telegram.answerCallbackQuery(query.id, '僅限擁有者操作'); return;
   }
   const data = query.data ?? '';
+  if (data.startsWith('del:')) {
+    const match = data.match(/^del:([rcd]):([A-Za-z0-9_-]{1,48})$/);
+    const job = match && store.getJob(match[2]!);
+    if (!job || job.kind !== 'retract' || job.destination !== 'telegram' || !['failed', 'review', 'unknown'].includes(job.state)) {
+      await telegram.answerCallbackQuery(query.id, '這個刪除工作已處理或無法使用'); return;
+    }
+    try {
+      const action = match![1] === 'r' ? 'retry' : match![1] === 'c' ? 'cancel' : 'deleted';
+      engine.action(action, job.id);
+      if (action === 'retry') void worker.run().catch(() => undefined);
+      const status = action === 'deleted' ? '已記錄手動刪除，工作已完成' : action === 'cancel' ? '已取消重試，Telegram 訊息仍會保留' : '已排入重試，結果請看 /pending 或 /status';
+      await telegram.answerCallbackQuery(query.id, status);
+      await telegram.editMessageText(String(query.message.chat.id), query.message.message_id, `${status}\n${job.aggregateId}`)
+        .catch(error => store.event('warn', `Telegram deletion notice update failed: ${safeError(error)}`, job.id));
+    } catch (error) { await telegram.answerCallbackQuery(query.id, `操作失敗：${safeError(error)}`.slice(0, 190)); }
+    return;
+  }
   if (data.startsWith('rev:')) {
     const notice = store.getReviewNotice(query.message.message_id, String(query.message.chat.id));
     // Old messages included the batch ID; the stored message mapping remains authoritative.
@@ -201,7 +227,15 @@ export class TelegramNotifications {
       return safeError(new Error(text));
     };
     try {
-      await telegram.sendPlain(`⚠️ Wherry 錯誤（${errors.length}）\n\n${errors.map(error => `${error.at}\n${redact(readableEvent(error.message) ?? error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, 'private');
+      const ordinary = [];
+      for (const error of errors) {
+        const job = error.entityId ? store.getJob(error.entityId) : undefined;
+        if (job?.kind === 'retract' && job.destination === 'telegram' && ['failed', 'review', 'unknown'].includes(job.state)) {
+          // Links come from saved message receipts, after error redaction has removed arbitrary URLs.
+          await telegram.sendPlain(deletionNotice({ ...job, error: redact(job.error ?? '') }, this.context.engine), 'private', deletionButtons(job));
+        } else ordinary.push(error);
+      }
+      if (ordinary.length) await telegram.sendPlain(`⚠️ Wherry 錯誤（${ordinary.length}）\n\n${ordinary.map(error => `${error.at}\n${redact(readableEvent(error.message) ?? error.message)}${error.entityId ? `\n任務：${redact(error.entityId)}` : ''}`).join('\n\n')}`, 'private');
       store.setSetting('telegram:error_offset', errors.at(-1)!.id);
       store.setSetting('telegram:error_retry_at', '');
     } catch (error) {

@@ -150,6 +150,8 @@ export interface PublishPart {
 
 export interface RemoteRef {
   id: string;
+  /** Telegram delivery time; older receipts fall back to the durable step's start time. */
+  sentAt?: string;
   uri?: string;
   cid?: string;
   url?: string;
