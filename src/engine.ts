@@ -12,6 +12,7 @@ import { renderXMentions, sliceMentions, validTextMentions, type MentionText } f
 import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
 import { xPostState } from './platforms/x.js';
+import { telegramMessageLinks } from './platforms/telegram.js';
 import type { Attachment, Batch, Collector, Destination, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
 
 // Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
@@ -557,14 +558,32 @@ export class Engine {
     return { alreadyDelivered };
   }
 
-  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | 'cancel', id: string, now: string = new Date().toISOString()): void {
+  telegramDeletionLinks(job: Job): string[] {
+    if (job.kind !== 'retract' || job.destination !== 'telegram') return [];
+    return [...new Set(this.store.deliveredCopies(job.aggregateId.slice('x:'.length), 'telegram').flatMap(copy => telegramMessageLinks(copy.ref)))];
+  }
+
+  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | 'cancel' | 'deleted', id: string, now: string = new Date().toISOString()): void {
     // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
     // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
-    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile', 'cancel'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile|cancel');
+    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile', 'cancel', 'deleted'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile|cancel|deleted');
     if (typeof id !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(id)) throw new Error('id must be a plain identifier');
+    if (action === 'deleted') {
+      const job = this.store.getJob(id);
+      if (!job || job.kind !== 'retract' || job.destination !== 'telegram' || !['failed', 'review', 'unknown'].includes(job.state)) {
+        throw new Error('Only failed Telegram deletions can be confirmed as manually deleted');
+      }
+      this.store.transaction(() => {
+        for (const copy of this.store.deliveredCopies(job.aggregateId.slice('x:'.length), 'telegram')) this.store.retractStep(copy.jobId, copy.key);
+        this.store.updateJob(id, 'succeeded', 'owner_manually_deleted');
+        this.store.event('info', 'Owner confirmed the Telegram copies were manually deleted', id);
+      });
+      return;
+    }
     if (action === 'retry') {
       const job = this.store.getJob(id);
-      if (!job || !['failed', 'review'].includes(job.state)) throw new Error('Only explicitly failed/review jobs can retry; unknown deliveries require reconciliation');
+      const interruptedDeletion = job?.kind === 'retract' && job.destination === 'telegram' && job.state === 'unknown';
+      if (!job || (!['failed', 'review'].includes(job.state) && !interruptedDeletion)) throw new Error('Only failed/review jobs or interrupted Telegram deletions can retry; unknown deliveries require reconciliation');
       this.store.updateJob(id, 'pending', undefined, now); return;
     }
     if (action === 'cancel') {

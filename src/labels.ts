@@ -7,6 +7,7 @@ export const LABELS: Record<string, string> = {
   // Batch and job states
   open: '收集串文中', sealed: '已封存', review: '等你決定', mirror: '手動鏡像', ignored: '不同步',
   pending: '等待發送', running: '發送中', succeeded: '已送達', failed: '失敗', unknown: '結果不明', cancelled: '已取消',
+  retracted: '已刪除副本',
   // Post classifications
   baseline: '基準快照', collecting: '收集中', ready: '會同步', manual_mirror: '手動鏡像', mirror_review: '待確認', unsupported: '不支援', deleted: 'X 原文已刪除或編輯',
   // Reasons
@@ -35,6 +36,7 @@ export const LABELS: Record<string, string> = {
   outbound_possible: '疑似本程式同步的貼文（發送結果未確認）',
   owner_confirmed_new_content: '你已批准',
   owner_override: '你已手動處理',
+  owner_manually_deleted: '你已確認手動刪除 Telegram 副本',
   parent_author_unknown: '無法判斷回覆對象',
   poll_details_unavailable: '投票資料不完整',
   poll_not_supported: '此來源的投票不支援',
@@ -116,6 +118,7 @@ const EVENTS: Array<[RegExp, (...m: string[]) => string]> = [
   [/^Manual mirror registered after delivery started/, () => '發送開始後才登記手動鏡像；請檢查其他平台的貼文，程式不會自動刪除'],
   [/^Manual X mirror registered/, () => '已登記 X 手動鏡像，待發送的回傳已取消'],
   [/^Owner cancelled a job/, () => '你放棄了一個工作，不會再發送或重試'],
+  [/^Owner confirmed the Telegram copies were manually deleted$/, () => '你已確認手動刪除 Telegram 副本，工作已完成'],
   [/^Owner reconciled an unknown delivery/, () => '你確認了結果不明的發送，未確認的部分會重新發送'],
   [/^Owner action: (\w+)$/, a => `你的操作：${ACTIONS[a] ?? a}`],
   [/^No publisher configured for (\w+)$/, d => `${P(d)} 沒有設定發布器`],

@@ -7,7 +7,7 @@ import { LABELS, PLATFORM_NAMES, describe, readableEvent } from './labels.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
 import { TelegramClient, type TelegramUpdateMessage } from './platforms/telegram.js';
-import { extractXStatus, handleCallback, handleReminderReply, handleReviewReply, TelegramNotifications } from './telegram-notifications.js';
+import { deletionButtons, deletionNotice, extractXStatus, handleCallback, handleReminderReply, handleReviewReply, TelegramNotifications } from './telegram-notifications.js';
 import { SerialWork } from './lifecycle.js';
 import { XCollector, installSession } from './platforms/x.js';
 import { parseSessionFile, MAX_SESSION_BYTES } from './platforms/session.js';
@@ -159,6 +159,9 @@ export function createRuntime(config = loadConfig()) {
       timer.unref(); timers.add(timer);
     };
     every(config.pollSeconds * 1000, once);
+    if (live && telegram && config.x.enabled) every(60_000, async () => {
+      if (store.telegramPostsToRecheck(new Date().toISOString()).length) await once();
+    });
     if (live && telegram) every(15_000, () => notifications!.flush());
     if (live && telegram && config.telegram.pollCommands) {
       menu = telegram.setMyCommands(TELEGRAM_COMMANDS.map(c => ({ command: c.command, description: c.description })))
@@ -218,6 +221,7 @@ export const TELEGRAM_COMMANDS: Array<{ command: string; args?: string; descript
   { command: 'resync', args: '<jobId>', description: 'retry 別名：重試明確失敗的工作' },
   { command: 'reconcile', args: '<jobId>', description: '對帳後重試 unknown 工作（先自行確認遠端沒有重複貼文）' },
   { command: 'cancel', args: '<jobId>', description: '放棄發不出去的工作（不再發送或重試）' },
+  { command: 'deleted', args: '<jobId>', description: '確認已手動刪除失敗工作的所有 Telegram 副本' },
   { command: 'session', description: '更新 X 登入：接著上傳 x-session.json（或在檔案說明打 /session）' },
 ];
 
@@ -250,13 +254,13 @@ function statusText({ engine, store }: CommandContext): string {
     .map(state => [state, jobs.filter(j => j.state === state).length] as const).filter(([, n]) => n)
     .map(([state, n]) => `${LABELS[state]} ${n}`).join(' · ');
   const attention = jobs.filter(j => ATTENTION.has(j.state)).slice(0, 8).map(j =>
-    `• ${j.destination} ${j.aggregateId}：${LABELS[j.state]}${j.error ? `（${j.error.slice(0, 80)}）` : ''}\n  ${j.state === 'unknown' ? '/reconcile' : '/retry'} ${j.id}\n  /cancel ${j.id}`);
+    `• ${j.destination} ${j.aggregateId}：${LABELS[j.state]}${j.error ? `（${j.error.slice(0, 80)}）` : ''}\n  ${j.state === 'unknown' ? '/reconcile' : '/retry'} ${j.id}\n  /cancel ${j.id}${j.kind === 'retract' && j.destination === 'telegram' ? `\n  /deleted ${j.id}\n${engine.telegramDeletionLinks(j).join('\n')}` : ''}`);
   const events = store.events(8).map(e => `${e.level === 'error' ? '❌' : e.level === 'warn' ? '⚠️' : '•'} ${ago(e.at)}：${(readableEvent(e.message) ?? e.message).slice(0, 120)}`);
   return [
     '📊 Wherry 狀態',
     `模式：${config.mode === 'live' ? '正式（會發布）' : '預覽（不會發布）'}`,
     `X 登入：${SESSION_LABELS[store.setting<string>('x:session_state', config.x.enabled ? 'unknown' : 'disabled')] ?? '尚未確認'}`,
-    `待你決定：${heldBatches(engine).length} 批（/pending 查看）`,
+    `待你決定：${heldBatches(engine).length} 批、${store.telegramDeletionFailures().length} 筆 Telegram 刪除失敗（/pending 查看）`,
     `工作：${tally || '沒有進行中的工作'}`,
     ...(attention.length ? ['', '需要處理：', ...attention] : []),
     ...(events.length ? ['', '近期事件：', ...events] : []),
@@ -275,11 +279,13 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
     else if (command === '/pending') {
       const held = heldBatches(context.engine);
       const reminders = context.store.pendingReminders(context.engine.config.telegram.privateChatId);
+      const deletions = context.store.telegramDeletionFailures();
       const body = [
         ...held.map(b => `• ${b.id}｜${LABELS[b.state]}：${describe(b.reason)}${b.text ? `\n  ${Array.from(b.text).slice(0, 60).join('')}` : ''}\n  ${b.approvable ? `/approve ${b.id} · ` : ''}/skip ${b.id} · /mirror ${b.id}`),
         ...reminders.map(r => `• ${r.aggregateId}\n  X 提醒：${r.state}（請操作原提醒或 /mirror <id> <X_URL>）`),
       ].join('\n\n') || '目前沒有等待處理的批次或提醒。';
-      await context.telegram.sendPlain(`待處理批次（${held.length}）\n\n${body}`, 'private');
+      await context.telegram.sendPlain(`待處理（${held.length} 批、${deletions.length} 筆 Telegram 刪除失敗）\n\n${body}`, 'private');
+      for (const job of deletions) await context.telegram.sendPlain(deletionNotice(job, context.engine), 'private', deletionButtons(job));
     }
     else if (['/map', '/maps', '/unmap'].includes(command)) {
       let reply: string;
@@ -325,7 +331,8 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
     else if (['/retry', '/resync'].includes(command) && id) { context.engine.action('retry', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已排入重試 ${id}（背景執行）`, 'private'); }
     else if (command === '/reconcile' && id) { context.engine.action('reconcile', id); void context.worker.run().catch(() => undefined); await context.telegram.sendPlain(`已對帳並排入重新發送 ${id}（背景執行）。若剛才你在該平台看到已發出的貼文，請改用 /mirror 或 /skip，避免重複。`, 'private'); }
     else if (command === '/cancel' && id) { context.engine.action('cancel', id); await context.telegram.sendPlain(`已放棄 ${id}，不會再發送或重試。`, 'private'); }
-    else if (['/skip', '/mirror', '/approve', '/retry', '/resync', '/reconcile', '/cancel'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
+    else if (command === '/deleted' && id) { context.engine.action('deleted', id); await context.telegram.sendPlain(`已記錄 ${id} 的 Telegram 副本已手動刪除，工作已完成。`, 'private'); }
+    else if (['/skip', '/mirror', '/approve', '/retry', '/resync', '/reconcile', '/cancel', '/deleted'].includes(command)) await context.telegram.sendPlain(`${command} 需要一個 ID。例如：${command} <id>。用 /pending 查看待處理批次。`, 'private');
     else await context.telegram.sendPlain('未知指令。\n\n' + helpText(), 'private');
   } catch (error) { context.store.event('error', `Telegram command failed: ${safeError(error)}`); await context.telegram.sendPlain(`操作失敗：${safeError(error)}`, 'private').catch(() => undefined); }
 }
@@ -407,6 +414,7 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
     xSession: runtime.store.setting<string>('x:session_state', runtime.config.x.enabled ? 'unknown' : 'disabled'),
     tokenRequired: Boolean(runtime.config.webToken), destinations: runtime.config.destinations,
     jobs: runtime.store.jobs(100), batches: runtime.store.batches(100), held: heldBatches(runtime.engine), events: runtime.store.events(50).map(e => ({ ...e, text: readableEvent(e.message) })),
+    deletions: runtime.store.telegramDeletionFailures().map(job => ({ ...job, links: runtime.engine.telegramDeletionLinks(job) })),
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
   app.post('/api/scan', async () => { await runtime.once(); return { ok: true }; });
@@ -433,7 +441,7 @@ const icon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewB
 
 // Client code stays free of backticks, backslashes and "${" so it can live in this template literal as-is.
 const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Wherry</title><link rel="icon" href="${icon}"><style>
-:root{--bg:#f4f6f8;--card:#fff;--text:#0f1419;--muted:#5b6b78;--line:#e3e8ec;--soft:#eef2f4;--accent:#1d9bf0;--ok:#00875a;--warn:#9a6700;--err:#d1242f;--ok-bg:#dcf5ea;--warn-bg:#fff4d4;--err-bg:#fde8ea;--info-bg:#e2f1fd}
+:root{--bg:#f4f6f8;--card:#fff;--text:#0f1419;--muted:#5b6b78;--line:#e3e8ec;--soft:#eef2f4;--accent:#0875c2;--ok:#00875a;--warn:#916200;--err:#d1242f;--ok-bg:#dcf5ea;--warn-bg:#fff4d4;--err-bg:#fde8ea;--info-bg:#e2f1fd}
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--text:#e6edf3;--muted:#8d9aa7;--line:#2a323c;--soft:#222931;--accent:#4aa8f5;--ok:#3fcf8e;--warn:#e8b339;--err:#ff7b85;--ok-bg:#12352a;--warn-bg:#382c0c;--err-bg:#3f1a1f;--info-bg:#0f2a42}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Noto Sans TC",system-ui,sans-serif}
@@ -473,7 +481,10 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 input,textarea{font:inherit;width:100%;padding:.5rem .65rem;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
 textarea{resize:vertical;min-height:6rem}
 label{display:block;font-size:.83rem;color:var(--muted);margin:.55rem 0 .2rem}
-code{font-size:.85em;background:var(--soft);padding:0 .3rem;border-radius:4px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em;background:var(--soft);padding:0 .3rem;border-radius:4px}
+.deletion .actions button{min-height:44px}
+.deletion .note a{display:inline-flex;align-items:center;min-height:44px}
+.deletion-links{display:flex;flex-wrap:wrap;column-gap:1rem}
 .empty{color:var(--muted);font-size:.88rem;padding:.3rem 0}
 summary{cursor:pointer;color:var(--muted);font-size:.85rem;margin-top:.6rem}
 .evt{display:grid;grid-template-columns:auto 1fr;gap:.1rem .6rem;font-size:.82rem;padding:.4rem 0;border-top:1px solid var(--line)}
@@ -496,7 +507,7 @@ input[type=checkbox]{width:1.05rem;height:1.05rem;margin:0;accent-color:var(--ac
 <div id="offline" class="banner err" role="alert" hidden>連不上 Wherry 服務，會自動重試。</div>
 <div id="preview" class="banner" hidden><b>預覽模式</b>：照常讀取與分類，但不會真的發布到任何平台。確認行為正確後把 <code>APP_MODE</code> 改成 <code>live</code>。</div>
 <form id="token-box" class="banner" hidden><label for="token" style="margin-top:0">這個服務設定了 WEB_TOKEN，操作前請先輸入：</label><div class="row"><input id="token" type="password" autocomplete="off" style="flex:1;min-width:12rem"><button type="submit">儲存</button></div></form>
-<section><h2>等你決定 <span id="held-count" class="count">0</span></h2><p class="hint">X 上無法自動判斷的新內容會停在這裡；串文收集中的批次也可以提早發布。</p><div id="held-bulk"></div><div id="held"><div class="empty">載入中…</div></div></section>
+<section><h2>等你決定 <span id="held-count" class="count">0</span></h2><p class="hint">待確認的 X 內容與 Telegram 刪除失敗會停在這裡。</p><div id="held-bulk"></div><div id="held"><div class="empty">載入中…</div></div></section>
 <section><h2>發送工作 <span id="jobs-count" class="count">0</span></h2><div id="jobs-bulk"></div><div id="jobs"><div class="empty">載入中…</div></div><details id="jobs-more" hidden><summary>已完成與已取消（<span id="jobs-done-count">0</span>）</summary><div id="jobs-done"></div></details></section>
 <section><h2>最近讀到的貼文</h2><p class="hint">每則的分類與原因；沒同步的貼文為什麼沒同步，看這裡。</p><div id="posts"><div class="empty">載入中…</div></div></section>
 </div>
@@ -510,8 +521,8 @@ const L=${JSON.stringify(LABELS)};
 const PLATFORM=${JSON.stringify(PLATFORM_NAMES)};
 const KIND={publish:'發布',reminder:'X 提醒',ops:'待決通知',retract:'刪除副本'};
 const SESSION={authenticated:['X 已登入','ok'],error:['X 登入失效','err'],unknown:['X 登入未確認',''],disabled:['X 讀取未啟用','']};
-const TONE={succeeded:'ok',sealed:'ok',ready:'ok',manual_mirror:'ok',mirror:'ok',open:'info',collecting:'info',pending:'info',running:'info',review:'warn',mirror_review:'warn',failed:'err',unknown:'err',unsupported:'err'};
-const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄'};
+const TONE={succeeded:'ok',retracted:'ok',sealed:'ok',ready:'ok',manual_mirror:'ok',mirror:'ok',open:'info',collecting:'info',pending:'info',running:'info',review:'warn',mirror_review:'warn',failed:'err',unknown:'err',unsupported:'err'};
+const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄',deleted:'已記錄手動刪除，工作已完成'};
 const $=s=>document.querySelector(s);
 const busy=new Set();const picked=new Set();const openEvt=new Set();let rawEvents=false;try{rawEvents=localStorage.getItem('evtRaw')==='1'}catch{}let scopes={};let status={};let loading=false;
 const rtf=new Intl.RelativeTimeFormat('zh-Hant',{numeric:'auto'});
@@ -533,8 +544,9 @@ function confirmText(verb,n){const these=n>1?'這 '+n+' 筆':'這則';
 if(verb==='approve')return status.mode==='live'?'確定把'+these+'發布到 '+((status.destinations||[]).map(d=>PLATFORM[d]||d).join('、')||'其他平台')+'？發出後無法自動收回。':'';
 if(verb==='skip')return these+'略過後不會同步，之後也無法再批准。確定？';
 if(verb==='mirror')return these+'標記為手動鏡像後不會同步。確定？';
-if(verb==='cancel')return (n>1?'這 '+n+' 個工作':'這個工作')+'放棄後不會再發送或重試。確定？';
+if(verb==='cancel')return '確定停止'+(n>1?'這 '+n+' 個工作':'這個工作')+'，不再重試？已存在的遠端訊息會保留。';
 if(verb==='reconcile')return '請先到該平台確認這則沒有成功發出（沒有重複貼文）。確定重新發送未確認的部分？';
+if(verb==='deleted')return '確認已在 Telegram 手動刪除這則貼文的所有訊息？記錄後將結束工作，不再重試刪除。';
 return ''}
 // One request per id: the same validated endpoint as a single click, so a bulk run can't bypass any per-item check.
 async function act(verb,ids){const q=confirmText(verb,ids.length);if(q&&!confirm(q))return;for(const id of ids)busy.add(verb+':'+id);render();let failed=0,last='';
@@ -552,11 +564,14 @@ return '<div class="item '+(collecting?'':'decide')+'"><div class="head">'+pick(
 +(b.approvable?'':'<div class="note">這種內容無法自動同步；需要的話請自行貼到其他平台。</div>')
 +'<div class="actions">'+approve+btn('skip',b.id,'略過')+btn('mirror',b.id,'我已手動鏡像')+'</div></div>'}
 const stuck=j=>j.state==='failed'||j.state==='unknown'||j.state==='review';
+const deletionChoice=j=>j.kind==='retract'&&j.destination==='telegram'&&stuck(j);
 function jobItem(j){const attn=stuck(j);
-const action=!attn?'':(j.state==='unknown'?btn('reconcile',j.id,'確認沒發出，重新發送','go'):btn('retry',j.id,'重試','go'))+btn('cancel',j.id,'放棄');
-return '<div class="item'+(attn?' attn':'')+'"><div class="head">'+(attn?pick(j.id):'')+tag(j.state)+'<b>'+esc(PLATFORM[j.destination]||j.destination)+'</b><span class="meta">'+esc(KIND[j.kind]||j.kind)+(j.attempts?' · 第 '+j.attempts+' 次':'')+'</span><span class="spacer"></span><span class="meta">'+when(j.dueAt)+'</span></div>'
+const deletion=deletionChoice(j);
+const action=!attn?'':(j.state==='unknown'&&!deletion?btn('reconcile',j.id,'確認沒發出，重新發送','go'):btn('retry',j.id,'重試','go'))+btn('cancel',j.id,deletion?'取消':'放棄')+(deletion?btn('deleted',j.id,'我已手動刪除'):'');
+return '<div class="item'+(attn?' attn':'')+(deletion?' deletion':'')+'"><div class="head">'+(attn&&!deletion?pick(j.id):'')+tag(j.kind==='retract'&&j.state==='succeeded'?'retracted':j.state)+'<b>'+esc(PLATFORM[j.destination]||j.destination)+'</b><span class="meta">'+esc(KIND[j.kind]||j.kind)+(j.attempts?' · 第 '+j.attempts+' 次':'')+'</span><span class="spacer"></span><span class="meta">'+when(j.dueAt)+'</span></div>'
 +'<div class="note"><span class="id">'+esc(j.aggregateId)+'</span></div>'
-+(j.error?'<div class="note'+(attn?' bad':'')+'">'+label(j.error)+'</div>':'')+(j.state==='unknown'?'<div class="note">送出結果不明，不會自動重試。請到該平台確認：沒發出就重新發送，已經發出就放棄。</div>':'')
++(j.error?'<div class="note'+(attn?' bad':'')+'">'+label(j.error)+'</div>':'')+(j.state==='unknown'&&!deletion?'<div class="note">送出結果不明，不會自動重試。請到該平台確認：沒發出就重新發送，已經發出就放棄。</div>':'')
++(deletion?'<div class="note deletion-links">'+((j.links||[]).map((url,i)=>link(url,'開啟 Telegram 訊息 '+(i+1))).join('')||'此聊天不支援訊息連結，請到 Telegram 聊天中查看。')+'</div><div class="note">請手動刪除以上所有訊息後再確認；取消只會停止重試，會保留訊息。</div>':'')
 +(action?'<div class="actions">'+action+'</div>':'')+'</div>'}
 function postItem(p){return '<div class="item"><div class="head">'+tag(p.classification)+'<b>'+esc(PLATFORM[p.post.platform]||p.post.platform)+'</b><span class="meta">'+label(p.reason)+'</span><span class="spacer"></span><span class="meta">'+when(p.post.createdAt)+'</span></div>'
 +(p.post.text?'<div class="text short">'+esc(p.post.text)+'</div>':'')
@@ -572,14 +587,14 @@ function render(){const s=status;if(!s.mode)return;
 const mode=$('#mode');mode.textContent=s.mode==='live'?'正式模式':'預覽模式';mode.className='pill '+(s.mode==='live'?'ok':'warn');$('#preview').hidden=s.mode==='live';
 const sess=SESSION[s.xSession]||SESSION.unknown;const xs=$('#xsess');xs.textContent=sess[0];xs.className='pill '+sess[1];xs.hidden=false;
 if(s.tokenRequired&&!token())$('#token-box').hidden=false;
-const held=s.held||[];count('held-count',held.length,true);document.title=(held.length?'('+held.length+') ':'')+'Wherry';
-const jobs=s.jobs||[];const done=jobs.filter(j=>j.state==='succeeded'||j.state==='cancelled');const active=jobs.filter(j=>!done.includes(j));
+const held=s.held||[];const deletions=s.deletions||[];const decisions=held.length+deletions.length;count('held-count',decisions,true);document.title=(decisions?'('+decisions+') ':'')+'Wherry';
+const jobs=s.jobs||[];const done=jobs.filter(j=>j.state==='succeeded'||j.state==='cancelled');const active=jobs.filter(j=>!done.includes(j)&&!deletionChoice(j));
 const rank=j=>stuck(j)?0:1;active.sort((a,b)=>rank(a)-rank(b));
 scopes={held:{items:held,verbs:[['approve','發布',b=>b.approvable,'go'],['skip','略過',()=>true],['mirror','我已手動鏡像',()=>true]]},
 jobs:{items:active.filter(stuck),verbs:[['retry','重試',j=>j.state!=='unknown','go'],['cancel','放棄',()=>true]]}};
 const live=new Set([...scopes.held.items,...scopes.jobs.items].map(i=>i.id));for(const id of picked)if(!live.has(id))picked.delete(id);
 put('held-bulk',bulkBar('held'));put('jobs-bulk',bulkBar('jobs'));
-put('held',held.length?held.map(heldItem).join(''):'<div class="empty">沒有等你決定的內容。</div>');
+put('held',decisions?deletions.map(jobItem).join('')+held.map(heldItem).join(''):'<div class="empty">沒有等你決定的內容。</div>');
 count('jobs-count',scopes.jobs.items.length,true);
 put('jobs',active.length?active.map(jobItem).join(''):'<div class="empty">沒有進行中或失敗的工作。</div>');
 $('#jobs-more').hidden=!done.length;$('#jobs-done-count').textContent=done.length;put('jobs-done',done.slice(0,40).map(jobItem).join(''));
