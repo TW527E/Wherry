@@ -12,7 +12,8 @@ import { renderXMentions, sliceMentions, validTextMentions, type MentionText } f
 import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
 import { xPostState } from './platforms/x.js';
-import type { Attachment, Batch, Collector, Destination, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
+import { telegramMessageLinks } from './platforms/telegram.js';
+import type { Attachment, Batch, Collector, Destination, InlineButton, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
 
 // Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
 // output is re-validated on the way in. zod's `.url()` accepts ANY scheme, so `javascript:` and
@@ -48,6 +49,8 @@ export const snapshotSchema = z.object({
 const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
 // A batch still unsealed this long after its settle time is stuck rather than catching up; say so once.
 const SEAL_STUCK_ALERT_MS = 30 * 60_000;
+// How long a failed between-scan Telegram deadline check waits before asking the embed endpoint again.
+const DEADLINE_RETRY_MS = 5 * 60_000;
 
 // A text-only mirror match is only conclusive when the text is distinctive. A short generic phrase that
 // happens to equal a recent downstream post ("早安") is far more likely to be a coincidence than a
@@ -466,10 +469,32 @@ export class Engine {
    * same way, so the copies downstream end up showing only the edited text.
    */
   async retractDeleted(snapshot: SourceSnapshot, now: string = new Date().toISOString()): Promise<number> {
-    const due = this.store.xPostsToRecheck(now);
-    if (!due.length) return 0;
     const live = snapshot.posts.filter(post => !post.repost).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
-    const liveState = live && await xPostState(this.transport, live.id);
+    // Remembered for checkTelegramDeadlines, which runs between scans without a timeline of its own.
+    if (live) this.store.setSetting('x:deletion_oracle', live.id);
+    return this.recheck(this.store.xPostsToRecheck(now), live?.id, now);
+  }
+
+  /**
+   * The hour-47 Telegram checks that fall between scans. Only the embed endpoint is asked — no browser,
+   * no timeline scroll — with the newest post the last scan saw live as the "endpoint works" proof. When
+   * that proof or a check fails, the next try waits DEADLINE_RETRY_MS, so a broken endpoint costs a few
+   * requests per deadline hour instead of a full X scan every minute.
+   */
+  async checkTelegramDeadlines(now: string = new Date().toISOString()): Promise<number> {
+    if (this.store.setting<string>('telegram_deadline_retry_at', '') > now) return 0;
+    const due = this.store.telegramPostsToRecheck(now);
+    if (!due.length) return 0;
+    const deleted = await this.recheck(due, this.store.setting<string | undefined>('x:deletion_oracle', undefined), now);
+    if (this.store.telegramPostsToRecheck(now).length) {
+      this.store.setSetting('telegram_deadline_retry_at', new Date(Date.parse(now) + DEADLINE_RETRY_MS).toISOString());
+    }
+    return deleted;
+  }
+
+  private async recheck(due: StoredPost[], oracleId: string | undefined, now: string): Promise<number> {
+    if (!due.length) return 0;
+    const liveState = oracleId && await xPostState(this.transport, oracleId);
     if (!liveState || liveState.state === 'gone') {
       this.store.event('warn', 'X deletion check skipped: the embed endpoint did not confirm a post that is live on the timeline');
       return 0;
@@ -498,9 +523,14 @@ export class Engine {
     return deleted;
   }
 
-  schedule(input: { text: string; attachments?: Attachment[]; dueAt: string }, now: string = new Date().toISOString()): string {
+  schedule(input: { text: string; attachments?: Attachment[]; dueAt: string; destinations?: Destination[] }, now: string = new Date().toISOString()): string {
     const due = new Date(input.dueAt).toISOString();
     if (due < now) throw new Error('Schedule must be in the future');
+    // An explicit list narrows the configured destinations; it can never add one.
+    const destinations = input.destinations === undefined ? this.config.destinations : [...new Set(input.destinations)];
+    if (!Array.isArray(destinations) || !destinations.length || destinations.some(d => !this.config.destinations.includes(d))) {
+      throw new Error(`destinations must be a non-empty subset of: ${this.config.destinations.join(', ')}`);
+    }
     const post = sourcePostSchema.parse({ platform: 'local', id: randomUUID(), authorId: 'owner', text: input.text,
       createdAt: now, replyToId: null, relationKnown: true, visibility: 'public', attachments: input.attachments || [], metadataComplete: true }) as SourcePost;
     const unsupported = unsupportedReason(post, this.config.media.video);
@@ -510,7 +540,7 @@ export class Engine {
       this.store.addBatch({ id, platform: 'local', rootId: post.id, rootCreatedAt: now, cutoffAt: now, settleAt: due, state: 'sealed', reason: 'scheduled_no_x_url_yet' });
       this.store.addPost(post, 'ready', 'local_scheduled', now, id);
       this.store.addMirror(post, now);
-      for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now, due);
+      for (const destination of destinations) this.store.enqueue('publish', id, destination, now, due);
       // Same as a native post: the reminder exists only to notify, so it is queued only when it can reach
       // the owner. The scheduled post still publishes to every enabled destination either way.
       if (this.canNotifyOwner()) this.store.enqueue('reminder', id, 'telegram', now, due);
@@ -557,14 +587,32 @@ export class Engine {
     return { alreadyDelivered };
   }
 
-  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | 'cancel', id: string, now: string = new Date().toISOString()): void {
+  telegramDeletionLinks(job: Job): string[] {
+    if (job.kind !== 'retract' || job.destination !== 'telegram') return [];
+    return [...new Set(this.store.deliveredCopies(job.aggregateId.slice('x:'.length), 'telegram').flatMap(copy => telegramMessageLinks(copy.ref)))];
+  }
+
+  action(action: 'skip' | 'mirror' | 'approve' | 'retry' | 'reconcile' | 'cancel' | 'deleted', id: string, now: string = new Date().toISOString()): void {
     // Callers include a web endpoint whose body is untrusted and whose TS types are erased at
     // runtime; validate here so no caller can drive a state change with an unexpected verb or id.
-    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile', 'cancel'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile|cancel');
+    if (!['skip', 'mirror', 'approve', 'retry', 'reconcile', 'cancel', 'deleted'].includes(action)) throw new Error('action must be one of skip|mirror|approve|retry|reconcile|cancel|deleted');
     if (typeof id !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(id)) throw new Error('id must be a plain identifier');
+    if (action === 'deleted') {
+      const job = this.store.getJob(id);
+      if (!job || job.kind !== 'retract' || job.destination !== 'telegram' || !['failed', 'review', 'unknown'].includes(job.state)) {
+        throw new Error('Only failed Telegram deletions can be confirmed as manually deleted');
+      }
+      this.store.transaction(() => {
+        for (const copy of this.store.deliveredCopies(job.aggregateId.slice('x:'.length), 'telegram')) this.store.retractStep(copy.jobId, copy.key);
+        this.store.updateJob(id, 'succeeded', 'owner_manually_deleted');
+        this.store.event('info', 'Owner confirmed the Telegram copies were manually deleted', id);
+      });
+      return;
+    }
     if (action === 'retry') {
       const job = this.store.getJob(id);
-      if (!job || !['failed', 'review'].includes(job.state)) throw new Error('Only explicitly failed/review jobs can retry; unknown deliveries require reconciliation');
+      const interruptedDeletion = job?.kind === 'retract' && job.destination === 'telegram' && job.state === 'unknown';
+      if (!job || (!['failed', 'review'].includes(job.state) && !interruptedDeletion)) throw new Error('Only failed/review jobs or interrupted Telegram deletions can retry; unknown deliveries require reconciliation');
       this.store.updateJob(id, 'pending', undefined, now); return;
     }
     if (action === 'cancel') {
@@ -607,7 +655,11 @@ export class Engine {
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now);
     } else {
       this.store.updateBatch(id, action === 'mirror' ? 'mirror' : 'ignored', 'owner_override');
-      for (const member of this.store.batchPosts(id)) this.store.updatePost(member.key, action === 'mirror' ? 'manual_mirror' : 'ignored', 'owner_override');
+      for (const member of this.store.batchPosts(id)) {
+        this.store.updatePost(member.key, action === 'mirror' ? 'manual_mirror' : 'ignored', 'owner_override');
+        // A called-off scheduled post will never exist downstream, so it is no evidence of a manual mirror.
+        if (batch.platform === 'local') this.store.dropPendingMirror(member.key);
+      }
       for (const job of jobs) if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'owner_override');
     }
     this.store.event('info', `Owner action: ${action}`, id);
@@ -619,10 +671,16 @@ export class Engine {
    * plus the matching downstream URL to confirm the manual mirror. Only genuine, unexpired
    * candidates are listed so a code always resolves to a real downstream post.
    */
-  mirrorCandidates(now: string = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string }> {
+  mirrorCandidates(now: string = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string; text: string; createdAt: string }> {
     return this.store.mirrors(now)
       .filter(candidate => !candidate.expired)
-      .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id }));
+      .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id, text: candidate.post.text, createdAt: candidate.post.createdAt }));
+  }
+
+  /** What a job is about, for the owner: the first post's text and source link. */
+  jobSummary(job: Job): { text: string; url?: string } {
+    const post = ['publish', 'ops'].includes(job.kind) ? this.store.batchPosts(job.aggregateId)[0]?.post : this.store.postByKey(job.aggregateId)?.post;
+    return { text: post ? Array.from(cleanXLinks(post.text)).slice(0, 120).join('') : '', url: post?.url };
   }
 
   /**
@@ -680,31 +738,31 @@ export class Engine {
       '• 按「發送到其他平台」＝這是新內容，立刻同步到下游。',
       '• 按「略過」＝不要同步這則。',
     ];
-    lines.push('• 按「這是我手動鏡像的」後，回覆本則訊息並附上「鏡像代碼 + 對應平台貼文連結」，即可登記為手動鏡像、阻止反向同步。');
     const candidates = this.mirrorCandidates(now);
-    if (candidates.length) {
-      lines.push('', '可用的鏡像代碼（回覆本訊息時貼上代碼與該平台的貼文連結，順序不限）：');
-      for (const candidate of candidates) lines.push(`${candidate.platform}：${candidate.id}`);
-    } else {
-      lines.push('', '（目前沒有待認領的下游貼文；若確定是手動鏡像，仍可回覆代碼與連結，或用網頁後台處理。）');
-    }
+    lines.push(candidates.length
+      ? `• 按「這是我手動鏡像的」＝這則是你從其他平台手動搬來的；接著點選對應的下游貼文（目前有 ${candidates.length} 則候選），即可阻止反向同步。`
+      : '• 按「這是我手動鏡像的」＝這則是你從其他平台手動搬來的，直接登記並阻止反向同步。');
     return lines.filter((line, index) => line !== '' || lines[index - 1] !== '').join('\n');
+  }
+
+  /** The decision buttons a held X batch's notice carries, also restored when the owner backs out of picking a mirror. */
+  reviewNoticeButtons(batchId: string): InlineButton[] {
+    const hold = this.holdReason(batchId);
+    return [
+      // Incomplete polls and unsupported media have no publish path, even with owner approval.
+      ...(!hold || holdIsApprovable(hold) ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: 'rev:a' }] : []),
+      { text: '🚫 略過', data: 'rev:s' },
+      { text: '🪞 這是我手動鏡像的', data: 'rev:m' },
+    ];
   }
 
   async parts(job: Job, now: string = new Date().toISOString()): Promise<PublishPart[]> {
     if (job.kind === 'ops') {
       const batch = this.store.getBatch(job.aggregateId);
       if (!batch) throw new Error('Job source not found');
-      const hold = this.holdReason(batch.id);
-      const approvable = !hold || holdIsApprovable(hold);
       return [{
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
-        media: [], buttons: [
-          // Incomplete polls and unsupported media have no publish path, even with owner approval.
-          ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: 'rev:a' }] : []),
-          { text: '🚫 略過', data: 'rev:s' },
-          { text: '🪞 這是我手動鏡像的', data: 'rev:m' },
-        ],
+        media: [], buttons: this.reviewNoticeButtons(batch.id),
       }];
     }
     const batch = job.kind === 'publish' ? this.store.getBatch(job.aggregateId) : undefined;

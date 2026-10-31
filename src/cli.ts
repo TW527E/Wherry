@@ -18,7 +18,7 @@ Usage:
   wherry scan                  Collect sources only (never publishes)
   wherry publish <batchId>     Enqueue downstream publication for a sealed batch
   wherry schedule <iso> <text> Create a local scheduled post (no X write)
-  wherry action <verb> <id>    skip | approve | mirror | retry | reconcile | cancel
+  wherry action <verb> <id>    skip | approve | mirror | retry | reconcile | cancel | deleted
   wherry doctor                Validate configuration and report capabilities
   wherry login                 Open a visible browser to log into X once (saves the session)
   wherry export-session        Export the X login to X_SESSION_FILE (default: data/x-session.json)
@@ -93,6 +93,7 @@ async function main(): Promise<number> {
             log: message => console.log(message),
           });
           if (result.authenticated) console.log(`登入成功，session 已存到 ${config.x.profileDir}。之後 scan/serve 就能讀到你的推文了。`);
+          else if (result.account) console.log(`登入的是 @${result.account}，不是設定的 @${config.x.handle}。請登出後改用正確帳號重跑 login。`);
           else console.log('看起來仍未通過登入（偵測到登入或驗證畫面）。請重跑 login 並確認完成登入後再按 Enter。');
           return result.authenticated ? 0 : 1;
         } finally { rl.close(); }
@@ -116,6 +117,7 @@ async function main(): Promise<number> {
         const file = parseSessionFile(bytes);
         const result = await installSession(config.x, file);
         if (result.authenticated) console.log(`session 已安裝到 ${config.x.profileDir} 並驗證成功。`);
+        else if (result.account) console.log(`session 已安裝，但登入的是 @${result.account}，不是設定的 @${config.x.handle}。請用正確帳號重新 login 後再匯出。`);
         else console.log('session 已安裝，但驗證時仍看到登入/驗證畫面；可能已過期，請在本機重新 login 後再匯出。');
         return result.authenticated ? 0 : 1;
       }

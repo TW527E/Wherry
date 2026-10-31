@@ -57,7 +57,7 @@ test('command polling retains only live timer handles between polls', async t =>
   }
   assert.equal(polls, 6);
   await runtime.stop();
-  assert.equal(clear.mock.callCount(), 3, 'only two intervals and the next pending poll require cleanup');
+  assert.equal(clear.mock.callCount(), 4, 'only three intervals (poll, flush, housekeeping) and the next pending poll require cleanup');
 });
 
 test('web UI: held batches say whether approve can publish, and a schedule without dueAt means now', async t => {

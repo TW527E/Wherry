@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { AppConfig } from '../config.js';
 import { isSensitiveContent, warningPrefix } from '../content-warning.js';
 import { nativePollPayload } from '../poll.js';
-import type { PreparedMedia, PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
+import type { InlineButton, PreparedMedia, PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
 import { fixupUrl, htmlEscape, splitText } from '../text.js';
 import { PlatformError, multipart, nonempty, object, positiveInteger, requestJson, schemaError, type MultipartFile } from './parse.js';
 
@@ -12,6 +12,13 @@ interface TelegramMessage { message_id: number; chat: { id: number | string }; m
 const MAX_TEXT = 4096; const MAX_CAPTION = 1024;
 /** A slash command followed by ID-like arguments, e.g. "/retry 9549-…" or "/approve batch-1". */
 const COPYABLE_COMMAND = /(?<=^|[\s（(])\/[a-z]+(?: [\w:.-]+)+/gm;
+
+export function telegramMessageLinks(ref: RemoteRef): string[] {
+  const chat = ref.chatId ?? '';
+  const path = /^-100[1-9]\d*$/.test(chat) ? `c/${chat.slice(4)}`
+    : /^@[A-Za-z][A-Za-z0-9_]{3,31}$/.test(chat) ? chat.slice(1) : undefined;
+  return path ? (ref.messageIds ?? []).filter(id => Number.isSafeInteger(id) && id > 0).map(id => `https://t.me/${path}/${id}`) : [];
+}
 
 export class TelegramClient implements Publisher {
   readonly destination = 'telegram' as const;
@@ -67,7 +74,7 @@ export class TelegramClient implements Publisher {
         || createdPoll.close_date !== Math.floor(poll.expiresAt / 1000)
         || !Array.isArray(createdPoll.options) || createdPoll.options.length !== poll.choices.length
         || createdPoll.options.some((choice, index) => object(choice)?.text !== poll.choices[index])) throw schemaError('Telegram sendPoll', true);
-      return { id: String(result.message_id), messageIds: [result.message_id], chatId };
+      return { id: String(result.message_id), messageIds: [result.message_id], chatId, sentAt: this.now().toISOString() };
     }
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
     const body = htmlEscape(part.text);
@@ -107,21 +114,24 @@ export class TelegramClient implements Publisher {
         ...(sensitive ? { link_preview_options: { is_disabled: true } } : {}), ...(reply ? { reply_parameters: reply } : {}), ...markup })];
     }
     const ids = sent.map(message => message.message_id);
-    return { id: String(ids[0]), messageIds: ids, chatId };
+    return { id: String(ids[0]), messageIds: ids, chatId, sentAt: this.now().toISOString() };
   }
-  async sendPlain(text: string, audience: TelegramAudience = 'ops'): Promise<RemoteRef> {
+  async sendPlain(text: string, audience: TelegramAudience = 'ops', buttons: InlineButton[] = []): Promise<RemoteRef> {
     const chatId = this.chat(audience); const messageIds: number[] = [];
     for (const chunk of splitText(text, { utf16: MAX_TEXT })) {
       // "/retry <id>" as a bot-command link would send only "/retry"; a code entity makes one tap copy the whole command.
       const entities = Array.from(chunk.matchAll(COPYABLE_COMMAND), match => ({ type: 'code', offset: match.index, length: match[0].length }));
-      const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: chunk, link_preview_options: { is_disabled: true }, ...(entities.length ? { entities } : {}) });
+      const result = await this.call<TelegramMessage>('sendMessage', { chat_id: chatId, text: chunk, link_preview_options: { is_disabled: true }, ...(entities.length ? { entities } : {}),
+        ...(buttons.length ? { reply_markup: { inline_keyboard: buttons.map(button => [{ text: button.text, callback_data: button.data }]) } } : {}) });
       messageIds.push(result.message_id);
     }
     return { id: String(messageIds[0]), messageIds, chatId };
   }
-  async editMessageText(chatId: string, messageId: number, text: string): Promise<void> {
+  /** Replace a message's text; its buttons become `buttons` (one per row), none by default. */
+  async editMessageText(chatId: string, messageId: number, text: string, buttons: InlineButton[] = []): Promise<void> {
     try {
-      await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: [] } });
+      await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true },
+        reply_markup: { inline_keyboard: buttons.map(button => [{ text: button.text, callback_data: button.data }]) } });
     } catch (error) {
       if (!(error instanceof PlatformError && error.status === 400 && /message is not modified/i.test(error.message))) throw error;
     }
