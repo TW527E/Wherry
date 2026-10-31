@@ -329,6 +329,12 @@ export class Store {
     const seen = new Set<string>();
     return [...this.attentionJobs(), ...this.jobs(limit)].filter(job => !seen.has(job.id) && Boolean(seen.add(job.id)));
   }
+  /** When the bot loses the right to delete a post's remaining Telegram copies: 48 hours after the oldest was sent. */
+  telegramDeleteBy(sourcePostId: string): string | undefined {
+    const row = this.db.prepare(`SELECT MIN(COALESCE(json_extract(s.result,'$.sentAt'),s.started_at)) AS at FROM steps s JOIN jobs j ON j.id=s.job_id
+      WHERE j.kind='publish' AND j.destination='telegram' AND s.state='succeeded' AND s.result IS NOT NULL AND json_extract(s.content,'$.sourcePostId')=?`).get(sourcePostId);
+    return row?.at ? new Date(Date.parse(String(row.at)) + 48 * 3600_000).toISOString() : undefined;
+  }
   telegramDeletionFailures(): Job[] {
     return this.db.prepare("SELECT * FROM jobs WHERE kind='retract' AND destination='telegram' AND state IN ('failed','review','unknown') ORDER BY created_at").all().map(row => this.jobRow(row));
   }
@@ -390,7 +396,9 @@ export class Store {
         AND substr(key,${'mention-plan:'.length + 1}) IN (SELECT id FROM jobs WHERE state IN ('succeeded','cancelled'))`).run().changes);
       const stuck = Number(this.db.prepare(`DELETE FROM settings WHERE key GLOB 'seal_stuck:*'
         AND substr(key,${'seal_stuck:'.length + 1}) IN (SELECT id FROM batches WHERE state<>'open')`).run().changes);
-      return { events, settings: plans + stuck };
+      const choices = Number(this.db.prepare(`DELETE FROM settings WHERE key GLOB 'review_choices:*'
+        AND substr(key,${'review_choices:'.length + 1}) NOT IN (SELECT id FROM batches WHERE state IN ('review','open'))`).run().changes);
+      return { events, settings: plans + stuck + choices };
     });
   }
   /** Uploaded schedule images still needed: those of local posts with a delivery that can still run. */

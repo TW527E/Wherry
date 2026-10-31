@@ -13,7 +13,7 @@ import { describe } from './labels.js';
 import { resolveBlueskyMentions } from './platforms/bluesky.js';
 import { xPostState } from './platforms/x.js';
 import { telegramMessageLinks } from './platforms/telegram.js';
-import type { Attachment, Batch, Collector, Destination, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
+import type { Attachment, Batch, Collector, Destination, InlineButton, Job, PreparedMedia, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, StoredPost, TextRange, Transport } from './types.js';
 
 // Media locations cross a trust boundary here: the /api/schedule body is untrusted, and collector
 // output is re-validated on the way in. zod's `.url()` accepts ANY scheme, so `javascript:` and
@@ -671,10 +671,10 @@ export class Engine {
    * plus the matching downstream URL to confirm the manual mirror. Only genuine, unexpired
    * candidates are listed so a code always resolves to a real downstream post.
    */
-  mirrorCandidates(now: string = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string }> {
+  mirrorCandidates(now: string = new Date().toISOString()): Array<{ id: string; platform: SourcePost['platform']; postId: string; text: string; createdAt: string }> {
     return this.store.mirrors(now)
       .filter(candidate => !candidate.expired)
-      .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id }));
+      .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id, text: candidate.post.text, createdAt: candidate.post.createdAt }));
   }
 
   /** What a job is about, for the owner: the first post's text and source link. */
@@ -738,31 +738,31 @@ export class Engine {
       '• 按「發送到其他平台」＝這是新內容，立刻同步到下游。',
       '• 按「略過」＝不要同步這則。',
     ];
-    lines.push('• 按「這是我手動鏡像的」後，回覆本則訊息並附上「鏡像代碼 + 對應平台貼文連結」，即可登記為手動鏡像、阻止反向同步。');
     const candidates = this.mirrorCandidates(now);
-    if (candidates.length) {
-      lines.push('', '可用的鏡像代碼（回覆本訊息時貼上代碼與該平台的貼文連結，順序不限）：');
-      for (const candidate of candidates) lines.push(`${candidate.platform}：${candidate.id}`);
-    } else {
-      lines.push('', '（目前沒有待認領的下游貼文；若確定是手動鏡像，仍可回覆代碼與連結，或用網頁後台處理。）');
-    }
+    lines.push(candidates.length
+      ? `• 按「這是我手動鏡像的」＝這則是你從其他平台手動搬來的；接著點選對應的下游貼文（目前有 ${candidates.length} 則候選），即可阻止反向同步。`
+      : '• 按「這是我手動鏡像的」＝這則是你從其他平台手動搬來的，直接登記並阻止反向同步。');
     return lines.filter((line, index) => line !== '' || lines[index - 1] !== '').join('\n');
+  }
+
+  /** The decision buttons a held X batch's notice carries, also restored when the owner backs out of picking a mirror. */
+  reviewNoticeButtons(batchId: string): InlineButton[] {
+    const hold = this.holdReason(batchId);
+    return [
+      // Incomplete polls and unsupported media have no publish path, even with owner approval.
+      ...(!hold || holdIsApprovable(hold) ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: 'rev:a' }] : []),
+      { text: '🚫 略過', data: 'rev:s' },
+      { text: '🪞 這是我手動鏡像的', data: 'rev:m' },
+    ];
   }
 
   async parts(job: Job, now: string = new Date().toISOString()): Promise<PublishPart[]> {
     if (job.kind === 'ops') {
       const batch = this.store.getBatch(job.aggregateId);
       if (!batch) throw new Error('Job source not found');
-      const hold = this.holdReason(batch.id);
-      const approvable = !hold || holdIsApprovable(hold);
       return [{
         key: 'notice', sourcePostId: batch.rootId, text: this.reviewNoticeText(batch),
-        media: [], buttons: [
-          // Incomplete polls and unsupported media have no publish path, even with owner approval.
-          ...(approvable ? [{ text: hold ? '✅ 仍要發送到其他平台' : '✅ 發送到其他平台', data: 'rev:a' }] : []),
-          { text: '🚫 略過', data: 'rev:s' },
-          { text: '🪞 這是我手動鏡像的', data: 'rev:m' },
-        ],
+        media: [], buttons: this.reviewNoticeButtons(batch.id),
       }];
     }
     const batch = job.kind === 'publish' ? this.store.getBatch(job.aggregateId) : undefined;

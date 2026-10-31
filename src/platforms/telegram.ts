@@ -127,9 +127,11 @@ export class TelegramClient implements Publisher {
     }
     return { id: String(messageIds[0]), messageIds, chatId };
   }
-  async editMessageText(chatId: string, messageId: number, text: string): Promise<void> {
+  /** Replace a message's text; its buttons become `buttons` (one per row), none by default. */
+  async editMessageText(chatId: string, messageId: number, text: string, buttons: InlineButton[] = []): Promise<void> {
     try {
-      await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: [] } });
+      await this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true },
+        reply_markup: { inline_keyboard: buttons.map(button => [{ text: button.text, callback_data: button.data }]) } });
     } catch (error) {
       if (!(error instanceof PlatformError && error.status === 400 && /message is not modified/i.test(error.message))) throw error;
     }

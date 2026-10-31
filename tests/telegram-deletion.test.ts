@@ -269,7 +269,7 @@ test('Telegram /pending resurfaces a saved deletion failure with all three actio
   };
   runtime.start();
   await delivered.promise;
-  assert.match(sent[0]![0], /1 筆 Telegram 刪除失敗/);
+  assert.match(sent[0]![0], /Telegram 副本刪不掉 1 筆/);
   assert.match(sent[1]![0], /t.me\/c\/1234567890\/124/);
   assert.deepEqual(sent[1]![2], deletionButtons(runtime.store.getJob(job)!));
 });
