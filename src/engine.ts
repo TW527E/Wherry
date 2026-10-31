@@ -49,6 +49,8 @@ export const snapshotSchema = z.object({
 const DEGRADE_SEAL_FRESHNESS_AFTER_FAILURES = 3;
 // A batch still unsealed this long after its settle time is stuck rather than catching up; say so once.
 const SEAL_STUCK_ALERT_MS = 30 * 60_000;
+// How long a failed between-scan Telegram deadline check waits before asking the embed endpoint again.
+const DEADLINE_RETRY_MS = 5 * 60_000;
 
 // A text-only mirror match is only conclusive when the text is distinctive. A short generic phrase that
 // happens to equal a recent downstream post ("早安") is far more likely to be a coincidence than a
@@ -467,10 +469,32 @@ export class Engine {
    * same way, so the copies downstream end up showing only the edited text.
    */
   async retractDeleted(snapshot: SourceSnapshot, now: string = new Date().toISOString()): Promise<number> {
-    const due = this.store.xPostsToRecheck(now);
-    if (!due.length) return 0;
     const live = snapshot.posts.filter(post => !post.repost).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
-    const liveState = live && await xPostState(this.transport, live.id);
+    // Remembered for checkTelegramDeadlines, which runs between scans without a timeline of its own.
+    if (live) this.store.setSetting('x:deletion_oracle', live.id);
+    return this.recheck(this.store.xPostsToRecheck(now), live?.id, now);
+  }
+
+  /**
+   * The hour-47 Telegram checks that fall between scans. Only the embed endpoint is asked — no browser,
+   * no timeline scroll — with the newest post the last scan saw live as the "endpoint works" proof. When
+   * that proof or a check fails, the next try waits DEADLINE_RETRY_MS, so a broken endpoint costs a few
+   * requests per deadline hour instead of a full X scan every minute.
+   */
+  async checkTelegramDeadlines(now: string = new Date().toISOString()): Promise<number> {
+    if (this.store.setting<string>('telegram_deadline_retry_at', '') > now) return 0;
+    const due = this.store.telegramPostsToRecheck(now);
+    if (!due.length) return 0;
+    const deleted = await this.recheck(due, this.store.setting<string | undefined>('x:deletion_oracle', undefined), now);
+    if (this.store.telegramPostsToRecheck(now).length) {
+      this.store.setSetting('telegram_deadline_retry_at', new Date(Date.parse(now) + DEADLINE_RETRY_MS).toISOString());
+    }
+    return deleted;
+  }
+
+  private async recheck(due: StoredPost[], oracleId: string | undefined, now: string): Promise<number> {
+    if (!due.length) return 0;
+    const liveState = oracleId && await xPostState(this.transport, oracleId);
     if (!liveState || liveState.state === 'gone') {
       this.store.event('warn', 'X deletion check skipped: the embed endpoint did not confirm a post that is live on the timeline');
       return 0;
@@ -499,9 +523,14 @@ export class Engine {
     return deleted;
   }
 
-  schedule(input: { text: string; attachments?: Attachment[]; dueAt: string }, now: string = new Date().toISOString()): string {
+  schedule(input: { text: string; attachments?: Attachment[]; dueAt: string; destinations?: Destination[] }, now: string = new Date().toISOString()): string {
     const due = new Date(input.dueAt).toISOString();
     if (due < now) throw new Error('Schedule must be in the future');
+    // An explicit list narrows the configured destinations; it can never add one.
+    const destinations = input.destinations === undefined ? this.config.destinations : [...new Set(input.destinations)];
+    if (!Array.isArray(destinations) || !destinations.length || destinations.some(d => !this.config.destinations.includes(d))) {
+      throw new Error(`destinations must be a non-empty subset of: ${this.config.destinations.join(', ')}`);
+    }
     const post = sourcePostSchema.parse({ platform: 'local', id: randomUUID(), authorId: 'owner', text: input.text,
       createdAt: now, replyToId: null, relationKnown: true, visibility: 'public', attachments: input.attachments || [], metadataComplete: true }) as SourcePost;
     const unsupported = unsupportedReason(post, this.config.media.video);
@@ -511,7 +540,7 @@ export class Engine {
       this.store.addBatch({ id, platform: 'local', rootId: post.id, rootCreatedAt: now, cutoffAt: now, settleAt: due, state: 'sealed', reason: 'scheduled_no_x_url_yet' });
       this.store.addPost(post, 'ready', 'local_scheduled', now, id);
       this.store.addMirror(post, now);
-      for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now, due);
+      for (const destination of destinations) this.store.enqueue('publish', id, destination, now, due);
       // Same as a native post: the reminder exists only to notify, so it is queued only when it can reach
       // the owner. The scheduled post still publishes to every enabled destination either way.
       if (this.canNotifyOwner()) this.store.enqueue('reminder', id, 'telegram', now, due);
@@ -626,7 +655,11 @@ export class Engine {
       for (const destination of this.config.destinations) this.store.enqueue('publish', id, destination, now);
     } else {
       this.store.updateBatch(id, action === 'mirror' ? 'mirror' : 'ignored', 'owner_override');
-      for (const member of this.store.batchPosts(id)) this.store.updatePost(member.key, action === 'mirror' ? 'manual_mirror' : 'ignored', 'owner_override');
+      for (const member of this.store.batchPosts(id)) {
+        this.store.updatePost(member.key, action === 'mirror' ? 'manual_mirror' : 'ignored', 'owner_override');
+        // A called-off scheduled post will never exist downstream, so it is no evidence of a manual mirror.
+        if (batch.platform === 'local') this.store.dropPendingMirror(member.key);
+      }
       for (const job of jobs) if (['pending', 'failed', 'review'].includes(job.state)) this.store.updateJob(job.id, 'cancelled', 'owner_override');
     }
     this.store.event('info', `Owner action: ${action}`, id);
@@ -642,6 +675,12 @@ export class Engine {
     return this.store.mirrors(now)
       .filter(candidate => !candidate.expired)
       .map(candidate => ({ id: candidate.id, platform: candidate.post.platform, postId: candidate.post.id }));
+  }
+
+  /** What a job is about, for the owner: the first post's text and source link. */
+  jobSummary(job: Job): { text: string; url?: string } {
+    const post = ['publish', 'ops'].includes(job.kind) ? this.store.batchPosts(job.aggregateId)[0]?.post : this.store.postByKey(job.aggregateId)?.post;
+    return { text: post ? Array.from(cleanXLinks(post.text)).slice(0, 120).join('') : '', url: post?.url };
   }
 
   /**

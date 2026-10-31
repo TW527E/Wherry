@@ -302,11 +302,19 @@ async function guardRoutes(page: Page): Promise<void> {
  * Whether the session reads the configured profile. Decided solely by the logged-in account switcher:
  * behind a login/verification wall that control never appears.
  */
-async function sessionAuthenticated(page: Page, handle: string): Promise<{ authenticated: boolean }> {
+async function sessionAuthenticated(page: Page, handle: string): Promise<SessionCheck> {
   await page.goto(`https://x.com/${encodeURIComponent(handle)}/with_replies`, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-  const authenticated = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
-  return { authenticated };
+  const switcher = page.locator('[data-testid="SideNav_AccountSwitcher_Button"]');
+  const authenticated = await switcher.waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false);
+  if (!authenticated) return { authenticated };
+  // The switcher names the signed-in account. A session for a different account would read the profile
+  // as a stranger, so it does not count — but a switcher that shows no @handle at all is not held against it.
+  const account = (await switcher.innerText({ timeout: 5_000 }).catch(() => '')).match(/@([A-Za-z0-9_]{1,15})\b/)?.[1];
+  return account && account.toLowerCase() !== handle.toLowerCase() ? { authenticated: false, account } : { authenticated: true };
 }
+
+/** Whether a session reads the configured profile; `account` names a different signed-in account. */
+export interface SessionCheck { authenticated: boolean; account?: string }
 
 export class XCollector implements Collector {
   readonly platform = 'x' as const;
@@ -754,7 +762,7 @@ export class XCollector implements Collector {
 export async function loginInteractive(
   config: AppConfig['x'],
   options: { waitForEnter: () => Promise<void>; log?: (message: string) => void } ,
-): Promise<{ authenticated: boolean }> {
+): Promise<SessionCheck> {
   const log = options.log ?? (() => {});
   const context = await chromium.launchPersistentContext(config.profileDir, launchOptionsFor(config, false));
   try {
@@ -790,7 +798,7 @@ export async function exportSession(config: AppConfig['x']): Promise<SessionFile
  * GUI-less server that received the file over Telegram or scp. Returns whether the seeded
  * session actually reads the profile without hitting a login wall.
  */
-export async function installSession(config: AppConfig['x'], file: SessionFile): Promise<{ authenticated: boolean }> {
+export async function installSession(config: AppConfig['x'], file: SessionFile): Promise<SessionCheck> {
   if (!config.enabled) throw new Error('X_ENABLED is false; enable X before importing');
   if (file.handle && file.handle.toLowerCase() !== config.handle.toLowerCase()) throw new Error('Session belongs to a different configured X handle');
   const context = await chromium.launchPersistentContext(config.profileDir, launchOptionsFor(config, true));

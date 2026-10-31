@@ -207,6 +207,19 @@ export class Store {
   getBatch(id: string): Batch | undefined { const row = this.db.prepare('SELECT * FROM batches WHERE id=?').get(id); return row ? this.batchRow(row) : undefined; }
   batches(limit = 100): Batch[] { return this.db.prepare('SELECT * FROM batches ORDER BY root_created_at DESC LIMIT ?').all(limit).map(r => this.batchRow(r)); }
   openBatches(): Batch[] { return this.db.prepare("SELECT * FROM batches WHERE state='open'").all().map(r => this.batchRow(r)); }
+  /** Batches waiting on the owner, by state rather than recency, so an old one never drops out of view. */
+  heldBatches(limit = 200): Batch[] {
+    return this.db.prepare("SELECT * FROM batches WHERE state IN ('review','open') ORDER BY root_created_at DESC LIMIT ?").all(limit).map(r => this.batchRow(r));
+  }
+  /** Scheduled local posts that have not gone out anywhere yet, soonest first: the ones the owner can still call off. */
+  scheduledBatches(limit = 100): Array<Batch & { dueAt: string; destinations: Destination[] }> {
+    return this.db.prepare(`SELECT b.*, MIN(j.due_at) AS due_at, json_group_array(j.destination) AS destinations FROM batches b
+      JOIN jobs j ON j.aggregate_id=b.id AND j.kind='publish' AND j.state='pending'
+      WHERE b.platform='local' AND b.state='sealed'
+      AND NOT EXISTS (SELECT 1 FROM jobs d WHERE d.aggregate_id=b.id AND d.kind='publish' AND d.state IN ('running','succeeded','unknown'))
+      GROUP BY b.id ORDER BY due_at LIMIT ?`).all(limit)
+      .map(r => ({ ...this.batchRow(r), dueAt: String(r.due_at), destinations: decode<Destination[]>(r.destinations) }));
+  }
   updateBatch(id: string, state: Batch['state'], reason: string): void { this.db.prepare('UPDATE batches SET state=?,reason=? WHERE id=?').run(state, reason, id); }
   addMirror(post: SourcePost, now: string): string {
     const key = Store.postKey(post.platform, post.id);
@@ -227,6 +240,8 @@ export class Store {
     this.db.prepare('INSERT OR IGNORE INTO manual_x_links(mirror_id,x_id) VALUES(?,?)').run(id, xId);
     this.db.prepare("UPDATE mirrors SET state='matched',matched_x_id=? WHERE id=?").run(xId, id);
   }
+  /** Withdraw a post that will never be published from the pending mirror candidates. */
+  dropPendingMirror(postKey: string): void { this.db.prepare("DELETE FROM mirrors WHERE post_key=? AND state='pending'").run(postKey); }
   mirrorMatchesXId(xId: string): boolean { return Boolean(this.db.prepare('SELECT 1 FROM manual_x_links WHERE x_id=? LIMIT 1').get(xId)); }
   /** A single mirror candidate by its id, if it still exists and has not expired past the search window. */
   getMirror(id: string, now: string): { id: string; post: SourcePost; expired: boolean; state: string } | undefined {
@@ -305,6 +320,15 @@ export class Store {
   jobsForAggregate(id: string): Job[] { return this.db.prepare('SELECT * FROM jobs WHERE aggregate_id=?').all(id).map(r => this.jobRow(r)); }
   hasDeliveryEvidence(jobId: string): boolean { return Boolean(this.db.prepare("SELECT 1 FROM steps WHERE job_id=? AND state IN ('started','succeeded') LIMIT 1").get(jobId)); }
   jobs(limit = 100): Job[] { return this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit).map(r => this.jobRow(r)); }
+  /** Jobs that need the owner, by state rather than recency, so a stuck job never drops out of view behind newer ones. */
+  attentionJobs(limit = 200): Job[] {
+    return this.db.prepare("SELECT * FROM jobs WHERE state IN ('failed','unknown','review') ORDER BY created_at DESC LIMIT ?").all(limit).map(r => this.jobRow(r));
+  }
+  /** The recent history plus every job that needs the owner, newest first. */
+  visibleJobs(limit = 100): Job[] {
+    const seen = new Set<string>();
+    return [...this.attentionJobs(), ...this.jobs(limit)].filter(job => !seen.has(job.id) && Boolean(seen.add(job.id)));
+  }
   telegramDeletionFailures(): Job[] {
     return this.db.prepare("SELECT * FROM jobs WHERE kind='retract' AND destination='telegram' AND state IN ('failed','review','unknown') ORDER BY created_at").all().map(row => this.jobRow(row));
   }
@@ -341,12 +365,38 @@ export class Store {
   /** Reconciliation: discard the uncertain (started-but-unconfirmed) steps of a job so a retry re-runs
    * them from scratch. Succeeded steps keep their receipts, so only the unconfirmed parts are redone. */
   discardStartedSteps(jobId: string): number { return Number(this.db.prepare("UPDATE steps SET state='rejected' WHERE job_id=? AND state='started'").run(jobId).changes); }
+  /**
+   * Whether a native post is one of our own deliveries. The receipt match runs in SQL, so this no
+   * longer decodes every step ever sent to the platform on each new native post; only the few
+   * started-but-unconfirmed steps are compared by text.
+   */
   outbound(platform: SourcePlatform, id: string, text: string): 'known' | 'possible' | undefined {
-    const rows = this.db.prepare('SELECT s.state,s.content,s.result FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.destination=?').all(platform);
-    for (const row of rows) {
-      if (row.result) { const ref = decode<RemoteRef>(row.result); if (ref.id === id || ref.uri === id) return 'known'; }
-      if (row.state === 'started' && cleanXLinks(decode<{ text: string }>(row.content).text) === text) return 'possible';
-    }
-    return undefined;
+    const known = this.db.prepare(`SELECT 1 FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.destination=? AND s.result IS NOT NULL
+      AND (json_extract(s.result,'$.id')=? OR json_extract(s.result,'$.uri')=?) LIMIT 1`).get(platform, id, id);
+    if (known) return 'known';
+    const started = this.db.prepare("SELECT s.content FROM steps s JOIN jobs j ON j.id=s.job_id WHERE j.destination=? AND s.state='started'").all(platform);
+    return started.some(row => cleanXLinks(decode<{ text: string }>(row.content).text) === text) ? 'possible' : undefined;
+  }
+
+  /**
+   * Housekeeping so the database does not grow forever: events older than `eventDays` (always keeping
+   * the newest `keepEvents`), and bookkeeping settings whose job or batch is finished.
+   */
+  prune(now: string, eventDays = 30, keepEvents = 500): { events: number; settings: number } {
+    return this.transaction(() => {
+      const before = new Date(Date.parse(now) - eventDays * 86400_000).toISOString();
+      const events = Number(this.db.prepare('DELETE FROM events WHERE at<? AND id<=(SELECT COALESCE(MAX(id),0)-? FROM events)').run(before, keepEvents).changes);
+      const plans = Number(this.db.prepare(`DELETE FROM settings WHERE key GLOB 'mention-plan:*'
+        AND substr(key,${'mention-plan:'.length + 1}) IN (SELECT id FROM jobs WHERE state IN ('succeeded','cancelled'))`).run().changes);
+      const stuck = Number(this.db.prepare(`DELETE FROM settings WHERE key GLOB 'seal_stuck:*'
+        AND substr(key,${'seal_stuck:'.length + 1}) IN (SELECT id FROM batches WHERE state<>'open')`).run().changes);
+      return { events, settings: plans + stuck };
+    });
+  }
+  /** Uploaded schedule images still needed: those of local posts with a delivery that can still run. */
+  mediaInUse(): Set<string> {
+    const rows = this.db.prepare(`SELECT payload FROM posts WHERE platform='local' AND batch_id IN
+      (SELECT aggregate_id FROM jobs WHERE kind='publish' AND state NOT IN ('succeeded','cancelled'))`).all();
+    return new Set(rows.flatMap(row => decode<SourcePost>(row.payload).attachments.map(a => a.path).filter((p): p is string => Boolean(p))));
   }
 }

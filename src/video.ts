@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -104,6 +104,8 @@ export async function prepareVideo(attachment: Attachment, config: VideoConfig, 
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const cached = await sourceBytes({ kind: 'video', path: target, alt: '' }, { ...config, maxDownloadBytes: outBytes.length }, transport);
       if (!cached.equals(outBytes)) throw new UnsupportedMediaError('Cached video content does not match its filename');
+      // Reused now, so media pruning must not treat it as stale while this delivery reads it.
+      await utimes(target, new Date(), new Date());
     });
     return {
       path: target, mimeType: 'video/mp4', alt: attachment.alt || '',

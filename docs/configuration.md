@@ -38,7 +38,7 @@
 | `DATA_DIR` | 工作目錄下的 `data` | 私密、可寫的狀態根目錄；SQLite 固定為其中的 `crosspost.sqlite`。同一目錄只可由一個執行中的實例使用。 | 自行建立並指定；新測試可用 `./data-preview`，systemd 的位置見 [部署文件](../deploy/README.md)。自訂目錄也須自行排除版控與公開備份。 |
 | `HOST` | `127.0.0.1` | Web 監聽位址。只有字面值 `127.0.0.1`、`::1` 可不設 token；其他值（包括 `localhost`）必須搭配長度至少 32 的 `WEB_TOKEN`。 | 本機／主機部署保持 loopback。容器內若需讓轉發連接埠可達，見 [Docker](#docker)。 |
 | `PORT` | `3000` | TCP 連接埠，整數 **1–65535**。低於 1024 的埠可能需要額外系統權限，不應因此以 root 啟動。 | 選擇未使用的高位埠；反向代理與連接埠映射須一致。 |
-| `WEB_TOKEN` | 空字串 | 有設定時，所有 POST／PUT／PATCH／DELETE 都必須帶 `Authorization: Bearer <token>`；非 loopback 至少 32 字元。**GET 頁面、狀態與貼文 API 並未因此加上登入保護。** | 用密碼管理器或密碼學安全亂數產生，建議至少 32 隨機 bytes，再編碼為 hex 等可儲存字串；用編輯器／secret store 存入，不貼到命令列。 |
+| `WEB_TOKEN` | 空字串 | 有設定時，所有 `/api/*`（含 GET 狀態與貼文）都必須帶 `Authorization: Bearer <token>`，只有頁面殼與 `/healthz` 不需要；非 loopback 至少 32 字元。沒設定時只接受 `Host` 為 loopback 名稱的請求，以擋 DNS rebinding。 | 用密碼管理器或密碼學安全亂數產生，建議至少 32 隨機 bytes，再編碼為 hex 等可儲存字串；用編輯器／secret store 存入，不貼到命令列。 |
 
 Web 頁面可輸入 token；目前 UI 會把它保存在該瀏覽器來源的 `localStorage`，請使用自己的受信任瀏覽器，勿在共用電腦保留。預設 loopback 且未設 token 時，寫入端點仍要求 JSON 並拒絕不符的跨來源請求；這不是完整的多使用者認證機制。正式部署優先用 SSH 通道；若使用反向代理，應在代理層對**所有路由**加上認證與 TLS。
 
@@ -281,7 +281,7 @@ npm run cli -- export-session
 5. 有疑問先停止 `bridge`。執行 `doctor`／`import-session` 等一次性命令時，使用相同 volume 與設定，且不要與常駐程式同時操作它。
 6. 不要同時讓主機版程式與容器處理同一資料庫、同一 X profile 或同一 bot。若 Chromium 報 sandbox／核心功能受限，先核對宿主環境與服務權限，不要直接關閉所有隔離保護。
 
-Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127.0.0.1:3000`。`WEB_TOKEN` 仍不保護所有 GET 路由，不能取代防火牆、SSH 或代理層認證。
+Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127.0.0.1:3000`。`WEB_TOKEN` 保護所有 API，但仍不能取代防火牆、SSH 或代理層認證。
 
 <a id="maintenance"></a>
 ## 備份、還原與更新

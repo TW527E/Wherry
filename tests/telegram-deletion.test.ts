@@ -178,7 +178,7 @@ test('Telegram deletion notices contain working owner-only actions and message l
   }
 });
 
-test('a Telegram deadline triggers a scan even when the normal collection interval is a day', async t => {
+test('a Telegram deadline is checked every minute through the embed endpoint only, never by an extra browser scan', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const directory = mkdtempSync(join(tmpdir(), 'wherry-deadline-'));
   const runtime = createRuntime(loadConfig({ DATA_DIR: directory, APP_MODE: 'live', X_ENABLED: 'true', X_HANDLE: 'owner',
@@ -191,17 +191,47 @@ test('a Telegram deadline triggers a scan even when the normal collection interv
   } });
   runtime.telegram!.setMyCommands = async () => {};
   const due = t.mock.method(runtime.store, 'telegramPostsToRecheck', () => [] as ReturnType<Store['telegramPostsToRecheck']>);
+  const checks = t.mock.method(runtime.engine, 'checkTelegramDeadlines', async () => 0);
   runtime.start();
   t.mock.timers.tick(60_000);
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(scans, 0, 'no extra scans without a deadline');
+  assert.equal(checks.mock.callCount(), 0, 'nothing to check without a deadline');
   due.mock.mockImplementation(() => [{} as ReturnType<Store['telegramPostsToRecheck']>[number]]);
   t.mock.timers.tick(60_000);
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(scans, 1);
+  assert.equal(checks.mock.callCount(), 1);
+  assert.equal(scans, 0, 'the deadline check never starts a browser scan');
 });
 
-test('web pending includes legacy deletion failures even beyond the job history limit and resolves them through the shared action', async t => {
+test('a failed between-scan deadline check backs off instead of retrying every minute', async t => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  let requests = 0;
+  let healthy = false;
+  const transport: Transport = { async request(url) {
+    requests++;
+    const id = new URL(url).searchParams.get('id');
+    if (!healthy) return { status: 503, headers: {}, body: new Uint8Array() };
+    return id === '999' ? { status: 200, headers: {}, body: Buffer.from(JSON.stringify({ id_str: id })) } : { status: 404, headers: {}, body: new Uint8Array() };
+  } };
+  const engine = new Engine(store, loadConfig({}), transport);
+  const source: SourcePost = { platform: 'x', id: '100', authorId: 'owner', text: 'body', createdAt: at(0),
+    replyToId: null, relationKnown: true, visibility: 'public', attachments: [], metadataComplete: true };
+  store.addPost(source, 'ready', 'thread_closed', at(0));
+  receipt(store);
+  store.markChecked('x:100', at(46.5));
+  store.setSetting('x:deletion_oracle', '999');
+  assert.equal(await engine.checkTelegramDeadlines(at(47)), 0);
+  assert.equal(requests, 1, 'only the oracle was asked');
+  assert.equal(await engine.checkTelegramDeadlines(at(47.05)), 0);
+  assert.equal(requests, 1, 'within the back-off window nothing is requested');
+  healthy = true;
+  assert.equal(await engine.checkTelegramDeadlines(at(47.1)), 1, 'after the back-off the deleted source is found');
+  assert.equal(store.getPost('x', '100')!.classification, 'deleted');
+  assert.equal(store.jobsForAggregate('x:100').filter(job => job.kind === 'retract').length, 1);
+});
+
+test('web status keeps a deletion failure listed even beyond the job history limit and resolves it through the shared action', async t => {
   const directory = mkdtempSync(join(tmpdir(), 'wherry-deletion-'));
   const runtime = createRuntime(loadConfig({ DATA_DIR: directory }));
   const app = await createWeb(runtime);
@@ -209,7 +239,7 @@ test('web pending includes legacy deletion failures even beyond the job history 
   const { job } = failure(runtime.store);
   for (let i = 0; i < 101; i++) runtime.store.enqueue('publish', `local:${i}`, 'telegram', at(50));
   const status = (await app.inject('/api/status')).json();
-  assert.ok(!status.jobs.some((entry: { id: string }) => entry.id === job));
+  assert.ok(status.jobs.some((entry: { id: string }) => entry.id === job), 'a stuck job is listed by state, not by recency');
   assert.equal(status.deletions[0].id, job);
   assert.equal(status.deletions[0].links.length, 2);
   const response = await app.inject({ method: 'POST', url: '/api/action', headers: { 'content-type': 'application/json' }, payload: { action: 'deleted', id: job } });

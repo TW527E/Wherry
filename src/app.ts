@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { FastifyInstance, fastify } from 'fastify';
 import { loadConfig, type AppConfig } from './config.js';
 import { SafeHttp } from './security/http.js';
@@ -12,7 +13,8 @@ import { SerialWork } from './lifecycle.js';
 import { XCollector, installSession } from './platforms/x.js';
 import { parseSessionFile, MAX_SESSION_BYTES } from './platforms/session.js';
 import { normalizeXHandle, type MentionTargets } from './mentions.js';
-import type { Collector, Destination, Publisher, RemoteRef } from './types.js';
+import { pruneMedia, saveUpload } from './media.js';
+import type { Attachment, Collector, Destination, Publisher, RemoteRef } from './types.js';
 
 class PreviewPublisher implements Publisher {
   constructor(readonly destination: Destination, private readonly store: Store) {}
@@ -77,6 +79,7 @@ export function createRuntime(config = loadConfig()) {
   let commands: Promise<void> | undefined;
   let stopping: Promise<void> | undefined;
   let menu: Promise<void> | undefined;
+  let deadlines: Promise<void> | undefined;
 
   const runCycle = (publish: boolean): Promise<void> => {
     if (stopped) return Promise.resolve();
@@ -159,9 +162,24 @@ export function createRuntime(config = loadConfig()) {
       timer.unref(); timers.add(timer);
     };
     every(config.pollSeconds * 1000, once);
-    if (live && telegram && config.x.enabled) every(60_000, async () => {
-      if (store.telegramPostsToRecheck(new Date().toISOString()).length) await once();
+    // Telegram copies can only be deleted for 48 hours, so hour-47 checks cannot wait for a long poll
+    // interval. They ask the embed endpoint only (no browser scan) and back off on failure; the heavy
+    // lane keeps them from overlapping a cycle, and the single-flight guard keeps ticks from queueing.
+    if (live && telegram && config.x.enabled) every(60_000, () => {
+      if (deadlines || stopped || !store.telegramPostsToRecheck(new Date().toISOString()).length) return Promise.resolve();
+      deadlines = heavy.run(async () => { if (!stopped && await engine.checkTelegramDeadlines()) await worker.run(); })
+        .finally(() => { deadlines = undefined; });
+      return deadlines;
     });
+    const maintain = async (): Promise<void> => {
+      const now = new Date().toISOString();
+      const pruned = store.prune(now);
+      const media = await pruneMedia(config.dataDir, store.mediaInUse(), Date.parse(now));
+      if (stopped) return;
+      if (pruned.events + pruned.settings + media) store.event('info', `Housekeeping removed ${pruned.events} old events, ${pruned.settings} finished bookkeeping entries and ${media} unused media files`);
+    };
+    void maintain().catch(error => { if (!stopped) store.event('warn', `Housekeeping failed: ${safeError(error)}`); });
+    every(86_400_000, maintain);
     if (live && telegram) every(15_000, () => notifications!.flush());
     if (live && telegram && config.telegram.pollCommands) {
       menu = telegram.setMyCommands(TELEGRAM_COMMANDS.map(c => ({ command: c.command, description: c.description })))
@@ -184,6 +202,8 @@ export function createRuntime(config = loadConfig()) {
   return {
     config, store, engine, worker, collectors, publishers, telegram, start, once,
     scan: () => runCycle(false),
+    /** True while a collect/publish cycle is running, so the UI can show it instead of blocking on it. */
+    scanning: () => Boolean(cycle),
     stop: () => {
       if (stopping) return stopping;
       stopped = true;
@@ -191,7 +211,7 @@ export function createRuntime(config = loadConfig()) {
       for (const timer of timers) clearInterval(timer);
       const workerStopped = worker.stop();
       stopping = (async () => {
-        await Promise.allSettled([cycle, commands, menu, workerStopped]);
+        await Promise.allSettled([cycle, commands, menu, deadlines, workerStopped]);
         await heavy.drain();
         await control.drain();
         await notifications?.flush();
@@ -233,6 +253,11 @@ function helpText(): string {
 const SESSION_LABELS: Record<string, string> = { authenticated: '已登入', error: '登入失效，請重新 /session', unknown: '尚未確認', disabled: '未啟用' };
 const ATTENTION = new Set(['failed', 'unknown', 'review']);
 
+function until(iso: string): string {
+  const minutes = Math.round((Date.parse(iso) - Date.now()) / 60_000);
+  return minutes < 1 ? '即將發布' : minutes < 60 ? `${minutes} 分鐘後` : minutes < 1440 ? `${Math.round(minutes / 60)} 小時後` : `${Math.round(minutes / 1440)} 天後`;
+}
+
 function ago(iso: string): string {
   const minutes = Math.round((Date.now() - Date.parse(iso)) / 60_000);
   return minutes < 1 ? '剛剛' : minutes < 60 ? `${minutes} 分鐘前` : minutes < 1440 ? `${Math.round(minutes / 60)} 小時前` : `${Math.round(minutes / 1440)} 天前`;
@@ -240,16 +265,21 @@ function ago(iso: string): string {
 
 /** Batches still waiting on the owner, with what the owner needs to decide: an excerpt and whether approve can publish. */
 function heldBatches(engine: Engine) {
-  return engine.store.batches(100).filter(b => b.state === 'review' || b.state === 'open').map(b => {
+  return engine.store.heldBatches().map(b => {
     const posts = engine.store.batchPosts(b.id).map(p => p.post);
     const hold = engine.holdReason(b.id);
     return { ...b, approvable: !hold || holdIsApprovable(hold), count: posts.length, text: posts[0]?.text ?? '', url: posts[0]?.url };
   });
 }
 
+function scheduledText(engine: Engine, batchId: string): string {
+  const text = engine.store.batchPosts(batchId)[0]?.post.text ?? '';
+  return text ? `\n  ${Array.from(text).slice(0, 60).join('')}` : '';
+}
+
 function statusText({ engine, store }: CommandContext): string {
   const { config } = engine;
-  const jobs = store.jobs(100);
+  const jobs = store.visibleJobs(100);
   const tally = (['failed', 'unknown', 'review', 'pending', 'running'] as const)
     .map(state => [state, jobs.filter(j => j.state === state).length] as const).filter(([, n]) => n)
     .map(([state, n]) => `${LABELS[state]} ${n}`).join(' · ');
@@ -280,11 +310,13 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
       const held = heldBatches(context.engine);
       const reminders = context.store.pendingReminders(context.engine.config.telegram.privateChatId);
       const deletions = context.store.telegramDeletionFailures();
+      const scheduled = context.store.scheduledBatches(20);
       const body = [
         ...held.map(b => `• ${b.id}｜${LABELS[b.state]}：${describe(b.reason)}${b.text ? `\n  ${Array.from(b.text).slice(0, 60).join('')}` : ''}\n  ${b.approvable ? `/approve ${b.id} · ` : ''}/skip ${b.id} · /mirror ${b.id}`),
         ...reminders.map(r => `• ${r.aggregateId}\n  X 提醒：${r.state}（請操作原提醒或 /mirror <id> <X_URL>）`),
-      ].join('\n\n') || '目前沒有等待處理的批次或提醒。';
-      await context.telegram.sendPlain(`待處理（${held.length} 批、${deletions.length} 筆 Telegram 刪除失敗）\n\n${body}`, 'private');
+        ...scheduled.map(b => `• ${b.id}｜排程：${until(b.dueAt)}${scheduledText(context.engine, b.id)}\n  取消：/skip ${b.id}`),
+      ].join('\n\n') || '目前沒有等待處理的批次、提醒或排程。';
+      await context.telegram.sendPlain(`待處理（${held.length} 批、${deletions.length} 筆 Telegram 刪除失敗、${scheduled.length} 則排程）\n\n${body}`, 'private');
       for (const job of deletions) await context.telegram.sendPlain(deletionNotice(job, context.engine), 'private', deletionButtons(job));
     }
     else if (['/map', '/maps', '/unmap'].includes(command)) {
@@ -315,7 +347,7 @@ async function handleCommand(raw: string, context: CommandContext): Promise<void
       } catch (error) { reply = `ID 映射未變更：${error instanceof Error ? error.message : '輸入無效'}`; }
       await context.telegram.sendPlain(reply, 'private');
     }
-    else if (command === '/skip' && id) { context.engine.action('skip', id); await context.telegram.sendPlain(`已跳過 ${id}`, 'private'); }
+    else if (command === '/skip' && id) { context.engine.action('skip', id); await context.telegram.sendPlain(id.startsWith('local:') ? `已取消排程 ${id}，不會發布。` : `已跳過 ${id}`, 'private'); }
     else if (command === '/mirror' && id) {
       if (extra) {
         const link = extractXStatus(extra, context.engine.config.x.handle);
@@ -375,29 +407,54 @@ async function handleSessionUpload(
 }
 
 const writeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+// The page shell and the health probe carry no data, so they load before the owner has entered a token.
+const publicPaths = new Set(['/', '/healthz']);
+const loopbackNames = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+class AuthError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
+/** Constant-time string comparison: hash both sides so the lengths match too. */
+function sameSecret(a: string, b: string): boolean {
+  return timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
+}
 
 /**
- * Guards the write endpoints. On loopback without a token we still refuse form-style
- * and cross-origin requests, so a page the owner happens to visit cannot drive the service.
+ * Guards every endpoint. With a token, every data route needs it — reads included, since status,
+ * events and posts are private too. Without one (loopback only), the Host header must name loopback:
+ * a DNS-rebinding page has its own hostname there, and since its Origin then matches that Host, the
+ * cross-origin check below alone would let it through. Writes additionally refuse form-style and
+ * cross-origin requests, so a page the owner happens to visit cannot drive the service.
  */
-function authorize(method: string, headers: Record<string, string | string[] | undefined>, config: AppConfig): void {
-  if (!writeMethods.has(method)) return;
+function authorize(method: string, path: string, headers: Record<string, string | string[] | undefined>, config: AppConfig): void {
   const header = headers.authorization;
-  const bearer = typeof header === 'string' && config.webToken && header === `Bearer ${config.webToken}`;
-  if (bearer) return;
-  if (config.webToken) throw new Error('Unauthorized');
-  if (config.host !== '127.0.0.1' && config.host !== '::1') throw new Error('Unauthorized');
+  if (config.webToken) {
+    if (publicPaths.has(path)) return;
+    if (typeof header === 'string' && sameSecret(header, `Bearer ${config.webToken}`)) return;
+    throw new AuthError('Unauthorized', 401);
+  }
+  let hostname = '';
+  try { hostname = new URL(`http://${String(headers.host ?? '')}`).hostname; } catch { /* rejected below */ }
+  if (!loopbackNames.has(hostname)) throw new AuthError('Host header must be a loopback address', 403);
+  if (!writeMethods.has(method)) return;
+  if (config.host !== '127.0.0.1' && config.host !== '::1') throw new AuthError('Unauthorized', 401);
   // A JSON content type forces a CORS preflight for cross-origin callers, and HTML forms
   // cannot set it at all, which blocks localhost CSRF.
   const contentType = headers['content-type'];
-  if (typeof contentType !== 'string' || !contentType.toLowerCase().startsWith('application/json')) throw new Error('Unsupported media type');
+  if (typeof contentType !== 'string' || !contentType.toLowerCase().startsWith('application/json')) throw new AuthError('Unsupported media type', 415);
   const origin = headers.origin;
   if (typeof origin === 'string' && origin !== 'null') {
     const host = headers.host;
     try { if (typeof host !== 'string' || new URL(origin).host !== host) throw new Error('Cross-origin request rejected'); }
-    catch { throw new Error('Cross-origin request rejected'); }
+    catch { throw new AuthError('Cross-origin request rejected', 403); }
   }
 }
+
+// A scheduled post carries at most four images, each sent as base64 JSON so the write stays a JSON
+// request (the CSRF guard relies on that); this bounds one image and the whole body.
+const MAX_UPLOAD_IMAGE_BYTES = 10_000_000;
+const SCHEDULE_BODY_LIMIT = Math.ceil(4 * MAX_UPLOAD_IMAGE_BYTES * 4 / 3) + 1_000_000;
 
 export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
   const app = fastify({ logger: false });
@@ -405,19 +462,23 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
     reply.header('x-content-type-options', 'nosniff');
     reply.header('cache-control', 'no-store');
     reply.header('referrer-policy', 'no-referrer');
-    try { authorize(request.method, request.headers, runtime.config); }
-    catch (error) { await reply.code(401).send({ error: safeError(error) }); }
+    try { authorize(request.method, request.url.split('?')[0]!, request.headers, runtime.config); }
+    catch (error) { await reply.code(error instanceof AuthError ? error.status : 401).send({ error: safeError(error) }); }
   });
   app.get('/healthz', async () => ({ ok: true, mode: runtime.config.mode }));
   app.get('/api/status', async () => ({
     mode: runtime.config.mode,
     xSession: runtime.store.setting<string>('x:session_state', runtime.config.x.enabled ? 'unknown' : 'disabled'),
-    tokenRequired: Boolean(runtime.config.webToken), destinations: runtime.config.destinations,
-    jobs: runtime.store.jobs(100), batches: runtime.store.batches(100), held: heldBatches(runtime.engine), events: runtime.store.events(50).map(e => ({ ...e, text: readableEvent(e.message) })),
-    deletions: runtime.store.telegramDeletionFailures().map(job => ({ ...job, links: runtime.engine.telegramDeletionLinks(job) })),
+    tokenRequired: Boolean(runtime.config.webToken), destinations: runtime.config.destinations, scanning: runtime.scanning(),
+    jobs: runtime.store.visibleJobs(100).map(job => ({ ...job, summary: runtime.engine.jobSummary(job) })),
+    batches: runtime.store.batches(100), held: heldBatches(runtime.engine), events: runtime.store.events(50).map(e => ({ ...e, text: readableEvent(e.message) })),
+    deletions: runtime.store.telegramDeletionFailures().map(job => ({ ...job, links: runtime.engine.telegramDeletionLinks(job), summary: runtime.engine.jobSummary(job) })),
+    scheduled: runtime.store.scheduledBatches().map(batch => ({ ...batch, text: runtime.store.batchPosts(batch.id)[0]?.post.text ?? '',
+      images: runtime.store.batchPosts(batch.id)[0]?.post.attachments.length ?? 0 })),
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
-  app.post('/api/scan', async () => { await runtime.once(); return { ok: true }; });
+  // A cycle can take minutes in a real browser, so the request only starts it; /api/status reports `scanning`.
+  app.post('/api/scan', async () => { const started = !runtime.scanning(); void runtime.once(); return { ok: true, started }; });
   app.post<{ Body: { action: Parameters<Engine['action']>[0]; id: string } }>('/api/action', async (request, reply) => {
     try {
       runtime.engine.action(request.body.action, request.body.id);
@@ -427,12 +488,28 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
     }
     catch (error) { return reply.code(400).send({ error: safeError(error) }); }
   });
-  app.post<{ Body: { text: string; attachments?: unknown[]; dueAt?: string } }>('/api/schedule', async (request, reply) => {
-    // No dueAt = now, stamped here: a client-side "now" is already in the past when it arrives.
-    const now = new Date().toISOString();
-    try { return { id: runtime.engine.schedule({ text: request.body.text, attachments: request.body.attachments as never, dueAt: request.body.dueAt || now }, now) }; }
-    catch (error) { return reply.code(400).send({ error: safeError(error) }); }
-  });
+  app.post<{ Body: { text: string; attachments?: unknown[]; images?: Array<{ data?: unknown; alt?: unknown }>; dueAt?: string; destinations?: Destination[] } }>('/api/schedule',
+    { bodyLimit: SCHEDULE_BODY_LIMIT }, async (request, reply) => {
+      // No dueAt = now, stamped here: a client-side "now" is already in the past when it arrives.
+      const now = new Date().toISOString();
+      try {
+        const images = request.body.images ?? [];
+        if (!Array.isArray(images) || images.length > 4) throw new Error('At most four images can be attached');
+        const uploaded: Attachment[] = [];
+        for (const image of images) {
+          if (typeof image?.data !== 'string' || (image.alt !== undefined && typeof image.alt !== 'string')) throw new Error('Each image needs base64 data and optional alt text');
+          const bytes = Buffer.from(image.data, 'base64');
+          if (!bytes.length || bytes.length > MAX_UPLOAD_IMAGE_BYTES) throw new Error(`Each image must be 1 byte to ${MAX_UPLOAD_IMAGE_BYTES / 1_000_000} MB`);
+          uploaded.push(await saveUpload(bytes, String(image.alt ?? '').slice(0, 2000), runtime.config));
+        }
+        const attachments = [...(Array.isArray(request.body.attachments) ? request.body.attachments : []), ...uploaded];
+        const id = runtime.engine.schedule({ text: request.body.text, attachments: attachments as never, dueAt: request.body.dueAt || now, destinations: request.body.destinations }, now);
+        // A post due now goes out now, not on the next poll.
+        if (!request.body.dueAt || Date.parse(request.body.dueAt) <= Date.now()) void runtime.worker.run().catch(() => undefined);
+        return { id };
+      }
+      catch (error) { return reply.code(400).send({ error: safeError(error) }); }
+    });
   app.get('/', async (_request, reply) => { reply.type('text/html; charset=utf-8'); return html; });
   return app;
 }
@@ -537,7 +614,9 @@ function put(id,html){const el=document.getElementById(id);if(el.dataset.h!==htm
 let toastTimer;function toast(message,bad){const t=$('#toast');t.textContent=message;t.className='toast show'+(bad?' bad':'');clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.className='toast'+(bad?' bad':'')},bad?4500:2400)}
 function token(){try{return localStorage.getItem('webToken')||''}catch{return ''}}
 function askToken(){$('#token-box').hidden=false;$('#token').focus()}
-async function post(path,body){const headers={'content-type':'application/json'};if(token())headers.authorization='Bearer '+token();
+function auth(){return token()?{authorization:'Bearer '+token()}:{}}
+async function get(path){const r=await fetch(path,{headers:auth()});if(r.status===401){askToken();throw new Error('unauthorized')}if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}
+async function post(path,body){const headers=Object.assign({'content-type':'application/json'},auth());
 const r=await fetch(path,{method:'POST',headers,body:JSON.stringify(body||{})});const j=await r.json().catch(()=>({}));
 if(r.status===401){askToken();throw new Error('需要正確的 Web token')}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 function confirmText(verb,n){const these=n>1?'這 '+n+' 筆':'這則';
@@ -603,9 +682,9 @@ const events=(s.events||[]).slice(0,25);const errors=events.filter(e=>e.level===
 const ec=$('#evt-count');ec.hidden=!errors;ec.textContent=errors+' 錯誤';ec.className='count hot';
 put('events',events.length?events.map(evtItem).join(''):'<div class="empty">尚無事件。</div>')}
 async function load(){if(loading)return;loading=true;
-try{const [s,posts]=await Promise.all([fetch('/api/status').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}),fetch('/api/posts').then(r=>r.ok?r.json():[]).catch(()=>[])]);
+try{const [s,posts]=await Promise.all([get('/api/status'),get('/api/posts').catch(()=>[])]);
 status=Object.assign(s,{posts});$('#offline').hidden=true;$('#updated').textContent='更新於 '+new Date().toLocaleTimeString('zh-TW',{hour12:false});render()}
-catch(e){$('#offline').hidden=false}finally{loading=false}}
+catch(e){if(e.message!=='unauthorized')$('#offline').hidden=false}finally{loading=false}}
 document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
 if(d.act)act(d.act,[d.id]);
 else if(d.bulk){const {items,verbs}=scopes[d.scope];const ok=verbs.find(v=>v[0]===d.bulk)[2];act(d.bulk,items.filter(i=>picked.has(i.id)&&ok(i)).map(i=>i.id))}
@@ -616,7 +695,7 @@ else if(d.all){for(const i of scopes[d.all].items){if(e.target.checked)picked.ad
 document.addEventListener('toggle',e=>{const k=e.target.dataset&&e.target.dataset.k;if(k){if(e.target.open)openEvt.add(k);else openEvt.delete(k)}},true);
 $('#evt-raw').addEventListener('click',()=>{rawEvents=!rawEvents;try{localStorage.setItem('evtRaw',rawEvents?'1':'')}catch{}rawBtn();render()});rawBtn();
 $('#scan').addEventListener('click',async e=>{const b=e.currentTarget;b.disabled=true;b.textContent='檢查中…';
-try{await post('/api/scan');toast('檢查完成')}catch(err){toast('檢查失敗：'+err.message,true)}finally{b.disabled=false;b.textContent='立即檢查';load()}});
+try{const r=await post('/api/scan');toast(r.started?'已開始檢查（背景執行）':'已有一次檢查正在進行')}catch(err){toast('檢查失敗：'+err.message,true)}finally{b.disabled=false;b.textContent='立即檢查';load()}});
 $('#token-box').addEventListener('submit',e=>{e.preventDefault();try{localStorage.setItem('webToken',$('#token').value.trim())}catch{}$('#token-box').hidden=true;toast('已儲存 token')});
 const text=$('#s-text');text.addEventListener('input',()=>{$('#s-count').textContent=Array.from(text.value.trim()).length+' 字'});
 text.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('#schedule').requestSubmit()});
