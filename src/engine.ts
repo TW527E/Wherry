@@ -666,6 +666,48 @@ export class Engine {
   }
 
   /**
+   * Already-synced X threads that a destination added later never received, newest first, with those
+   * destinations. Only owner-picked items from this list are ever sent: an old post reappearing on a new
+   * platform is a decision, not something to do to the whole history behind the owner's back.
+   */
+  backfillCandidates(limit = 200): Array<{ id: string; rootCreatedAt: string; text: string; url?: string; count: number; missing: Destination[] }> {
+    const output = [];
+    for (const batch of this.store.deliveredXBatches()) {
+      const missing = this.config.destinations.filter(destination => !batch.destinations.includes(destination));
+      if (!missing.length) continue;
+      const posts = this.store.batchPosts(batch.id).filter(member => member.classification !== 'deleted').map(member => member.post);
+      output.push({ id: batch.id, rootCreatedAt: batch.rootCreatedAt, text: posts[0]?.text ?? '', url: posts[0]?.url, count: posts.length, missing });
+      if (output.length >= limit) break;
+    }
+    return output;
+  }
+
+  /**
+   * Queue an already-synced X thread for destinations that never had it. Each call stamps its own time,
+   * so picking several oldest-first delivers them in that order and a quoted post lands before its quote.
+   */
+  backfill(batchId: string, destinations: Destination[] | undefined, now: string = new Date().toISOString()): Destination[] {
+    if (typeof batchId !== 'string' || !/^x:\d{1,32}$/.test(batchId)) throw new Error('id must be an X batch id');
+    const candidate = this.store.deliveredXBatches().find(batch => batch.id === batchId);
+    if (!candidate) throw new Error('Only X posts already synced to another platform can be backfilled');
+    const missing = this.config.destinations.filter(destination => !candidate.destinations.includes(destination));
+    const wanted = destinations === undefined ? missing : destinations;
+    if (!Array.isArray(wanted) || !wanted.length || wanted.some(destination => !missing.includes(destination))) {
+      throw new Error(`destinations must be a non-empty subset of the platforms this post never reached: ${missing.join(', ') || '(none)'}`);
+    }
+    // Content that became unpublishable since (VIDEO_ENABLED turned off, say) is refused up front rather
+    // than queued to fail.
+    const hold = this.holdReason(batchId);
+    if (hold && !holdIsApprovable(hold)) throw new Error(`This post can no longer be published: ${hold}`);
+    const queued = [...new Set(wanted)];
+    this.store.transaction(() => {
+      for (const destination of queued) this.store.enqueue('publish', batchId, destination, now);
+      this.store.event('info', `Owner backfilled ${batchId} to ${queued.join(', ')}`, batchId);
+    });
+    return queued;
+  }
+
+  /**
    * The downstream mirror candidates a held X batch might be a manual copy of, within the search
    * window. Their ids double as the "mirror codes" the notice shows: the owner replies with a code
    * plus the matching downstream URL to confirm the manual mirror. Only genuine, unexpired

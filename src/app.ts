@@ -483,6 +483,7 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
       deleteBy: runtime.store.telegramDeleteBy(job.aggregateId.slice('x:'.length)) })),
     scheduled: runtime.store.scheduledBatches().map(batch => ({ ...batch, text: runtime.store.batchPosts(batch.id)[0]?.post.text ?? '',
       images: runtime.store.batchPosts(batch.id)[0]?.post.attachments.length ?? 0 })),
+    backfill: runtime.engine.backfillCandidates(),
   }));
   app.get('/api/posts', async () => runtime.store.posts(100));
   // A cycle can take minutes in a real browser, so the request only starts it; /api/status reports `scanning`.
@@ -493,6 +494,14 @@ export async function createWeb(runtime: Runtime): Promise<FastifyInstance> {
       // Deliver now instead of on the next poll, like the Telegram commands do.
       if (['approve', 'retry', 'reconcile'].includes(request.body.action)) void runtime.worker.run().catch(() => undefined);
       return { ok: true };
+    }
+    catch (error) { return reply.code(400).send({ error: safeError(error) }); }
+  });
+  app.post<{ Body: { id: string; destinations?: Destination[] } }>('/api/backfill', async (request, reply) => {
+    try {
+      const destinations = runtime.engine.backfill(request.body?.id, request.body?.destinations);
+      void runtime.worker.run().catch(() => undefined);
+      return { ok: true, destinations };
     }
     catch (error) { return reply.code(400).send({ error: safeError(error) }); }
   });
@@ -625,6 +634,7 @@ section{padding:1rem}button{min-height:44px}.tabs button,.seg button,button.smal
 <div class="col col-main">
 <section id="sec-held"><h2>等你決定 <span id="held-count" class="count">0</span></h2><p class="hint">需要你按一下才會繼續的事情，最舊的在最上面。</p><div id="held-bulk"></div><div id="held"><div class="empty">載入中…</div></div></section>
 <section id="sec-jobs"><h2>發送工作 <span id="jobs-count" class="count">0</span><span id="jobs-attn" class="attn"></span></h2><div id="jobs-tabs" class="tabs" role="group" aria-label="篩選發送工作"></div><div id="jobs-bulk"></div><div id="jobs"><div class="empty">載入中…</div></div></section>
+<section id="sec-backfill"><h2>補發到新平台 <span id="bf-count" class="count">0</span></h2><p class="hint">已經同步過、但還沒發到某些平台（例如剛加的平台）的推文。勾選要補的，會從最舊的開始發。</p><div id="bf-dests" class="chips" role="group" aria-label="要補發的平台"></div><div id="bf-bulk"></div><div id="backfill"><div class="empty">載入中…</div></div></section>
 <section id="sec-posts"><h2>最近讀到的貼文</h2><p class="hint">每則有沒有同步、為什麼。</p><div id="posts" class="list"><div class="empty">載入中…</div></div></section>
 </div>
 <div class="col col-side">
@@ -649,7 +659,7 @@ const TONE={succeeded:'ok',retracted:'ok',sealed:'ok',ready:'ok',manual_mirror:'
 const JOB={failed:['發送失敗','err'],unknown:['不確定有沒有發出','warn'],review:['需要你確認','warn'],pending:['等待發送','info'],running:['發送中','info'],succeeded:['已完成','ok'],cancelled:['已取消','']};
 const MIRROR_REASONS=['possible_manual_mirror','multiple_possible_manual_mirrors'];
 const TABS=[['attn','需要處理'],['active','進行中'],['done','已完成']];
-const DONE={approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄',deleted:'已記錄手動刪除，工作已完成',unschedule:'已取消排程'};
+const DONE={backfill:'已排入補發，最舊的先發',approve:'已批准，背景發布中',skip:'已略過',mirror:'已標記為手動鏡像',retry:'已排入重試',reconcile:'已排入重新發送',cancel:'已放棄',deleted:'已記錄手動刪除，工作已完成',unschedule:'已取消排程'};
 // Client-only verbs that reuse a server action with their own wording.
 const ACTION={unschedule:'skip'};
 const TYPES=['image/jpeg','image/png','image/webp','image/gif'];
@@ -660,7 +670,7 @@ clock:'<svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><circl
 plus:'<svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>'};
 const $=s=>document.querySelector(s);
 const busy=new Set();const picked=new Set();const openEvt=new Set();let rawEvents=false;try{rawEvents=localStorage.getItem('evtRaw')==='1'}catch{}
-let scopes={};let status={};let loading=false;let scanning=false;let offline=false;let lastOk=0;let jobTab='attn';let tabPinned=false;let destReady=false;let whenMode='now';let timer=0;let memToken='';
+const bfOff=new Set();let scopes={};let status={};let loading=false;let scanning=false;let offline=false;let lastOk=0;let jobTab='attn';let tabPinned=false;let destReady=false;let whenMode='now';let timer=0;let memToken='';
 const files=[];const alts=[];const urls=[];
 const rtf=new Intl.RelativeTimeFormat('zh-Hant',{numeric:'auto'});
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -685,7 +695,8 @@ async function get(path){const r=await fetch(path,{headers:auth()});if(r.status=
 async function post(path,body){const headers=Object.assign({'content-type':'application/json'},auth());
 const r=await fetch(path,{method:'POST',headers,body:JSON.stringify(body||{})});const j=await r.json().catch(()=>({}));
 if(r.status===401){needToken('權杖不對，伺服器拒絕了（401）。');throw new Error('需要正確的存取權杖')}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
-function confirmText(verb,n){const these=n>1?'這 '+n+' 筆':'這則';
+function confirmText(verb,n,ids){const these=n>1?'這 '+n+' 筆':'這則';
+if(verb==='backfill'){const d=[...new Set((ids||[]).flatMap(bfTargets))];return status.mode==='live'?'確定把'+these+'舊推文補發到 '+d.map(x=>PLATFORM[x]||x).join('、')+'？會出現在這些平台上，發出後無法自動收回。':''}
 if(verb==='approve')return status.mode==='live'?'確定把'+these+'發布到 '+((status.destinations||[]).map(d=>PLATFORM[d]||d).join('、')||'其他平台')+'？發出後無法自動收回。':'';
 if(verb==='skip')return these+'略過後不會同步，之後也無法再批准。確定？';
 if(verb==='mirror')return these+'標記為手動鏡像後不會同步。確定？';
@@ -695,8 +706,11 @@ if(verb==='deleted')return '確認已在 Telegram 手動刪除這則貼文的所
 if(verb==='unschedule')return '取消這則排程？取消後不會發布到任何平台。';
 return ''}
 // One request per id: the same validated endpoint as a single click, so a bulk run can't bypass any per-item check.
-async function act(verb,ids){const q=confirmText(verb,ids.length);if(q&&!confirm(q))return;for(const id of ids)busy.add(verb+':'+id);render();let failed=0,last='';
-for(const id of ids){try{await post('/api/action',{action:ACTION[verb]||verb,id});picked.delete(id)}catch(e){failed++;last=e.message}finally{busy.delete(verb+':'+id)}}
+async function act(verb,ids){const q=confirmText(verb,ids.length,ids);if(q&&!confirm(q))return;
+// Oldest first, so a quoted post is already on the platform when the post quoting it goes out.
+if(verb==='backfill')ids=ids.slice().sort((a,b)=>String((bfItem(a)||{}).rootCreatedAt).localeCompare(String((bfItem(b)||{}).rootCreatedAt)));
+for(const id of ids)busy.add(verb+':'+id);render();let failed=0,last='';
+for(const id of ids){try{await (verb==='backfill'?post('/api/backfill',{id,destinations:bfTargets(id)}):post('/api/action',{action:ACTION[verb]||verb,id}));picked.delete(id)}catch(e){failed++;last=e.message}finally{busy.delete(verb+':'+id)}}
 if(failed)toast((ids.length>1?(ids.length-failed)+' 筆完成、'+failed+' 筆失敗：':'失敗：')+last,true);else toast((ids.length>1?ids.length+' 筆':'')+DONE[verb]);await load()}
 function pick(id){return '<input type="checkbox" data-pick="'+esc(id)+'" aria-label="選取"'+(picked.has(id)?' checked':'')+'>'}
 function bulkBar(scope){const {items,verbs}=scopes[scope];if(items.length<2)return '';const sel=items.filter(i=>picked.has(i.id));
@@ -732,6 +746,12 @@ return '<article class="item"><div class="head">'+(attn?pick(j.id):'')+chip(st[0
 +'<div class="actions">'+acts+'<span class="spacer"></span><span class="links meta">'+(s.url?link(s.url,'原文'):'')+'<span class="id">'+esc(j.aggregateId)+'</span></span></div></article>'}
 function postItem(p){return '<div><div class="prow">'+tag(p.classification)+'<b>'+esc(PLATFORM[p.post.platform]||p.post.platform)+'</b><span class="t">'+esc(p.post.text||'（沒有文字）')+'</span><span class="meta">'+when(p.post.createdAt)+'</span></div>'
 +'<div class="meta">'+[label(p.reason),link(p.post.url,'原文')].filter(Boolean).join(' · ')+'</div></div>'}
+function bfItem(id){return (status.backfill||[]).find(b=>b.id===id)}
+function bfTargets(id){const b=bfItem(id);return b?b.missing.filter(d=>!bfOff.has(d)):[]}
+function bfRow(b){const d=bfTargets(b.id).map(x=>PLATFORM[x]||x);
+return '<article class="item"><div class="head">'+pick(b.id)+d.map(x=>chip('缺 '+x,'info')).join('')+'<span class="spacer"></span><span class="meta">'+when(b.rootCreatedAt)+'</span></div>'
++(b.text?'<p class="text short">'+esc(b.text)+'</p>':'')
++'<div class="actions">'+btn('backfill',b.id,'補發到 '+esc(d.join('、')),'primary')+'<span class="spacer"></span><span class="links meta">'+[b.count>1?'<span>串文共 '+b.count+' 則</span>':'',link(b.url,'在 X 開啟'),'<span class="id">'+esc(b.id)+'</span>'].filter(Boolean).join('')+'</span></div></article>'}
 function upItem(b){const d=b.destinations||[];const all=d.length>1&&d.length===(status.destinations||[]).length;
 return '<div class="up"><div class="head"><b>'+esc(fmtDue(b.dueAt))+'</b><span class="meta">'+[ago(b.dueAt),all?'全部平台':d.map(x=>PLATFORM[x]||x).join('、'),b.images?b.images+' 張圖':''].filter(Boolean).map(esc).join(' · ')+'</span></div>'
 +(b.text?'<p class="text short">'+esc(b.text)+'</p>':'')+'<div>'+btn('unschedule',b.id,'取消排程','small')+'</div></div>'}
@@ -755,10 +775,14 @@ const jobs=(s.jobs||[]).filter(j=>!deletionChoice(j)&&!(j.state==='pending'&&lat
 const groups={attn:jobs.filter(stuck),active:jobs.filter(j=>j.state==='pending'||j.state==='running'),done:jobs.filter(j=>j.state==='succeeded'||j.state==='cancelled')};
 // Open on what needs the owner; with nothing stuck, fall through to what is moving, then to history.
 if(!tabPinned)jobTab=groups.attn.length?'attn':groups.active.length?'active':'done';
+const bfAll=s.backfill||[];const bfDests=[...new Set(bfAll.flatMap(b=>b.missing))];const bf=bfAll.filter(b=>bfTargets(b.id).length);
 scopes={held:{items:held,verbs:[['approve','發布',b=>b.approvable,'go'],['skip','略過',()=>true],['mirror','是我手動搬的',()=>true]]},
-jobs:{items:jobTab==='attn'?groups.attn:[],verbs:[['retry','重試',j=>j.state!=='unknown','primary'],['cancel','放棄',()=>true]]}};
-const keep=new Set([...scopes.held.items,...scopes.jobs.items].map(i=>i.id));for(const id of picked)if(!keep.has(id))picked.delete(id);
-put('held-bulk',bulkBar('held'));put('jobs-bulk',bulkBar('jobs'));
+jobs:{items:jobTab==='attn'?groups.attn:[],verbs:[['retry','重試',j=>j.state!=='unknown','primary'],['cancel','放棄',()=>true]]},
+backfill:{items:bf,verbs:[['backfill','補發',()=>true,'primary']]}};
+const keep=new Set([...scopes.held.items,...scopes.jobs.items,...scopes.backfill.items].map(i=>i.id));for(const id of picked)if(!keep.has(id))picked.delete(id);
+put('held-bulk',bulkBar('held'));put('jobs-bulk',bulkBar('jobs'));put('bf-bulk',bulkBar('backfill'));
+count('bf-count',bf.length,false);put('bf-dests',bfDests.length>1?bfDests.map(d=>'<label><input type="checkbox" value="'+esc(d)+'"'+(bfOff.has(d)?'':' checked')+'>'+esc(PLATFORM[d]||d)+'</label>').join(''):'');
+put('backfill',bf.length?bf.slice(0,100).map(bfRow).join(''):empty('',bfAll.length?'沒有符合所選平台的推文':'沒有要補發的推文',bfAll.length?'':'每則已同步的推文都已經發到目前的所有平台'));
 const queue=[...deletions.map(j=>[j.dueAt,deletionItem(j)]),...held.map(b=>[b.rootCreatedAt,heldItem(b)])].sort((a,b)=>String(a[0]).localeCompare(String(b[0])));
 put('held',queue.length?queue.map(q=>q[1]).join(''):empty(ICON.ok,'沒有要你決定的事','新貼文會自動同步'));
 count('jobs-count',groups.attn.length+groups.active.length,false);$('#jobs-attn').textContent=groups.attn.length?'其中 '+groups.attn.length+' 個需要處理':'';
@@ -789,7 +813,8 @@ document.addEventListener('change',e=>{const t=e.target;const d=t.dataset||{};
 if(d.pick){if(t.checked)picked.add(d.pick);else picked.delete(d.pick);render()}
 else if(d.all){for(const i of scopes[d.all].items){if(t.checked)picked.add(i.id);else picked.delete(i.id)}render()}
 else if(t.id==='s-img'){addImgs(t.files);t.value=''}
-else if(t.closest('#s-dest'))lengthHint()});
+else if(t.closest('#s-dest'))lengthHint();
+else if(t.closest('#bf-dests')){if(t.checked)bfOff.delete(t.value);else bfOff.add(t.value);render()}});
 document.addEventListener('input',e=>{const d=e.target.dataset||{};if('alt' in d)alts[Number(d.alt)]=e.target.value});
 document.addEventListener('toggle',e=>{const k=e.target.dataset&&e.target.dataset.k;if(k){if(e.target.open)openEvt.add(k);else openEvt.delete(k)}},true);
 $('#evt-raw').addEventListener('click',()=>{rawEvents=!rawEvents;try{localStorage.setItem('evtRaw',rawEvents?'1':'')}catch{}rawBtn();render()});rawBtn();

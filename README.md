@@ -25,6 +25,7 @@
 - 你刪掉已同步的 X 推文時，自動刪掉它在 Bluesky、dvd.chat、Telegram 的副本，Argon 說說則移到垃圾桶（[細節](#deletes)）。
 - 系統錯誤自動轉發到 Telegram 私聊，秘密先遮蔽。
 - CLI、網頁介面，以及排程發布（排程只發到下游，並提醒你發 X）。
+- 新加一個平台後，可以挑選之前已同步過的推文**手動補發**過去（[細節](#backfill)）；不會自動把整段歷史灌進新平台。
 
 **不會做**
 
@@ -112,6 +113,8 @@ npm run cli -- status                    # 列出 jobs、batches、近期事件
 npm run cli -- publish <batchId>         # 對已封存的批次補發布
 npm run cli -- schedule <ISO時間> <文字>   # 排程發布（不會排程 X 寫入）
 npm run cli -- action <動作> <id>         # 見下表
+npm run cli -- backfill                  # 列出已同步、但還沒發到某些平台的推文
+npm run cli -- backfill <batchId> [平台,…] # 把這則補發到缺的平台（不寫平台＝全部缺的）
 npm run cli -- doctor                    # 檢查設定
 npm run cli -- login                     # 本機開瀏覽器登入 X
 npm run cli -- export-session            # 匯出 X 登入到 X_SESSION_FILE
@@ -129,6 +132,13 @@ npm run cli -- import-session            # 安裝 X_SESSION_FILE 的登入
 | `reconcile <jobId>` | `/reconcile` | 重送結果不明（`unknown`）的工作——**先自己確認遠端沒有發出** |
 | `cancel <jobId>` | `/cancel` | 放棄發不出去的工作（例如投票已過期），不再發送或重試 |
 | `deleted <jobId>` | `/deleted` | 確認已手動刪除失敗工作的所有 Telegram 訊息，結束工作 |
+
+<a id="backfill"></a>
+### 補發到新平台
+
+在 `DESTINATIONS` 加了新平台後，之前的推文不會自己跑過去。網頁介面的「補發到新平台」列出已經成功同步到至少一個平台、但還沒發到某些平台的 X 推文（X 上已刪除、仍待審核、或曾在該平台嘗試過的不算）。勾選要補的（可用上方的平台勾選只補其中幾個），按「補發」後會從**最舊的**開始依序發出，讓被引用的推文先到。說說與 Bluesky 會標上原推文的時間（Bluesky 會顯示為回溯日期的貼文）；dvd.chat 與 Telegram 沒辦法回溯，會以補發當下的時間出現。
+
+補發只建立新平台的發布工作，已經發過的平台不會重發；發失敗時和一般工作一樣在「需要處理」裡重試。
 
 <a id="telegram"></a>
 ### Telegram

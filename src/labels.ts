@@ -120,6 +120,7 @@ const EVENTS: Array<[RegExp, (...m: string[]) => string]> = [
   [/^Owner cancelled a job/, () => '你放棄了一個工作，不會再發送或重試'],
   [/^Owner confirmed the Telegram copies were manually deleted$/, () => '你已確認手動刪除 Telegram 副本，工作已完成'],
   [/^Owner reconciled an unknown delivery/, () => '你確認了結果不明的發送，未確認的部分會重新發送'],
+  [/^Owner backfilled \S+ to ([\w, ]+)$/, d => `你把一則已同步的推文補發到 ${d.split(', ').map(P).join('、')}`],
   [/^Owner action: (\w+)$/, a => `你的操作：${ACTIONS[a] ?? a}`],
   [/^No publisher configured for (\w+)$/, d => `${P(d)} 沒有設定發布器`],
   [/^Dropped (\d+) baseline history posts/, n => `清掉 ${n} 則誤登記為手動鏡像的舊貼文`],
