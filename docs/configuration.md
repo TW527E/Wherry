@@ -5,7 +5,7 @@
 ## 目錄
 
 - [載入規則](#loading)
-- 設定表：[基本與 Web](#basics)、[X](#x)、[Bluesky](#bluesky)、[Sharkey](#sharkey)、[Telegram](#telegram)、[時間與限制](#timing)、[影片模組](#video)
+- 設定表：[基本與 Web](#basics)、[X](#x)、[Bluesky](#bluesky)、[Sharkey](#sharkey)、[Telegram](#telegram)、[Argon 說說](#argon)、[時間與限制](#timing)、[影片模組](#video)
 - [ID 映射（@提及）](#mentions)
 - [官方憑證與帳號資料取得](#credentials)
 - [X 登入與 session 安全](#x-session)
@@ -34,7 +34,7 @@
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
 | `APP_MODE` | `preview` | 僅接受 `preview` 或 `live`。前者模擬發布，後者可對下游真正發布；X 永遠手動發文。 | 先以 preview 核對分類；確認帳號、目的地與資料目錄後才改 live。 |
-| `DESTINATIONS` | 空清單 | 逗號分隔 `bluesky`、`sharkey`、`telegram`；會去除項目前後空白與重複值。不得包含 `x`。控制對外發布，不控制來源收集或 Telegram 私聊／告警。 | 只列出你要公開發布的平台。Bluesky／Sharkey 必須啟用對應來源；Telegram 要另設 public chat。 |
+| `DESTINATIONS` | 空清單 | 逗號分隔 `bluesky`、`sharkey`、`telegram`、`argon`；會去除項目前後空白與重複值。不得包含 `x`。控制對外發布，不控制來源收集或 Telegram 私聊／告警。 | 只列出你要公開發布的平台。Bluesky／Sharkey 必須啟用對應來源；Telegram 要另設 public chat；`argon` 要 `ARGON_ENABLED=true`。 |
 | `DATA_DIR` | 工作目錄下的 `data` | 私密、可寫的狀態根目錄；SQLite 固定為其中的 `crosspost.sqlite`。同一目錄只可由一個執行中的實例使用。 | 自行建立並指定；新測試可用 `./data-preview`，systemd 的位置見 [部署文件](../deploy/README.md)。自訂目錄也須自行排除版控與公開備份。 |
 | `HOST` | `127.0.0.1` | Web 監聽位址。只有字面值 `127.0.0.1`、`::1` 可不設 token；其他值（包括 `localhost`）必須搭配長度至少 32 的 `WEB_TOKEN`。 | 本機／主機部署保持 loopback。容器內若需讓轉發連接埠可達，見 [Docker](#docker)。 |
 | `PORT` | `3000` | TCP 連接埠，整數 **1–65535**。低於 1024 的埠可能需要額外系統權限，不應因此以 root 啟動。 | 選擇未使用的高位埠；反向代理與連接埠映射須一致。 |
@@ -118,6 +118,48 @@ X 目前只辨認頁面可見的警告文案，若帳戶設定隱藏了警告，
 所有非空 Telegram ID 均須為數字字串（驗證格式為 `^-?\d+$`）；頻道 ID 常以 `-100` 開頭，**保留負號**。Owner 使用自己的正數 user ID，不是電話號碼。格式驗證不會替你檢查 chat 是否存在、是否屬於你或 bot 是否有權限。
 
 告警目前針對 `error` 事件，不等於每次成功、每筆 `warn` 或服務啟停都會通知。常駐程式另以約 15 秒週期處理告警，並保存處理游標；首次啟用不會把所有舊錯誤一次重播。Telegram 本身故障時，仍須看本機事件與服務日誌；告警不是保證送達的監控系統。
+
+<a id="argon"></a>
+## Argon 說說（5 個）
+
+把 X 推文發到 WordPress [Argon 主題](https://github.com/TW527E/argon-theme)的「說說」（`shuoshuo` 文章類型），透過 WordPress 內建 REST API 與應用程式密碼。只發布、不讀取：你直接在說說發的內容不會被同步回 X 或其他平台，所以它不需要像 Bluesky／Sharkey 那樣當作來源觀察。
+
+| 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
+|---|---|---|---|
+| `ARGON_ENABLED` | `false` | 啟用 Argon 發布器；`DESTINATIONS` 含 `argon` 時必須為 true。`live` 且帳號與密碼都非空才真的發布。 | 網站開好 REST（見下方）後再啟用。 |
+| `ARGON_URL` | 空字串 | WordPress 網站的 HTTPS 根網址，不含 `/wp-json`、查詢字串或帳密。程式呼叫 `{ARGON_URL}/wp-json/wp/v2/…`，所以網站要開啟固定網址（permalink 不是「樸素」）。 | 填瀏覽器開網站首頁時的網址，例如 `https://blog.example.com`；裝在子目錄就帶上子目錄。 |
+| `ARGON_USERNAME` | 空字串 | 發文帳號的使用者名稱。 | 建議開一個只有「作者」角色的專用帳號：能發布自己的文章、上傳媒體、刪除自己的文章，不能改網站設定。 |
+| `ARGON_APP_PASSWORD` | 空字串 | 該帳號的應用程式密碼（WordPress 5.6+），以 HTTP Basic 驗證送出；外洩時可單獨撤銷，不影響登入密碼。 | 以該帳號登入後台 →「使用者 → 個人資料 → 應用程式密碼」，命名為 Wherry 後新增，複製顯示一次的密碼（空格可保留）。 |
+| `ARGON_SIGNATURE` | 「原文連結」段落 | 附在每則說說底部的 HTML；`{url}` 換成該推文的 `x.com` 連結（已跳脫）。空字串＝不加。 | 想要不同文字或樣式時再改；內容原樣寫入文章 HTML，不要放不信任的內容。 |
+
+### 讓說說開放 REST API
+
+Argon 註冊 `shuoshuo` 時沒有設定 `show_in_rest`，所以 WordPress REST API 預設沒有這個路由，發布會回 404（事件會寫「enable show_in_rest for the shuoshuo post type」）。擇一處理：
+
+- **改主題**：在主題 `functions.php` 的 `init_shuoshuo()` 裡，`$args` 加上 `'show_in_rest' => true,`。主題更新會覆蓋這個修改。
+- **不動主題（建議）**：在 `wp-content/mu-plugins/` 新增一個 PHP 檔（例如 `argon-shuoshuo-rest.php`），主題更新也不受影響：
+
+  ```php
+  <?php
+  // Expose Argon's shuoshuo post type to the REST API so Wherry can publish to it.
+  add_filter('register_post_type_args', function ($args, $post_type) {
+      if ($post_type === 'shuoshuo') $args['show_in_rest'] = true;
+      return $args;
+  }, 10, 2);
+  ```
+
+開啟後後台編輯說說會改用區塊編輯器；Wherry 寫入的也是區塊格式，可以直接編輯。要確認路由，以瀏覽器開 `{ARGON_URL}/wp-json/wp/v2/shuoshuo`，看到 JSON 陣列（可能是空的 `[]`）就代表好了。若有安全外掛或主機商封鎖 REST API／應用程式密碼，需對這個帳號放行。
+
+### 發出去的樣子
+
+- **一串推文＝一則說說**：自串文合併成一則，每則推文一段，圖片與影片接在各自的文字後面，照原順序。沒有長度限制，不會分段。
+- **時間**：說說的發布時間設為 X 上 root 推文的時間，說說頁顯示的日期與 X 一致。
+- **媒體**：圖片與影片（含 GIF，以靜音循環影片呈現）上傳到媒體庫並保留替代文字；大小受網站的 PHP 上傳上限（`upload_max_filesize`、`post_max_size`）限制，超過會失敗並寫入事件。
+- **提及與引用**：@提及一律換成 X 個人頁連結（說說沒有帳號體系，所以沒有映射）。引用自己已同步的推文時連到那則說說，否則連到 X 原推文。
+- **投票**：說說沒有投票，改以文字列出選項並附 X 原投票連結（與 Bluesky 相同）。
+- **敏感內容**：整則說說包進可展開的「詳情」區塊，摘要顯示 CW。
+- **刪除**：X 原推文刪除時，對應的說說會移到 WordPress **垃圾桶**（可還原），上傳的媒體留在媒體庫。只刪除串文中的後續推文不會動到說說；刪掉 root 才會。
+- 標題留空，Argon 只顯示內文；留言、按讚照主題原本的設定。
 
 <a id="mentions"></a>
 ## ID 映射（@提及）
@@ -342,6 +384,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | 401／403／Sharkey `read:account` 不足 | 核對同帳戶的憑證與實例；Sharkey 優先填自己的 username 或 user ID，若採 `/api/i` 才另外需要 read scope。不要把 token 或完整回應貼到 issue。 |
 | Telegram 不回指令／按鈕沒反應 | 需 live、enabled、token、`TELEGRAM_POLL_COMMANDS=true`，且 owner/private chat 都正確；先 `/start`，檢查是否另有 poller／webhook。preview 不會回應。 |
 | Telegram 沒有告警 | 需 live 及可用 Telegram 設定；自動告警一律送 private chat。只轉送新 `error` 事件，並非所有訊息；pollCommands=false 仍可發告警。 |
+| Argon 說說發送失敗 HTTP 404 | 說說沒有開放 REST API，照 [讓說說開放 REST API](#讓說說開放-rest-api) 處理；也確認 `ARGON_URL` 正確、網站使用固定網址。401 是帳號或應用程式密碼錯誤，403 多半是角色權限不足或安全外掛擋下。 |
 | Telegram 私聊可用，但對外頻道沒內容 | 確認 `DESTINATIONS` 含 `telegram`、public chat 數字 ID 正確及 bot 可發文。只設 enabled 或 public chat 不會建立對外發布工作。 |
 | `/session` 被拒絕 | 核對 owner/private chat、live、輪詢、X enabled、明確的 `/session` 指令／caption、本工具匯出格式與 256 KiB 上限；勿反覆把登入檔傳到其他 chat。 |
 | `unknown` 或送出後連線中斷 | 先人工確認遠端是否已有內容並處理對帳。`/retry`、`/resync`、CLI retry 都不是強制重送 unknown 的後門，不能靠重啟解決。 |

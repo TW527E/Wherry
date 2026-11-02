@@ -59,11 +59,12 @@ export function nativePollPayload(poll: PollSnapshot, destination: 'sharkey' | '
   return { choices, multiple: false, expiresAt };
 }
 
-export function formatXPoll(poll: PollSnapshot, url: string): string {
+/** A destination without native polls lists the X poll as text; `platform` names it in the notice. */
+export function formatXPoll(poll: PollSnapshot, url: string, platform = 'Bluesky'): string {
   const snapshot = pollSnapshotSchema.parse(poll);
   const status = { open: '進行中', closed: '已結束', unknown: '狀態未提供' }[snapshot.status];
   const lines = [
-    'Bluesky 不支援原生投票；請前往 X 參與。',
+    `${platform} 不支援原生投票；請前往 X 參與。`,
     `🗳️ X 投票（${status}；擷取時快照）`,
     ...snapshot.options.map((option, index) => `${index + 1}. ${option.text}${option.percentage === undefined ? '' : ` — ${option.percentage}%`}`),
   ];

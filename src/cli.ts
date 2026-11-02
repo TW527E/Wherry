@@ -133,6 +133,7 @@ async function main(): Promise<number> {
           sources: { x: config.x.enabled, bluesky: config.bluesky.enabled, sharkey: config.sharkey.enabled },
           xBrowser: { ...browser, status: browserStatus },
           telegram: { enabled: config.telegram.enabled, private: Boolean(config.telegram.privateChatId), ops: Boolean(config.telegram.opsChatId), public: Boolean(config.telegram.publicChatId) },
+          argon: { enabled: config.argon.enabled, url: config.argon.baseUrl || undefined, credentials: Boolean(config.argon.username && config.argon.appPassword) },
           xWrites: 'disabled by design (manual only)',
         }, null, 2));
         return 0;

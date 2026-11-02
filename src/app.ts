@@ -7,6 +7,7 @@ import { Engine, Worker, collectCycle, holdIsApprovable, safeError } from './eng
 import { LABELS, PLATFORM_NAMES, describe, readableEvent } from './labels.js';
 import { BlueskyClient } from './platforms/bluesky.js';
 import { SharkeyClient } from './platforms/sharkey.js';
+import { ArgonClient } from './platforms/argon.js';
 import { TelegramClient, type TelegramUpdateMessage } from './platforms/telegram.js';
 import { deletionButtons, deletionNotice, extractXStatus, handleCallback, handleReminderReply, handleReviewReply, TelegramNotifications } from './telegram-notifications.js';
 import { SerialWork } from './lifecycle.js';
@@ -54,6 +55,8 @@ export function createRuntime(config = loadConfig()) {
     telegram = new TelegramClient(config.telegram, transport);
     if (live) publishers.set('telegram', telegram);
   }
+  // Publish-only: nothing posted to the 說說 page is read back, so there is no collector.
+  if (live && config.argon.enabled && config.argon.username && config.argon.appPassword) publishers.set('argon', new ArgonClient(config.argon, transport));
   if (!live) {
     for (const destination of config.destinations) publishers.set(destination, new PreviewPublisher(destination, store));
   }
