@@ -1,5 +1,5 @@
 export type SourcePlatform = 'x' | 'bluesky' | 'sharkey' | 'local';
-export type Destination = 'bluesky' | 'sharkey' | 'telegram';
+export type Destination = 'bluesky' | 'sharkey' | 'telegram' | 'argon';
 export type SensitiveLabel = 'porn' | 'sexual' | 'nudity' | 'graphic-media';
 export type Classification = 'baseline' | 'collecting' | 'ready' | 'manual_mirror' | 'mirror_review' | 'ignored' | 'unsupported' | 'deleted';
 export type JobState = 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'review' | 'cancelled';
@@ -146,6 +146,11 @@ export interface PublishPart {
   isFooter?: boolean;
   /** Inline keyboard, one row of buttons, attached only by Telegram (e.g. the interactive reminder). */
   buttons?: InlineButton[];
+  /**
+   * Argon only: a whole X thread goes out as ONE 說說, each source post a section with its own media in
+   * place. `text` and `media` still hold the joined text and every item, for the delivery record.
+   */
+  sections?: Array<{ text: string; media: PreparedMedia[] }>;
 }
 
 export interface RemoteRef {

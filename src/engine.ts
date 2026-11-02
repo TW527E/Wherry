@@ -787,6 +787,11 @@ export class Engine {
     const lateMs = (this.config.threadWindowSeconds + this.config.settleSeconds + 3600) * 1000;
     const backdate = (post: SourcePost): { backdate?: string } => job.destination === 'bluesky' && post.platform === 'x'
       && Date.parse(now) - Date.parse(post.createdAt) > lateMs ? { backdate: post.createdAt } : {};
+    // Sharkey and Telegram create native polls; Bluesky and Argon show an X poll as text.
+    const pollDestination = job.destination === 'sharkey' || job.destination === 'telegram' ? job.destination : undefined;
+    const nativePoll = pollDestination !== undefined;
+    // Argon publishes a whole thread as ONE 說說, every post a section with its media in place.
+    const sections: Array<{ post: SourcePost; text: string; media: PreparedMedia[]; sourceUrl?: string }> = [];
     if (job.kind === 'reminder') output.push({
       key: 'notice', sourcePostId: members[0]!.id,
       text: `🔔 你在 ${members[0]!.platform} 發了新內容。要不要也發到 X？\n下方是可直接複製的內容。請選擇：`,
@@ -799,7 +804,7 @@ export class Engine {
       if (unsupported && !holdIsApprovable(unsupported)) throw new Error(unsupported);
       const poll = post.platform === 'x' ? post.pollData : undefined;
       const sensitive = isSensitiveContent(post);
-      if (poll && job.destination !== 'bluesky') {
+      if (poll && nativePoll) {
         if (post.attachments.length) throw new Error('A native X poll cannot be combined with media');
         if (job.destination === 'telegram' && sensitive) throw new Error('Telegram cannot hide native poll questions/options with a spoiler; sensitive polls require review');
       }
@@ -822,16 +827,20 @@ export class Engine {
       if (post.quoteUrl && !quoted) {
         const quoteUrl = fixupUrl(post.quoteUrl) || post.quoteUrl;
         text += `${text ? '\n\n' : ''}${job.destination === 'sharkey' ? `[引用推文](${quoteUrl})` : `引用推文：${quoteUrl}`}`;
-      }
+      } else if (quoted?.url && job.destination === 'argon') text += `${text ? '\n\n' : ''}引用說說：${quoted.url}`;
       const sourceUrl = post.platform === 'x' ? fixupUrl(post.url || `https://x.com/${post.authorId}/status/${post.id}`) : undefined;
       if (poll) {
-        const pollText = job.destination === 'bluesky' ? formatXPoll(poll, xPollUrl(post)!)
+        const pollText = !nativePoll ? formatXPoll(poll, xPollUrl(post)!, job.destination === 'argon' ? 'Argon 說說' : 'Bluesky')
           : `🗳️ 此平台為獨立投票，票數不與 X 或其他平台合併。\n截止時間${poll.expiresAtEstimated ? '（依 X 倒數估算）' : ''}：${poll.expiresAt}\nX 原投票：${xPollUrl(post)!}`;
         text += `${text ? '\n\n' : ''}${pollText}`;
       }
       const marking = sensitive ? { sensitive: true, cw: contentWarning(post), sensitiveLabels: post.sensitiveLabels } : {};
       const prefix = warningPrefix(marking);
       const key = createHash('sha256').update(post.id).digest('hex').slice(0, 16);
+      if (job.destination === 'argon') {
+        sections.push({ post, text, media, sourceUrl });
+        continue;
+      }
       if (job.destination === 'telegram') {
         // A tweet's photos and videos belong to ONE post, so send them as a single album
         // (sendMediaGroup) with the whole caption on the first item — not one message per item, which
@@ -878,19 +887,31 @@ export class Engine {
         }
       }
     }
-    if (batch?.platform === 'x' && job.destination !== 'telegram' && job.destination !== 'sharkey') {
+    if (sections.length) {
+      // No length limit and no thread to reply into: the 說說 carries the root's key, so quoting that root
+      // later finds it, and deleting the root on X takes the whole 說說 with it. The root's time stays on
+      // it, so the 說說 page dates it as X does rather than by when the thread settled.
+      const root = sections[0]!;
+      const sensitive = sections.map(section => section.post).find(isSensitiveContent);
+      output.push({ key: `${createHash('sha256').update(root.post.id).digest('hex').slice(0, 16)}:0`, sourcePostId: root.post.id,
+        text: sections.map(section => section.text).join('\n\n'), media: sections.flatMap(section => section.media),
+        sections: sections.map(({ text, media }) => ({ text, media })), sourceUrl: root.sourceUrl,
+        ...(sensitive ? { sensitive: true, cw: contentWarning(sensitive), sensitiveLabels: sensitive.sensitiveLabels } : {}),
+        ...(root.post.platform === 'x' ? { backdate: root.post.createdAt } : {}) });
+    }
+    if (batch?.platform === 'x' && job.destination === 'bluesky') {
       const root = members[0]!;
       const url = fixupUrl(root.url || `https://x.com/${root.authorId}/status/${root.id}`);
       if (!url) throw new Error('X root URL invalid');
       output.push({ key: 'footer', sourcePostId: batch.rootId, text: `🔗 X 原推文：${url}`, media: [], sourceUrl: url, isFooter: true, ...backdate(members.at(-1)!) });
     }
-    if (job.destination !== 'bluesky') {
+    if (pollDestination) {
       for (const part of output) {
         if (!part.poll) continue;
         const prior = this.store.getStep(job.id, part.key);
         // Receipts survive expiry; an uncertain creation must reach reconciliation, not a fresh-poll check.
         if (prior?.state === 'started' || (prior?.state === 'succeeded' && prior.result)) continue;
-        nativePollPayload(part.poll, job.destination, Date.parse(now));
+        nativePollPayload(part.poll, pollDestination, Date.parse(now));
       }
     }
     return output;

@@ -287,7 +287,7 @@ export class TelegramNotifications {
     if (!config.telegram.privateChatId) return;
     const errors = store.errorEventsAfter(store.setting<number>('telegram:error_offset', 0), 5);
     if (!errors.length) return;
-    const secrets = [config.telegram.token, config.bluesky.appPassword, config.sharkey.token, config.webToken].filter(Boolean);
+    const secrets = [config.telegram.token, config.bluesky.appPassword, config.sharkey.token, config.argon.appPassword, config.webToken].filter(Boolean);
     const redact = (text: string): string => {
       for (const secret of secrets) text = text.replaceAll(secret, '[redacted]');
       return safeError(new Error(text));

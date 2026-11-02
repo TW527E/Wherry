@@ -2,7 +2,7 @@
 
 # Wherry
 
-以 X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動完成**；工具只讀取你自己的 X 內容，並同步到 Bluesky、dvd.chat（Sharkey）與 Telegram。
+以 X 為主來源的個人跨平台同步工具。X 的發文**永遠由你手動完成**；工具只讀取你自己的 X 內容，並同步到 Bluesky、dvd.chat（Sharkey）、Telegram 與 WordPress Argon 主題的說說。
 
 - 設定與維運：[`docs/configuration.md`](docs/configuration.md)
 - systemd 部署：[`deploy/README.md`](deploy/README.md)
@@ -17,12 +17,12 @@
 
 **會做**
 
-- 讀取你 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道。
-- 附上原文連結：Bluesky 在串文最後多回覆一則 `fixupx.com` 連結；Sharkey 在各則內文附可設定的署名與連結；Telegram 每則底部附 `原文連結`。
+- 讀取你 X 個人頁的新推文（含幾乎同時發出的自串文），過濾後同步到 Bluesky、dvd.chat、Telegram 對外頻道、Argon 說說（一串推文合併成一則說說）。
+- 附上原文連結：Bluesky 在串文最後多回覆一則 `fixupx.com` 連結；Sharkey 在各則內文附可設定的署名與連結；Telegram 每則底部附 `原文連結`；Argon 說說底部附可設定的原文連結。
 - 轉換 @提及：貼文裡真的 tag 到的 X 帳號，有映射就換成該平台的原生 ID，沒映射就換成 X 個人頁連結（[細節](#mentions)）。
 - 你在 Bluesky／dvd.chat 發原生貼文時，用 Telegram 私聊送**互動提醒**，請你決定要不要手動搬到 X（[細節](#telegram)）。
 - 認出你手動貼到 X 的鏡像內容，**不再**回同步到其他平台（[防回音](#echo)）。
-- 你刪掉已同步的 X 推文時，自動刪掉它在 Bluesky、dvd.chat、Telegram 的副本（[細節](#deletes)）。
+- 你刪掉已同步的 X 推文時，自動刪掉它在 Bluesky、dvd.chat、Telegram 的副本，Argon 說說則移到垃圾桶（[細節](#deletes)）。
 - 系統錯誤自動轉發到 Telegram 私聊，秘密先遮蔽。
 - CLI、網頁介面，以及排程發布（排程只發到下游，並提醒你發 X）。
 
@@ -33,7 +33,7 @@
 - ❌ 同步回覆他人、晚發的自回覆、轉貼、引用或非公開內容。
 - ❌ 純音訊、動態圖片檔（APNG 等）、X Premium 長文：一律**保留**並通知原因。長文可由通知手動放行（發布時自動分段），其餘沒有發布路徑。
 
-投票不在上面兩類：Sharkey／Telegram 各建一份**獨立**原生投票（票數不與 X 或彼此合併，沿用 X 的截止時間）；Bluesky 沒有原生投票，改以文字列出選項並附 X 原投票連結。資料不完整、已過期或敏感的投票仍會保留。
+投票不在上面兩類：Sharkey／Telegram 各建一份**獨立**原生投票（票數不與 X 或彼此合併，沿用 X 的截止時間）；Bluesky 與 Argon 說說沒有原生投票，改以文字列出選項並附 X 原投票連結。資料不完整、已過期或敏感的投票仍會保留。
 
 ---
 
@@ -91,6 +91,7 @@ npm run cli -- serve      # 啟動排程、worker 與網頁介面
 | `TELEGRAM_PRIVATE_CHAT_ID` | 你的私聊：互動提醒、錯誤告警、指令回覆、session 上傳 |
 | `TELEGRAM_OWNER_ID` | 唯一能下指令、按提醒按鈕、上傳 session 的使用者 |
 | `TELEGRAM_POLL_COMMANDS` | `true` 才處理指令與按鈕（僅 `live`） |
+| `ARGON_*` | WordPress Argon 說說：網址、帳號與**應用程式密碼**；網站須先讓說說開放 REST API（[步驟](docs/configuration.md#argon)） |
 
 完整設定（用途與取得方式）見 [`docs/configuration.md`](docs/configuration.md)。
 
@@ -181,7 +182,7 @@ Telegram 只允許 bot 刪 48 小時內的訊息。刪除失敗會保留失敗�
 
 **編輯同步**：X 的編輯會產生一則新推文（新 ID），舊版仍讀得到。新版會像新推文一樣照常同步；同一套重查發現舊版在 `edit_control` 裡已有較新版本時，就把舊版的副本當成刪除處理。所以各平台最後只留新版，但新版發出和舊版刪除各自進行，順序不保證，中間可能有幾分鐘兩版並存。
 
-**敏感內容**：Bluesky 每段加 selfLabels＋CW 文字、Sharkey 每段加 CW＋敏感檔案、Telegram 正文與媒體加 spoiler。來源沒有 CW 時使用「來源標記為敏感內容」。敏感標記不會解除非公開或不支援媒體的限制；敏感投票不會在 Telegram 發布（無法對題目防雷）。Bluesky 的媒體遮蔽依讀者設定，純文字只保留可見 CW、不保證折疊。X 偵測只涵蓋頁面可見的警告。詳見[敏感內容同步說明](docs/configuration.md#敏感內容如何同步)。
+**敏感內容**：Bluesky 每段加 selfLabels＋CW 文字、Sharkey 每段加 CW＋敏感檔案、Telegram 正文與媒體加 spoiler、Argon 說說整則包進可展開的區塊。來源沒有 CW 時使用「來源標記為敏感內容」。敏感標記不會解除非公開或不支援媒體的限制；敏感投票不會在 Telegram 發布（無法對題目防雷）。Bluesky 的媒體遮蔽依讀者設定，純文字只保留可見 CW、不保證折疊。X 偵測只涵蓋頁面可見的警告。詳見[敏感內容同步說明](docs/configuration.md#敏感內容如何同步)。
 
 <a id="mentions"></a>
 ### @提及

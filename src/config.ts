@@ -12,6 +12,9 @@ const bool = (value: string | undefined, fallback: boolean): boolean => value ==
 // string to publish Sharkey notes with no attribution at all (like clearing an email signature).
 export const DEFAULT_SHARKEY_SIGNATURE =
   '<center><small>$[sparkle $[blur 這是從 X 來的推文，[點擊此處]({url})前往原文，[點擊此處](https://github.com/TW527E/Wherry)前往項目倉庫]]</small></center>';
+// Appended below every Argon 說說 synced from X. WordPress stores post HTML, so this is HTML (a block-editor
+// paragraph); `{url}` becomes the post's X link, already HTML-escaped. An empty ARGON_SIGNATURE disables it.
+export const DEFAULT_ARGON_SIGNATURE = '<!-- wp:paragraph --><p><a href="{url}" target="_blank" rel="noopener">原文連結</a></p><!-- /wp:paragraph -->';
 const integer = (value: string | undefined, fallback: number, min: number, max: number): number => {
   const n = value === undefined ? fallback : Number(value);
   return z.number().int().min(min).max(max).parse(n);
@@ -37,12 +40,13 @@ export interface AppConfig {
   bluesky: { enabled: boolean; identifier: string; appPassword: string; serviceUrl: string; publicUrl: string; sensitiveLabel: SensitiveLabel };
   sharkey: { enabled: boolean; baseUrl: string; token: string; userId: string; username: string; signature: string; driveFolder: string; uploadName: string };
   telegram: { enabled: boolean; token: string; ownerId: string; privateChatId: string; opsChatId: string; publicChatId: string; pollCommands: boolean };
+  argon: { enabled: boolean; baseUrl: string; username: string; appPassword: string; signature: string };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const dataDir = resolve(env.DATA_DIR || 'data');
   const mode = z.enum(['preview', 'live']).parse(env.APP_MODE || 'preview');
-  const destinations = z.array(z.enum(['bluesky', 'sharkey', 'telegram'])).parse(
+  const destinations = z.array(z.enum(['bluesky', 'sharkey', 'telegram', 'argon'])).parse(
     (env.DESTINATIONS || '').split(',').map(s => s.trim()).filter(Boolean),
   );
   const config: AppConfig = {
@@ -102,6 +106,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       opsChatId: env.TELEGRAM_OPS_CHAT_ID || '', publicChatId: env.TELEGRAM_PUBLIC_CHAT_ID || '',
       pollCommands: bool(env.TELEGRAM_POLL_COMMANDS, false),
     },
+    argon: {
+      enabled: bool(env.ARGON_ENABLED, false), baseUrl: (env.ARGON_URL || '').trim().replace(/\/+$/, ''),
+      username: env.ARGON_USERNAME || '', appPassword: env.ARGON_APP_PASSWORD || '',
+      signature: env.ARGON_SIGNATURE ?? DEFAULT_ARGON_SIGNATURE,
+    },
   };
   if (config.host !== '127.0.0.1' && config.host !== '::1' && config.webToken.length < 32) {
     throw new Error('WEB_TOKEN must have at least 32 characters when binding outside loopback');
@@ -111,6 +120,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   for (const destination of config.destinations) {
     if (destination === 'bluesky' && !config.bluesky.enabled) throw new Error('DESTINATIONS includes bluesky, so BLUESKY_ENABLED must also be true (mirror detection requires observing that account)');
     if (destination === 'sharkey' && !config.sharkey.enabled) throw new Error('DESTINATIONS includes sharkey, so SHARKEY_ENABLED must also be true (mirror detection requires observing that account)');
+  }
+  // Argon is publish-only (nobody posts 說說 by hand to mirror back to X), so it needs no observed source,
+  // only a site to publish to. The Application Password travels on every request, hence HTTPS only.
+  if (config.destinations.includes('argon') && !config.argon.enabled) throw new Error('DESTINATIONS includes argon, so ARGON_ENABLED must also be true');
+  if (config.argon.enabled) {
+    let url: URL | undefined;
+    try { url = new URL(config.argon.baseUrl); } catch { /* reported below */ }
+    if (!url || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new Error('ARGON_URL must be the HTTPS address of the WordPress site, e.g. https://blog.example.com');
   }
   // The template must yield a filesystem-safe name. Fill the placeholders with representative values
   // and check the result up front, so a bad SHARKEY_UPLOAD_NAME fails at startup, not mid-publish.

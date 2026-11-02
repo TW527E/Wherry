@@ -70,7 +70,7 @@ export function describe(code: string | undefined): string {
   return label ? `${label}（${code}）` : code;
 }
 
-export const PLATFORM_NAMES: Record<string, string> = { x: 'X', bluesky: 'Bluesky', sharkey: 'Sharkey', telegram: 'Telegram', local: '本地排程' };
+export const PLATFORM_NAMES: Record<string, string> = { x: 'X', bluesky: 'Bluesky', sharkey: 'Sharkey', telegram: 'Telegram', argon: 'Argon 說說', local: '本地排程' };
 const P = (platform: string): string => PLATFORM_NAMES[platform] ?? platform;
 const L = (code: string): string => LABELS[code] ?? code;
 const ACTIONS: Record<string, string> = { approve: '批准發布', skip: '略過', mirror: '標記為手動鏡像' };
@@ -123,7 +123,7 @@ const EVENTS: Array<[RegExp, (...m: string[]) => string]> = [
   [/^Owner action: (\w+)$/, a => `你的操作：${ACTIONS[a] ?? a}`],
   [/^No publisher configured for (\w+)$/, d => `${P(d)} 沒有設定發布器`],
   [/^Dropped (\d+) baseline history posts/, n => `清掉 ${n} 則誤登記為手動鏡像的舊貼文`],
-  [/^(x|bluesky|sharkey|telegram): ([\s\S]*)$/, (d, e) => `${P(d)} 發送失敗：${e}`],
+  [/^(x|bluesky|sharkey|telegram|argon): ([\s\S]*)$/, (d, e) => `${P(d)} 發送失敗：${e}`],
 ];
 
 export function readableEvent(message: string): string | undefined {
