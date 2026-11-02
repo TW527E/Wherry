@@ -6,6 +6,7 @@ import { safeError } from './engine.js';
 import { resolveBrowserPlan, verifyBrowserPlan } from './platforms/browser.js';
 import { loginInteractive, exportSession, installSession } from './platforms/x.js';
 import { parseSessionFile } from './platforms/session.js';
+import type { Destination } from './types.js';
 import { createInterface } from 'node:readline/promises';
 import { readFile, writeFile, chmod } from 'node:fs/promises';
 
@@ -18,6 +19,8 @@ Usage:
   wherry scan                  Collect sources only (never publishes)
   wherry publish <batchId>     Enqueue downstream publication for a sealed batch
   wherry schedule <iso> <text> Create a local scheduled post (no X write)
+  wherry backfill [batchId [dest,...]]
+                               List synced X posts a destination never got, or send one there
   wherry action <verb> <id>    skip | approve | mirror | retry | reconcile | cancel | deleted
   wherry doctor                Validate configuration and report capabilities
   wherry login                 Open a visible browser to log into X once (saves the session)
@@ -75,6 +78,20 @@ async function main(): Promise<number> {
         if (!dueAt || !text) throw new Error('schedule requires an ISO timestamp and text');
         const id = runtime.engine.schedule({ text, dueAt });
         console.log(`scheduled batch ${id} for ${dueAt} (no X write is scheduled)`);
+        return 0;
+      }
+      case 'backfill': {
+        const [, batchId, list] = argv;
+        if (!batchId) {
+          const candidates = runtime.engine.backfillCandidates();
+          if (!candidates.length) console.log('every synced X post has reached all configured destinations');
+          for (const item of candidates) console.log(`  ${item.id.padEnd(24)} ${item.rootCreatedAt} missing=${item.missing.join(',')} ${item.text.replace(/\s+/g, ' ').slice(0, 60)}`);
+          return 0;
+        }
+        const queued = runtime.engine.backfill(batchId, list?.split(',').map(item => item.trim()).filter(Boolean) as Destination[] | undefined);
+        console.log(`queued ${batchId} for ${queued.join(', ')}`);
+        await runtime.worker.run();
+        printStatus(runtime);
         return 0;
       }
       case 'action': {

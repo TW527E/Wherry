@@ -220,6 +220,19 @@ export class Store {
       GROUP BY b.id ORDER BY due_at LIMIT ?`).all(limit)
       .map(r => ({ ...this.batchRow(r), dueAt: String(r.due_at), destinations: decode<Destination[]>(r.destinations) }));
   }
+  /**
+   * X threads already delivered somewhere, newest first, each with every destination that has a publish
+   * job for it in any state. A destination missing from that list never had one (it was added later),
+   * so it is the only kind a backfill may create; one that failed is retried instead, never duplicated.
+   */
+  deliveredXBatches(): Array<Batch & { destinations: Destination[] }> {
+    return this.db.prepare(`SELECT b.*, json_group_array(j.destination) AS destinations FROM batches b
+      JOIN jobs j ON j.aggregate_id=b.id AND j.kind='publish'
+      WHERE b.platform='x' AND b.state='sealed'
+      AND EXISTS (SELECT 1 FROM posts p WHERE p.batch_id=b.id AND p.classification<>'deleted')
+      GROUP BY b.id HAVING SUM(j.state='succeeded')>0 ORDER BY b.root_created_at DESC`).all()
+      .map(r => ({ ...this.batchRow(r), destinations: decode<Destination[]>(r.destinations) }));
+  }
   updateBatch(id: string, state: Batch['state'], reason: string): void { this.db.prepare('UPDATE batches SET state=?,reason=? WHERE id=?').run(state, reason, id); }
   addMirror(post: SourcePost, now: string): string {
     const key = Store.postKey(post.platform, post.id);
@@ -338,7 +351,7 @@ export class Store {
   telegramDeletionFailures(): Job[] {
     return this.db.prepare("SELECT * FROM jobs WHERE kind='retract' AND destination='telegram' AND state IN ('failed','review','unknown') ORDER BY created_at").all().map(row => this.jobRow(row));
   }
-  dueJobs(now: string): Job[] { return this.db.prepare("SELECT * FROM jobs WHERE state='pending' AND due_at<=? ORDER BY kind='retract' DESC,due_at,created_at LIMIT 20").all(now).map(r => this.jobRow(r)); }
+  dueJobs(now: string): Job[] { return this.db.prepare("SELECT * FROM jobs WHERE state='pending' AND due_at<=? ORDER BY kind='retract' DESC,due_at,created_at,rowid LIMIT 20").all(now).map(r => this.jobRow(r)); }
   claimJob(id: string): boolean { return Number(this.db.prepare("UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=? AND state='pending'").run(id).changes) === 1; }
   updateJob(id: string, state: JobState, error?: string, dueAt?: string): void {
     this.db.prepare('UPDATE jobs SET state=?,error=?,due_at=COALESCE(?,due_at) WHERE id=?').run(state, error || null, dueAt || null, id);
