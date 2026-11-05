@@ -174,3 +174,18 @@ test('native collectors only warn about incomplete posts newer than the last sca
     assert.equal(old.complete, true, platform);
   }
 });
+
+test('an X long post reads its full text once from its own status page, and fails loudly when it cannot', async () => {
+  const visits: string[] = []; let closed = 0; let html = '<span>full long text</span>';
+  const focal = { filter: () => focal, first: () => focal, async waitFor() {}, evaluate: async () => ({ html, truncated: false }) };
+  const tab = { async route() {}, async goto(url: string) { visits.push(url); }, locator: () => focal, async close() { closed++; } };
+  const article = { page: () => ({ context: () => ({ newPage: async () => tab }) }) };
+  const collector = new XCollector(loadConfig({ X_HANDLE: 'TW527E' }).x);
+  const read = (id: string): Promise<string> => collector['fullTextHtml'](article as never, id);
+  assert.equal(await read('42'), '<span>full long text</span>');
+  assert.equal(await read('42'), '<span>full long text</span>');
+  assert.deepEqual(visits, ['https://x.com/TW527E/status/42'], 'cached after the first read');
+  html = '';
+  await assert.rejects(read('43'), /full text could not be read/);
+  assert.equal(closed, 2, 'the extra tab is always closed');
+});
