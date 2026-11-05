@@ -267,6 +267,19 @@ export function parseTweetText(html: string): MentionText {
   return { text, mentions };
 }
 
+/**
+ * This article's own tweet body (never a quoted tweet's) as HTML, and whether X cut it short behind
+ * "Show more" — which the timeline and thread pages do to every X Premium long post.
+ */
+function readTweetText(article: Locator): Promise<{ html: string; truncated: boolean }> {
+  return article.evaluate((node: Element) => {
+    const own = (element: Element): boolean => element.closest('article') === node && !element.closest('[data-testid="quoteTweet"]');
+    const body = Array.from(node.querySelectorAll('[data-testid="tweetText"]')).find(own);
+    const truncated = Array.from(node.querySelectorAll('[data-testid="tweet-text-show-more-link"]')).some(own);
+    return { html: body?.innerHTML || '', truncated };
+  }).catch(() => ({ html: '', truncated: false }));
+}
+
 /** The tweet id and author handle from an article's own timestamp permalink. */
 async function articleIdentity(article: Locator): Promise<{ id?: string; author: string }> {
   const permalink = await article.locator('a:has(time)').first().getAttribute('href').catch(() => null);
@@ -328,6 +341,8 @@ export class XCollector implements Collector {
   private readonly videoMedia = new Map<string, Attachment[] | null>();
   // The tweet a quote card shows, per quoting tweet id (null = looked up, unknown).
   private readonly quotes = new Map<string, string | null>();
+  // A long post's full body HTML, per tweet id, read once from its own status page.
+  private readonly fullTexts = new Map<string, string>();
   constructor(
     private readonly config: AppConfig['x'],
     private readonly transport?: Transport,
@@ -364,6 +379,27 @@ export class XCollector implements Collector {
       ? `https://x.com/${handle}/status/${id}` : undefined;
     if (!signal?.aborted) this.quotes.set(tweetId, url ?? null);
     return url;
+  }
+
+  /**
+   * A long post's full body, from its own status page in a separate tab so the caller's page keeps its
+   * place. The engine stores a post the first time it sees it, so a truncated read would sync the cut
+   * text for good: failing to read the full text fails the scan (no checkpoint advanced) instead.
+   */
+  private async fullTextHtml(article: Locator, id: string): Promise<string> {
+    const cached = this.fullTexts.get(id);
+    if (cached !== undefined) return cached;
+    const page = await article.page().context().newPage();
+    try {
+      await guardRoutes(page);
+      await page.goto(`https://x.com/${encodeURIComponent(this.config.handle)}/status/${id}`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      const focal = page.locator('article[data-testid="tweet"]').filter({ has: page.locator(`a[href$="/status/${id}"] time`) }).first();
+      await focal.waitFor({ timeout: 15_000 }).catch(() => undefined);
+      const { html } = await readTweetText(focal);
+      if (!html) throw new Error(`X long post ${id} shows "Show more" but its full text could not be read from its status page; no checkpoint advanced`);
+      this.fullTexts.set(id, html);
+      return html;
+    } finally { await page.close().catch(() => undefined); }
   }
 
   /** The embed endpoint's view of one tweet; every failure is undefined. */
@@ -472,12 +508,9 @@ export class XCollector implements Collector {
     // anchor href. Reading innerText would sync the broken truncated string, so reconstruct the
     // text from the tweetText node: use each <a>'s href for external links, keep emoji alt text,
     // and keep visible text for everything else.
-    const textHtml = await article.evaluate((node: Element) => {
-      const body = Array.from(node.querySelectorAll('[data-testid="tweetText"]'))
-        .find(element => element.closest('article') === node && !element.closest('[data-testid="quoteTweet"]'));
-      return body?.innerHTML || '';
-    }).catch(() => '');
-    const body = parseTweetText(textHtml);
+    // An X Premium long post is cut at "Show more" here; its full text lives only on its status page.
+    const rendered = await readTweetText(article);
+    const body = parseTweetText(rendered.truncated ? await this.fullTextHtml(article, own) : rendered.html);
     const text = body.text;
     // Leave the quote card's text out: a quoted reply shows its own "Replying to @x", which must not make
     // this post a reply too (nor its "Pinned"/"Reposted by" chrome count as this post's).
