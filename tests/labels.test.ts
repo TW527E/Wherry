@@ -13,6 +13,8 @@ test('event log lines read as zh-Hant, and a line nobody translated stays raw', 
     ['Sealing x:1 with stale downstream mirror data (bluesky, sharkey unreachable); manual-mirror detection may be incomplete', '批次 x:1 已封存，但 Bluesky、Sharkey 連不上，手動鏡像判斷可能不完整'],
     ['X batch held: possible_manual_mirror', 'X 批次暫停：疑似手動鏡像'],
     ['Owner action: skip', '你的操作：略過'],
+    ['Housekeeping removed 96 old events, 0 finished bookkeeping entries and 4 unused media files', '定期清理：刪掉 96 筆舊事件、0 筆已完成的紀錄、4 個沒用到的媒體檔'],
+    ['Housekeeping failed: disk full', '定期清理失敗：disk full'],
   ];
   for (const [raw, readable] of cases) assert.equal(readableEvent(raw), readable, raw);
   assert.equal(readableEvent('something new nobody translated'), undefined);
