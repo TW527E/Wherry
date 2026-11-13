@@ -6,6 +6,7 @@ import { validTextMentions, type MentionText } from '../mentions.js';
 import type { AppConfig } from '../config.js';
 import { BLUESKY_SENSITIVE_LABELS, isSensitiveContent, warningPrefix } from '../content-warning.js';
 import type { Attachment, Collector, HttpOptions, PreparedVideo, PublishContext, Publisher, PublishPart, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import { DESTINATION_MAX_MEDIA } from '../media.js';
 import {
   PlatformError, canonicalJson, httpsBase, isoDate, jsonBody, nonempty, object, own,
   positiveInteger, requestJson, schemaError, uncertainError, validateImage, warning, webUrl,
@@ -194,7 +195,7 @@ function parsePost(entry: unknown, accountId: string, pds: string): ParsedPost {
     if (!embed) { valid = false; attachments.push({ kind: 'unknown', alt: '' }); return; }
     switch (embed.$type) {
       case 'app.bsky.embed.images': {
-        if (!Array.isArray(embed.images) || embed.images.length < 1 || embed.images.length > 4
+        if (!Array.isArray(embed.images) || embed.images.length < 1 || embed.images.length > DESTINATION_MAX_MEDIA.bluesky
           || display?.$type !== 'app.bsky.embed.images#view' || !Array.isArray(display.images) || display.images.length !== embed.images.length) valid = false;
         const images = Array.isArray(embed.images) ? embed.images : [], shown = Array.isArray(display?.images) ? display.images : [];
         for (let i = 0; i < images.length; i++) {
@@ -427,7 +428,7 @@ export class BlueskyClient implements Publisher, Collector {
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     if (part.poll) throw new PlatformError('Bluesky has no native polls; render the X options and link before publishing', { code: 'PollNotSupported' });
     const key = blueskyRecordKey(context.idempotencyKey);
-    if (!Array.isArray(part.media) || part.media.length > 4) throw new PlatformError('Bluesky accepts at most four images per part', { code: 'TooManyImages' });
+    if (!Array.isArray(part.media) || part.media.length > DESTINATION_MAX_MEDIA.bluesky) throw new PlatformError(`Bluesky accepts at most ${DESTINATION_MAX_MEDIA.bluesky} images per part`, { code: 'TooManyImages' });
     const pictures = part.media.filter(item => item.mimeType !== 'video/mp4');
     const videos = part.media.filter(item => item.mimeType === 'video/mp4');
     if (videos.length > 1 || (videos.length && pictures.length)) throw new PlatformError('A Bluesky post embeds either images or a single video', { code: 'MixedMedia' });

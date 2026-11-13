@@ -5,7 +5,7 @@ import type { AppConfig } from './config.js';
 import { Store, MIRROR_PENDING_MS } from './store.js';
 import { BLUESKY_SENSITIVE_LABELS, contentWarning, isSensitiveContent, warningPrefix } from './content-warning.js';
 import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
-import { prepareImages } from './media.js';
+import { DESTINATION_MAX_MEDIA, prepareImages, X_MAX_MEDIA } from './media.js';
 import { prepareVideo, MAX_VIDEO_SECONDS } from './video.js';
 import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
@@ -107,11 +107,11 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
     if (!pollSnapshotSchema.safeParse(post.pollData).success) return 'poll_details_unavailable';
     if (!xPollUrl(post)) return 'poll_source_url_invalid';
   }
-  if (post.attachments.length > 4) return 'more_than_four_images';
+  if (post.attachments.length > X_MAX_MEDIA) return 'more_than_twenty_attachments';
   const videos = post.attachments.filter(a => a.kind === 'video');
   if (videos.length) {
     // Videos (an X GIF is one too, a looping MP4) may sit beside images or each other, as X allows (up to
-    // four in all), but only when the operator opted in. An X video is an HLS stream behind a blob: URL,
+    // twenty in all), but only when the operator opted in. An X video is an HLS stream behind a blob: URL,
     // so the collector resolves a progressive MP4 through the public syndication endpoint; when that
     // yields nothing the attachment arrives with neither url nor path and the post is held with a clear
     // reason instead of being force-published without it.
@@ -132,7 +132,7 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
 }
 
 /**
- * Bluesky embeds up to four images or one video per post, never both, so a mixed X post keeps its order
+ * Bluesky embeds up to ten images or one video per post, never both, so a mixed X post keeps its order
  * across consecutive posts: each run of images shares one, each video gets its own.
  */
 function blueskyMediaGroups(media: PreparedMedia[]): PreparedMedia[][] {
@@ -852,8 +852,16 @@ export class Engine {
       }
       // Source order, one at a time: the hold check above already admitted only static images and
       // downloadable videos (videos only with VIDEO_ENABLED), and each video is a transcode.
+      // A destination that takes fewer than the post carries gets the first ones in source order; the
+      // rest are left out rather than spread over extra posts. Trimming before preparing skips
+      // downloading and transcoding what would not be sent.
+      const limit = DESTINATION_MAX_MEDIA[job.destination];
+      const attachments = post.attachments.slice(0, limit);
+      if (attachments.length < post.attachments.length) {
+        this.store.event('info', `${job.destination}: takes ${limit} attachments per post; sending the first ${limit} of ${post.attachments.length}`, Store.postKey(post.platform, post.id));
+      }
       const media: PreparedMedia[] = [];
-      for (const attachment of post.attachments) {
+      for (const attachment of attachments) {
         media.push(...attachment.kind === 'video'
           ? [await prepareVideo(attachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)]
           : await prepareImages([attachment], this.config, this.transport));

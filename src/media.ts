@@ -2,7 +2,17 @@ import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import sharp, { type Metadata } from 'sharp';
-import type { Attachment, PreparedImage, Transport } from './types.js';
+import type { Attachment, Destination, PreparedImage, Transport } from './types.js';
+
+/** The most photos and videos X puts on one post. */
+export const X_MAX_MEDIA = 20;
+/**
+ * The most photos and videos each destination takes on one post: Sharkey's note (Misskey caps fileIds
+ * at 16), a Telegram album (sendMediaGroup takes 2–10) and a Bluesky images embed (10). Argon's 說說 is
+ * a WordPress post with no limit of its own, so it carries all of X's. A post with more than its
+ * destination takes sends the first ones in source order there and leaves the rest out.
+ */
+export const DESTINATION_MAX_MEDIA: Record<Destination, number> = { argon: X_MAX_MEDIA, sharkey: 16, telegram: 10, bluesky: 10 };
 
 interface MediaConfig { dataDir: string; maxDownloadBytes: number; maxImageBytes: number }
 export class UnsupportedMediaError extends Error {
@@ -51,7 +61,7 @@ async function inspect(bytes: Buffer): Promise<Metadata> {
 }
 
 export async function prepareImages(attachments: Attachment[], config: MediaConfig, transport: Transport): Promise<PreparedImage[]> {
-  if (attachments.length > 4) throw new UnsupportedMediaError('Phase 1 supports at most four images');
+  if (attachments.length > X_MAX_MEDIA) throw new UnsupportedMediaError(`At most ${X_MAX_MEDIA} images per post`);
   const result: PreparedImage[] = [];
   for (const attachment of attachments) {
     if (attachment.kind !== 'image' || attachment.animated) throw new UnsupportedMediaError('Phase 1 supports static images only');
