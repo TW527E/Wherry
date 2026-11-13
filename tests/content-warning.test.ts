@@ -109,6 +109,32 @@ test('Bluesky preserves known categories instead of replacing them with the fall
   assert.equal(records[1]!.text, 'CW: 來源警告\n\nexample body');
 });
 
+test('Bluesky posts up to four photos as an images embed and five to ten as a gallery, quoted or not', async () => {
+  const { client, records } = blueskyFixture();
+  const photos = (count: number): PreparedImage[] => Array.from({ length: count }, (_, i) => image(i + 1));
+  await client.publish(part({ media: photos(4) }), { idempotencyKey: 'four' });
+  await client.publish(part({ media: photos(10) }), { idempotencyKey: 'ten' });
+  await client.publish(part({ media: photos(6), quote: { id: `at://${did}/app.bsky.feed.post/quoted`, cid: 'quoted-cid' } }), { idempotencyKey: 'quoted' });
+  await assert.rejects(client.publish(part({ media: photos(11) }), { idempotencyKey: 'eleven' }), /at most 10 images/);
+
+  // The images embed is still capped at four by its lexicon.
+  assert.equal(records[0]!.embed.$type, 'app.bsky.embed.images');
+  assert.equal(records[0]!.embed.images.length, 4);
+  // app.bsky.embed.gallery: items is a union of #image, each with its blob, alt and a required aspect ratio.
+  const gallery = records[1]!.embed;
+  assert.equal(gallery.$type, 'app.bsky.embed.gallery');
+  assert.equal(gallery.images, undefined);
+  assert.deepEqual(gallery.items.map((item: Record<string, any>) => [item.$type, item.alt, item.aspectRatio, item.image?.$type]),
+    photos(10).map(photo => ['app.bsky.embed.gallery#image', photo.alt, { width: 4, height: 4 }, 'blob']));
+  // A quote with five or more photos carries the gallery as its recordWithMedia media.
+  const quoted = records[2]!.embed;
+  assert.equal(quoted.$type, 'app.bsky.embed.recordWithMedia');
+  assert.equal(quoted.record.$type, 'app.bsky.embed.record');
+  assert.equal(quoted.media.$type, 'app.bsky.embed.gallery');
+  assert.equal(quoted.media.items.length, 6);
+  assert.equal(records.length, 3, 'more than ten photos never reaches createRecord');
+});
+
 test('Bluesky sensitive labels accompany both image and video embeds', async t => {
   const directory = mkdtempSync(join(tmpdir(), 'wherry-video-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));

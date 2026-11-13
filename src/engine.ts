@@ -132,7 +132,7 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
 }
 
 /**
- * Bluesky embeds up to ten images or one video per post, never both, so a mixed X post keeps its order
+ * Bluesky embeds up to ten images (a gallery past four) or one video per post, never both, so a mixed X post keeps its order
  * across consecutive posts: each run of images shares one, each video gets its own.
  */
 function blueskyMediaGroups(media: PreparedMedia[]): PreparedMedia[][] {

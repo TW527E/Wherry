@@ -127,6 +127,38 @@ for (const expiredStatus of [400, 401]) test(`Bluesky retains rotated sessions w
   assert.equal(requests.at(-1)!.token, 'Bearer second');
 });
 
+test('the Bluesky collector reads a gallery of photos like an images embed, alone or beside a quote', async () => {
+  const photo = (i: number) => ({ $type: 'app.bsky.embed.gallery#image', alt: `alt ${i}`, aspectRatio: { width: 4, height: 3 },
+    image: { $type: 'blob', ref: { $link: `bafy${i}` }, mimeType: 'image/jpeg', size: 100 + i } });
+  const shown = (i: number) => ({ $type: 'app.bsky.embed.gallery#viewImage', alt: `alt ${i}`, aspectRatio: { width: 4, height: 3 },
+    thumbnail: `https://cdn.example/thumb/${i}.jpg`, fullsize: `https://cdn.example/full/${i}.jpg` });
+  const gallery = { $type: 'app.bsky.embed.gallery', items: Array.from({ length: 7 }, (_, i) => photo(i)) };
+  const galleryView = { $type: 'app.bsky.embed.gallery#view', items: Array.from({ length: 7 }, (_, i) => shown(i)) };
+  const quoted = { uri: `at://${did}/app.bsky.feed.post/older`, cid: 'older-cid' };
+  const entry = (rkey: string, embed: unknown, view: unknown) => ({ post: { uri: `at://${did}/app.bsky.feed.post/${rkey}`, cid: 'offline-cid',
+    author: { did, labels: [] }, labels: [], embed: view, record: { $type: 'app.bsky.feed.post', text: 'body', createdAt: instant, embed } } });
+  const transport: Transport = { async request(url) {
+    if (url.endsWith('/.well-known/did.json')) return json({ id: did, service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: 'https://pds.example' }] });
+    return json({ feed: [
+      entry('plain', gallery, galleryView),
+      entry('quote', { $type: 'app.bsky.embed.recordWithMedia', record: { $type: 'app.bsky.embed.record', record: quoted }, media: gallery },
+        { $type: 'app.bsky.embed.recordWithMedia#view', record: { $type: 'app.bsky.embed.record#view', record: {} }, media: galleryView }),
+      // An untyped gallery item is not the #image the lexicon allows, so the post is held as incomplete.
+      entry('untyped', { ...gallery, items: gallery.items.map(({ $type, ...item }) => item) }, galleryView),
+    ] });
+  } };
+  const snapshot = await new BlueskyClient(loadConfig({ BLUESKY_IDENTIFIER: did }).bluesky, transport).collect('2026-09-01T00:00:00.000Z');
+  const byId = new Map(snapshot.posts.map(post => [post.id.split('/').at(-1)!, post]));
+  for (const id of ['plain', 'quote']) {
+    const post = byId.get(id)!;
+    assert.equal(post.metadataComplete, true, id);
+    assert.deepEqual(post.attachments.map(a => [a.kind, a.alt, a.url, a.width, a.height]),
+      Array.from({ length: 7 }, (_, i) => ['image', `alt ${i}`, `https://cdn.example/full/${i}.jpg`, 4, 3]), id);
+  }
+  assert.ok(byId.get('quote')!.quoteUrl);
+  assert.equal(byId.get('untyped')!.metadataComplete, false);
+});
+
 test('native collectors retain their three-page bound and refuse an uncovered backlog', async () => {
   for (const platform of ['bluesky', 'sharkey'] as const) {
     let pages = 0;

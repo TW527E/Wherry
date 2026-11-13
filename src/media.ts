@@ -8,7 +8,8 @@ import type { Attachment, Destination, PreparedImage, Transport } from './types.
 export const X_MAX_MEDIA = 20;
 /**
  * The most photos and videos each destination takes on one post: Sharkey's note (Misskey caps fileIds
- * at 16), a Telegram album (sendMediaGroup takes 2–10) and a Bluesky images embed (10). Argon's 說說 is
+ * at 16), a Telegram album (sendMediaGroup takes 2–10) and a Bluesky post (an images embed takes four, a
+ * gallery embed ten). Argon's 說說 is
  * a WordPress post with no limit of its own, so it carries all of X's. A post with more than its
  * destination takes sends the first ones in source order there and leaves the rest out.
  */
