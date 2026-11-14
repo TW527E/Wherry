@@ -3,6 +3,7 @@ import type { AppConfig } from '../config.js';
 import { isSensitiveContent, warningPrefix } from '../content-warning.js';
 import { nativePollPayload } from '../poll.js';
 import type { InlineButton, PreparedMedia, PublishContext, PublishPart, Publisher, RemoteRef, Transport } from '../types.js';
+import { DESTINATION_MAX_MEDIA } from '../media.js';
 import { fixupUrl, htmlEscape, splitText } from '../text.js';
 import { PlatformError, multipart, nonempty, object, positiveInteger, requestJson, schemaError, type MultipartFile } from './parse.js';
 
@@ -79,7 +80,7 @@ export class TelegramClient implements Publisher {
     const link = audience === 'public' && part.sourceUrl ? this.footer(part.sourceUrl) : '';
     const body = htmlEscape(part.text);
     const rendered = `${htmlEscape(warningPrefix(part))}${sensitive && body ? `<tg-spoiler>${body}</tg-spoiler>` : body}${link}`;
-    if (part.media.length > 4) throw new Error('Telegram publisher accepts at most four images or videos per durable step');
+    if (part.media.length > DESTINATION_MAX_MEDIA.telegram) throw new Error(`Telegram publisher accepts at most ${DESTINATION_MAX_MEDIA.telegram} images or videos per durable step`);
     const withMedia = part.media.length > 0;
     if (rendered.length > (withMedia ? MAX_CAPTION : MAX_TEXT)) throw new Error(`Telegram ${withMedia ? 'caption' : 'message'} requires core text splitter before publish`);
     const replyField: Record<string, string> = reply ? { reply_parameters: JSON.stringify(reply) } : {};

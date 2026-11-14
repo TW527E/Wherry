@@ -549,7 +549,9 @@ test('video gating: disabled holds video, enabled needs a downloadable source fo
   assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg, animated: true }]), true), 'only_static_images_or_video', 'an animated image file is still not supported');
   assert.equal(unsupportedReason(withVideo([{ kind: 'image', alt: '', url: jpg }, { kind: 'video', alt: '', url: mp4, durationSeconds: 141 }]), true), 'video_exceeds_duration_limit');
   assert.equal(unsupportedReason(withVideo([{ kind: 'video', alt: '', url: mp4 }, { kind: 'unknown', alt: '' }]), true), 'only_static_images_or_video');
-  assert.equal(unsupportedReason(withVideo(Array.from({ length: 5 }, () => ({ kind: 'video' as const, alt: '', url: mp4 }))), true), 'more_than_four_images');
+  // X now takes up to twenty on one post, photos and videos together.
+  assert.equal(unsupportedReason(withVideo(Array.from({ length: 20 }, (_, i) => i % 5 ? { kind: 'image' as const, alt: '', url: jpg } : { kind: 'video' as const, alt: '', url: mp4 })), true), undefined);
+  assert.equal(unsupportedReason(withVideo(Array.from({ length: 21 }, () => ({ kind: 'image' as const, alt: '', url: jpg }))), true), 'more_than_twenty_attachments');
 });
 
 test('a post mixing photos and videos keeps every item in order: Bluesky spreads them over replies, the others take them at once', async t => {
@@ -587,6 +589,42 @@ else require('node:fs').writeFileSync(args.at(-1), 'prepared');
     assert.equal(parts.length, 1, destination);
     assert.deepEqual(kinds(parts[0]!), ['video', 'image', 'image', 'video'], destination);
   }
+});
+
+test('a twenty-photo X post goes whole where the destination takes it and continues in media-only replies elsewhere', async t => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'crosspost-twenty-'));
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
+  mkdirSync(join(dataDir, 'media'));
+  const photos: Attachment[] = [];
+  for (let i = 0; i < 20; i++) {
+    const path = join(dataDir, 'media', `photo-${i}.jpg`);
+    writeFileSync(path, await sharp({ create: { width: 4, height: 4, channels: 3, background: { r: i * 12, g: 0, b: 0 } } }).jpeg().toBuffer());
+    photos.push({ kind: 'image', alt: `photo ${i + 1}`, path });
+  }
+  const config = loadConfig({ DATA_DIR: dataDir, DESTINATIONS: 'bluesky,sharkey,telegram,argon', BLUESKY_ENABLED: 'true', SHARKEY_ENABLED: 'true',
+    ARGON_ENABLED: 'true', ARGON_URL: 'https://blog.example.com', ARGON_USERNAME: 'wherry', ARGON_APP_PASSWORD: 'abcd efgh ijkl mnop',
+    X_ENABLED: 'true', X_HANDLE: 'owner' });
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const engine = new Engine(store, config, transport);
+  store.addBatch({ id: 'x:990', platform: 'x', rootId: '990', rootCreatedAt: at(0), cutoffAt: at(0), settleAt: at(0), state: 'sealed', reason: 'thread_closed' });
+  store.addPost(post({ id: '990', createdAt: at(0), text: 'twenty', attachments: photos }), 'ready', 'thread_closed', at(0), 'x:990');
+  const partsFor = async (destination: Destination) => (await engine.parts(store.getJob(store.enqueue('publish', 'x:990', destination, at(0)))!, at(1)))
+    .filter(part => !part.isFooter);
+  const alts = (from: number, to: number): string[] => photos.slice(from, to).map(photo => photo.alt);
+  // The first line only: Sharkey appends its signature to the main note.
+  const shape = (parts: Awaited<ReturnType<typeof partsFor>>) => parts.map(part => [part.text.split('\n')[0], part.media.map(item => item.alt)]);
+
+  assert.deepEqual(shape(await partsFor('argon')), [['twenty', alts(0, 20)]], 'Argon has no limit, so one 說說 takes all twenty');
+  // Past the limit the rest follow, in order, as a media-only reply below the main post (the worker
+  // chains each part as a reply to the one before).
+  assert.deepEqual(shape(await partsFor('sharkey')), [['twenty', alts(0, 16)], ['', alts(16, 20)]]);
+  assert.deepEqual(shape(await partsFor('bluesky')), [['twenty', alts(0, 10)], ['', alts(10, 20)]]);
+  const telegram = await partsFor('telegram');
+  assert.deepEqual(shape(telegram), [['twenty', alts(0, 10)], ['', alts(10, 20)]]);
+  assert.ok(telegram[0]!.sourceUrl, 'the main album keeps its source link footer');
+  assert.equal(telegram[1]!.sourceUrl, undefined, 'the overflow album carries no caption or repeated footer');
+  assert.deepEqual(telegram.map(part => part.key.split(':')[1]), ['0', '1'], 'each part has its own durable step key');
 });
 
 test('a mixed-media post collected before mixing was supported stays manual: its stored media came from the old collector', () => {
@@ -856,7 +894,7 @@ test('the long-post hold uses X weighted length and only fires when publishing w
   // Only the long-post hold can be released by approve; content holds have no publish path at all.
   assert.equal(holdIsApprovable('long_x_post_requires_manual_review'), true);
   for (const reason of ['poll_not_supported', 'video_sync_disabled', 'sensitive_content_requires_manual_review',
-    'more_than_four_images', 'only_static_images_or_video', 'x_video_has_no_downloadable_source', 'incomplete_metadata']) {
+    'more_than_twenty_attachments', 'only_static_images_or_video', 'x_video_has_no_downloadable_source', 'incomplete_metadata']) {
     assert.equal(holdIsApprovable(reason), false, `${reason} cannot be published, so it must not be approvable`);
   }
 });

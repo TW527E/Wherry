@@ -5,7 +5,7 @@ import type { AppConfig } from './config.js';
 import { Store, MIRROR_PENDING_MS } from './store.js';
 import { BLUESKY_SENSITIVE_LABELS, contentWarning, isSensitiveContent, warningPrefix } from './content-warning.js';
 import { cleanXLinks, fixupUrl, graphemes, htmlEscape, normalizeText, similarity, splitText } from './text.js';
-import { prepareImages } from './media.js';
+import { DESTINATION_MAX_MEDIA, prepareImages, X_MAX_MEDIA } from './media.js';
 import { prepareVideo, MAX_VIDEO_SECONDS } from './video.js';
 import { formatXPoll, nativePollPayload, pollSnapshotSchema, xPollUrl } from './poll.js';
 import { renderXMentions, sliceMentions, validTextMentions, type MentionText } from './mentions.js';
@@ -107,11 +107,11 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
     if (!pollSnapshotSchema.safeParse(post.pollData).success) return 'poll_details_unavailable';
     if (!xPollUrl(post)) return 'poll_source_url_invalid';
   }
-  if (post.attachments.length > 4) return 'more_than_four_images';
+  if (post.attachments.length > X_MAX_MEDIA) return 'more_than_twenty_attachments';
   const videos = post.attachments.filter(a => a.kind === 'video');
   if (videos.length) {
     // Videos (an X GIF is one too, a looping MP4) may sit beside images or each other, as X allows (up to
-    // four in all), but only when the operator opted in. An X video is an HLS stream behind a blob: URL,
+    // twenty in all), but only when the operator opted in. An X video is an HLS stream behind a blob: URL,
     // so the collector resolves a progressive MP4 through the public syndication endpoint; when that
     // yields nothing the attachment arrives with neither url nor path and the post is held with a clear
     // reason instead of being force-published without it.
@@ -132,14 +132,24 @@ export function unsupportedReason(post: SourcePost, videoEnabled = false): strin
 }
 
 /**
- * Bluesky embeds up to four images or one video per post, never both, so a mixed X post keeps its order
- * across consecutive posts: each run of images shares one, each video gets its own.
+ * A post's media in source order, cut into consecutive groups of at most `size`: the first rides on the
+ * main post and each further group on a reply below it, so nothing past a destination's limit is lost.
+ */
+function mediaGroups(media: PreparedMedia[], size: number): PreparedMedia[][] {
+  const groups: PreparedMedia[][] = [];
+  for (let start = 0; start < media.length; start += size) groups.push(media.slice(start, start + size));
+  return groups;
+}
+
+/**
+ * Bluesky embeds up to ten images (a gallery past four) or one video per post, never both, so a mixed X post keeps its order
+ * across consecutive posts: each run of up to ten images shares one, each video gets its own.
  */
 function blueskyMediaGroups(media: PreparedMedia[]): PreparedMedia[][] {
   const groups: PreparedMedia[][] = [];
   for (const item of media) {
     const last = groups.at(-1);
-    if (last && item.mimeType !== 'video/mp4' && last[0]!.mimeType !== 'video/mp4') last.push(item);
+    if (last && item.mimeType !== 'video/mp4' && last[0]!.mimeType !== 'video/mp4' && last.length < DESTINATION_MAX_MEDIA.bluesky) last.push(item);
     else groups.push([item]);
   }
   return groups;
@@ -884,17 +894,20 @@ export class Engine {
         continue;
       }
       if (job.destination === 'telegram') {
-        // A tweet's photos and videos belong to ONE post, so send them as a single album
-        // (sendMediaGroup) with the whole caption on the first item — not one message per item, which
-        // stranded every item after the first with an empty caption and a repeated footer link. Telegram
-        // counts rendered HTML and caps an album caption at 1024, a text message at 4096, so the
-        // caption chunk fits the album and any overflow continues as plain follow-up messages.
+        // A tweet's photos and videos go out as an album (sendMediaGroup) with the whole caption on the
+        // first item — not one message per item, which stranded every item after the first with an empty
+        // caption and a repeated footer link. An album holds ten, so a post with more continues in further
+        // albums, each a reply below the one before. Telegram counts rendered HTML and caps an album
+        // caption at 1024, a text message at 4096, so every caption chunk fits an album; text left over
+        // continues as follow-up messages, and albums left over follow as media-only replies with no
+        // caption or footer of their own.
+        const groups = mediaGroups(media, DESTINATION_MAX_MEDIA.telegram);
         const chunks = splitHtml(text, media.length ? 1024 : 4096,
           (sourceUrl ? 120 : 0) + htmlEscape(prefix).length + (sensitive ? '<tg-spoiler></tg-spoiler>'.length : 0), mentions);
-        const caption = chunks[0] ?? '';
-        output.push({ key: `${key}:0`, sourcePostId: post.id, text: caption, media, sourceUrl, ...marking, ...(quoted ? { quote: quoted } : {}) });
-        for (let i = 1; i < chunks.length; i++) {
-          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunks[i]!, media: [], sourceUrl, ...marking });
+        for (let i = 0; i < Math.max(1, chunks.length, groups.length); i++) {
+          const chunk = chunks[i] ?? '';
+          output.push({ key: `${key}:${i}`, sourcePostId: post.id, text: chunk, media: groups[i] ?? [],
+            ...(chunk || i === 0 ? { sourceUrl } : {}), ...marking, ...(quoted && i === 0 ? { quote: quoted } : {}) });
         }
         if (poll) {
           const question = body.text.trim();
@@ -913,9 +926,10 @@ export class Engine {
         const chunks = splitText(text, job.destination === 'bluesky'
           ? { graphemes: 300 - graphemes(prefix).length, utf8Bytes: 3000 - Buffer.byteLength(prefix, 'utf8') }
           : { utf16 }, mentions);
-        // Sharkey takes the whole mix on one note. Bluesky's groups ride on successive text parts, and any
-        // left over follow as media-only replies, so the thread stays in source order either way.
-        const groups = job.destination === 'bluesky' ? blueskyMediaGroups(media) : media.length ? [media] : [];
+        // Each destination's media groups ride on successive text parts, and any left over follow as
+        // media-only replies, so the thread stays in source order: Sharkey takes sixteen per note,
+        // Bluesky ten images or one video per post.
+        const groups = job.destination === 'bluesky' ? blueskyMediaGroups(media) : mediaGroups(media, DESTINATION_MAX_MEDIA.sharkey);
         let offset = 0;
         for (let index = 0; index < Math.max(chunks.length, groups.length); index++) {
           const chunk = chunks[index] ?? '';

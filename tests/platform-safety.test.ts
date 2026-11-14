@@ -288,6 +288,13 @@ test('the poll flag and sensitive label survive parsing into post facts', () => 
   assert.equal(plain.sensitive, false, 'a post with no warning is not sensitive');
 });
 
+test('a post whose carousel photos never rendered is held as incomplete instead of synced short', () => {
+  const base = { id: '123', authorId: 'owner', createdAt: '2026-09-19T00:00:00.000Z', text: 'twenty photos' };
+  assert.equal(parseTweetFacts(base, 'owner').metadataComplete, true);
+  assert.equal(parseTweetFacts({ ...base, mediaIncomplete: false }, 'owner').metadataComplete, true);
+  assert.equal(parseTweetFacts({ ...base, mediaIncomplete: true }, 'owner').metadataComplete, false);
+});
+
 test('a timeline self-thread continuation is parsed as a self-reply to the tweet above it', () => {
   const base = { authorId: 'owner', createdAt: '2026-09-19T00:00:00.000Z' };
   // The Posts timeline shows no "Replying to" header and embeds no parent status link for an
