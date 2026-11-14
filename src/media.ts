@@ -11,7 +11,7 @@ export const X_MAX_MEDIA = 20;
  * at 16), a Telegram album (sendMediaGroup takes 2–10) and a Bluesky post (an images embed takes four, a
  * gallery embed ten). Argon's 說說 is
  * a WordPress post with no limit of its own, so it carries all of X's. A post with more than its
- * destination takes sends the first ones in source order there and leaves the rest out.
+ * destination takes sends the rest, in source order, as media-only replies below the main post.
  */
 export const DESTINATION_MAX_MEDIA: Record<Destination, number> = { argon: X_MAX_MEDIA, sharkey: 16, telegram: 10, bluesky: 10 };
 

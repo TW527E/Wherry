@@ -591,7 +591,7 @@ else require('node:fs').writeFileSync(args.at(-1), 'prepared');
   }
 });
 
-test('a twenty-photo X post goes whole where the destination takes it and is cut to its first photos elsewhere', async t => {
+test('a twenty-photo X post goes whole where the destination takes it and continues in media-only replies elsewhere', async t => {
   const dataDir = mkdtempSync(join(tmpdir(), 'crosspost-twenty-'));
   t.after(() => rmSync(dataDir, { recursive: true, force: true }));
   mkdirSync(join(dataDir, 'media'));
@@ -609,15 +609,22 @@ test('a twenty-photo X post goes whole where the destination takes it and is cut
   const engine = new Engine(store, config, transport);
   store.addBatch({ id: 'x:990', platform: 'x', rootId: '990', rootCreatedAt: at(0), cutoffAt: at(0), settleAt: at(0), state: 'sealed', reason: 'thread_closed' });
   store.addPost(post({ id: '990', createdAt: at(0), text: 'twenty', attachments: photos }), 'ready', 'thread_closed', at(0), 'x:990');
-  const sent = async (destination: Destination): Promise<string[][]> => (await engine.parts(store.getJob(store.enqueue('publish', 'x:990', destination, at(0)))!, at(1)))
-    .filter(part => !part.isFooter).map(part => part.media.map(item => item.alt));
-  const first = (count: number): string[] => photos.slice(0, count).map(photo => photo.alt);
+  const partsFor = async (destination: Destination) => (await engine.parts(store.getJob(store.enqueue('publish', 'x:990', destination, at(0)))!, at(1)))
+    .filter(part => !part.isFooter);
+  const alts = (from: number, to: number): string[] => photos.slice(from, to).map(photo => photo.alt);
+  // The first line only: Sharkey appends its signature to the main note.
+  const shape = (parts: Awaited<ReturnType<typeof partsFor>>) => parts.map(part => [part.text.split('\n')[0], part.media.map(item => item.alt)]);
 
-  assert.deepEqual(await sent('argon'), [first(20)], 'Argon has no limit, so it takes all twenty');
-  assert.deepEqual(await sent('sharkey'), [first(16)], 'one note with the first sixteen');
-  assert.deepEqual(await sent('telegram'), [first(10)], 'one album with the first ten');
-  assert.deepEqual(await sent('bluesky'), [first(10)], 'one post with the first ten, no extra replies');
-  assert.ok(store.events(20).some(event => /telegram: takes 10 attachments per post; sending the first 10 of 20/.test(event.message)));
+  assert.deepEqual(shape(await partsFor('argon')), [['twenty', alts(0, 20)]], 'Argon has no limit, so one 說說 takes all twenty');
+  // Past the limit the rest follow, in order, as a media-only reply below the main post (the worker
+  // chains each part as a reply to the one before).
+  assert.deepEqual(shape(await partsFor('sharkey')), [['twenty', alts(0, 16)], ['', alts(16, 20)]]);
+  assert.deepEqual(shape(await partsFor('bluesky')), [['twenty', alts(0, 10)], ['', alts(10, 20)]]);
+  const telegram = await partsFor('telegram');
+  assert.deepEqual(shape(telegram), [['twenty', alts(0, 10)], ['', alts(10, 20)]]);
+  assert.ok(telegram[0]!.sourceUrl, 'the main album keeps its source link footer');
+  assert.equal(telegram[1]!.sourceUrl, undefined, 'the overflow album carries no caption or repeated footer');
+  assert.deepEqual(telegram.map(part => part.key.split(':')[1]), ['0', '1'], 'each part has its own durable step key');
 });
 
 test('a mixed-media post collected before mixing was supported stays manual: its stored media came from the old collector', () => {

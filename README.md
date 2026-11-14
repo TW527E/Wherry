@@ -247,8 +247,8 @@ SQLite 在 `DATA_DIR/crosspost.sqlite`（WAL、權限 600），媒體快取在 `
 <a id="media"></a>
 ## 媒體與網路
 
-- 預設只支援**靜態圖片**，每篇最多 20 張（X 的上限）；平台收不下全部時只發前面幾張、其餘不發：Argon 20、Sharkey 16、Telegram 10、Bluesky 10。依平台限制壓縮（Bluesky 上限 2 MB），先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
-- 動態圖片檔（APNG 等）不處理。`VIDEO_ENABLED=true` 時，影片與 GIF 從公開嵌入端點取能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質 MP4，經 FFmpeg 轉碼後同步，可與圖片或其他影片混在同一則（合計最多 20 個，同樣依上述各平台上限截斷，[限制](docs/configuration.md#video)）。
+- 預設只支援**靜態圖片**，每篇最多 20 張（X 的上限）；平台一則收不下時，其餘的依原順序發成只有圖片的回覆、接在主文下方（每則上限：Argon 20、Sharkey 16、Telegram 10、Bluesky 10）。依平台限制壓縮（Bluesky 上限 2 MB），先轉正、移除 EXIF，透明圖保留 PNG、其餘轉 JPEG。
+- 動態圖片檔（APNG 等）不處理。`VIDEO_ENABLED=true` 時，影片與 GIF 從公開嵌入端點取能塞進 `MAX_DOWNLOAD_BYTES` 的最高畫質 MP4，經 FFmpeg 轉碼後同步，可與圖片或其他影片混在同一則（合計最多 20 個，同樣依上述各平台上限分成回覆，[限制](docs/configuration.md#video)）。
 
 API、媒體下載與上傳都經過同一個受保護的 HTTP 通道：
 

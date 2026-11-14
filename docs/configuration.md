@@ -209,14 +209,14 @@ X 貼文 tag 的 `@帳號` 到了 Bluesky／Sharkey／Telegram 不一定存在�
 
 正常新 root 的預設最早封存時間約為「root 發布後 600 + 180 秒」，仍須等到實際輪詢及來源新鮮度合格。若很晚才第一次讀到該 root，至少再等 180 秒。`once` 不會駐留等待窗口结束；需要之後再執行，或用 `serve` 常駐。
 
-固定而非 env 的限制包括：每篇最多 20 個附件（各平台每則只發前 N 個：Argon 20、Sharkey 16、Telegram 10、Bluesky 10，多的不發）、每張輸出最多 **2000000 bytes**、圖片解碼最多 4000 萬像素、pending mirror 初始有效期 72 小時、Telegram session 上傳上限 256 KiB。Bluesky／Sharkey collector 目前各最多讀 3 頁、每頁最多 100 筆；沒有對應 env 可調整。
+固定而非 env 的限制包括：每篇最多 20 個附件（每則貼文的上限：Argon 20、Sharkey 16、Telegram 10、Bluesky 10；超過的部分依原順序，以只有圖片／影片的回覆接在主文下方）、每張輸出最多 **2000000 bytes**、圖片解碼最多 4000 萬像素、pending mirror 初始有效期 72 小時、Telegram session 上傳上限 256 KiB。Bluesky／Sharkey collector 目前各最多讀 3 頁、每頁最多 100 筆；沒有對應 env 可調整。
 
 <a id="video"></a>
 ## 選用影片轉碼（3 個）
 
 | 設定鍵 | 預設值 | 作用、格式與限制 | 如何取得／選擇 |
 |---|---|---|---|
-| `VIDEO_ENABLED` | `false` | 設 true 後，解析得到可下載來源的影片會轉成 MP4，再交給下游 publisher；同一則推文可以像 X 一樣混合圖片與影片（合計最多 20 個，超過平台上限的部分不發）。開啟時每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（公開嵌入端點）取 MP4 與完整媒體順序。GIF 在 X 上本身就是 MP4，照影片流程同步：Bluesky 以 GIF 呈現（`presentation: gif`）、Telegram 單獨一個時用 `sendAnimation`（相簿裡則當影片）、Sharkey 上傳 MP4。只有 HLS 沒有 MP4、超過 140 秒的影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
+| `VIDEO_ENABLED` | `false` | 設 true 後，解析得到可下載來源的影片會轉成 MP4，再交給下游 publisher；同一則推文可以像 X 一樣混合圖片與影片（合計最多 20 個，超過平台上限的部分以回覆接在主文下方）。開啟時每則含影片的推文會多打一次 `cdn.syndication.twimg.com`（公開嵌入端點）取 MP4 與完整媒體順序。GIF 在 X 上本身就是 MP4，照影片流程同步：Bluesky 以 GIF 呈現（`presentation: gif`）、Telegram 單獨一個時用 `sendAnimation`（相簿裡則當影片）、Sharkey 上傳 MP4。只有 HLS 沒有 MP4、超過 140 秒的影片仍保留。 | 只在已安裝 FFmpeg、確認帳戶限制後啟用；不保證所有平台帳戶都能接受。 |
 | `FFMPEG_PATH` | `ffmpeg` | 轉碼程式名（由 `PATH` 搜尋）或執行檔路徑；不是 shell 命令或額外參數欄位。 | 從系統套件管理器安裝 FFmpeg，確認包含 H.264／AAC 編碼器。 |
 | `FFPROBE_PATH` | `ffprobe` | 探測影片資訊的程式名或執行檔路徑。一般文字與靜態圖片同步不會呼叫。 | 通常隨 FFmpeg 套件提供；自行確認實際安裝路徑。 |
 
@@ -389,7 +389,7 @@ Web 介面可透過 SSH 通道存取，例如將本機埠轉送到伺服器 `127
 | `/session` 被拒絕 | 核對 owner/private chat、live、輪詢、X enabled、明確的 `/session` 指令／caption、本工具匯出格式與 256 KiB 上限；勿反覆把登入檔傳到其他 chat。 |
 | `unknown` 或送出後連線中斷 | 先人工確認遠端是否已有內容並處理對帳。`/retry`、`/resync`、CLI retry 都不是強制重送 unknown 的後門，不能靠重啟解決。 |
 | 429／暫時失敗 | 已確認安全重試的工作會按伺服器延遲／退避處理，至 `MAX_ATTEMPTS` 上限；不要密集手動重試。送出結果不明則另走對帳。 |
-| 影片／GIF／超過 20 個附件不發布 | 圖片、影片與 GIF 合計最多 20 個，可混合；平台收不下時只發前面幾個（Argon 20、Sharkey 16、Telegram 10、Bluesky 10）。影片與 GIF 需 `VIDEO_ENABLED=true`、FFmpeg，且嵌入端點解析得到每一個的 MP4；任何一個解析不到、只有 HLS 或超過 140 秒，整則都會保留，理由寫在事件與網頁的貼文列表裡。 |
+| 影片／GIF／超過 20 個附件不發布 | 圖片、影片與 GIF 合計最多 20 個，可混合；平台一則收不下時，其餘的以只有媒體的回覆接在主文下方（每則上限：Argon 20、Sharkey 16、Telegram 10、Bluesky 10）。影片與 GIF 需 `VIDEO_ENABLED=true`、FFmpeg，且嵌入端點解析得到每一個的 MP4；任何一個解析不到、只有 HLS 或超過 140 秒，整則都會保留，理由寫在事件與網頁的貼文列表裡。 |
 | 想知道某則為什麼沒同步 | 看網頁介面的「最近讀到的貼文」，每則都列出分類與原因；`self_reply_outside_new_batch` 若伴隨 `never collected` 的 warn 事件，代表上一則沒被收集到（可提高 `X_MAX_PAGES` 或縮短 `POLL_SECONDS`）。 |
 | 外部 URL 被拒絕 | API／媒體通道會拒絕私有、loopback、保留／metadata 位址、不允許的埠與不安全重導向。先核對服務 URL，不要停用防護或嵌入帳密。 |
 | Web 寫入回 401 | 設 token 後須在 UI 填入相同值；未設 token 的 loopback 仍要求 JSON／同來源。不要為了方便把服務直接公開。 |
