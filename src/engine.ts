@@ -539,7 +539,9 @@ export class Engine {
     this.store.transaction(() => {
       this.store.addBatch({ id, platform: 'local', rootId: post.id, rootCreatedAt: now, cutoffAt: now, settleAt: due, state: 'sealed', reason: 'scheduled_no_x_url_yet' });
       this.store.addPost(post, 'ready', 'local_scheduled', now, id);
-      this.store.addMirror(post, now);
+      // The anti-echo window starts when the post actually goes out, not when it was scheduled:
+      // a post scheduled weeks ahead must still be recognised when its manual X copy appears.
+      this.store.addMirror(post, due);
       for (const destination of destinations) this.store.enqueue('publish', id, destination, now, due);
       // Same as a native post: the reminder exists only to notify, so it is queued only when it can reach
       // the owner. The scheduled post still publishes to every enabled destination either way.
@@ -812,14 +814,21 @@ export class Engine {
     const members = job.kind === 'publish' ? this.store.batchPosts(job.aggregateId).filter(p => p.classification !== 'deleted').map(p => p.post) : [this.store.postByKey(job.aggregateId)?.post].filter((p): p is SourcePost => Boolean(p));
     if (!members.length) throw new Error('Job source not found');
     const planKey = `mention-plan:${job.id}`;
-    let bodies = this.store.setting<MentionText[] | undefined>(planKey, undefined);
+    // The plan is keyed by source post id. A member deleted on X between attempts drops out of
+    // `members`, and a plan indexed by position would then hand each later post its neighbour's text.
+    const savedPlan = this.store.setting<MentionText[] | Record<string, MentionText> | undefined>(planKey, undefined);
+    // Plans saved before this change are positional arrays; they are only safe while no member has gone.
+    let bodies: Record<string, MentionText> | undefined = Array.isArray(savedPlan)
+      ? (savedPlan.length === members.length ? Object.fromEntries(members.map((post, index) => [post.id, savedPlan[index]!])) : undefined)
+      : savedPlan;
     // Pin the rewrite the first time it matters: editing a mapping between attempts must not re-split
     // text whose earlier parts may already be delivered. A job that already delivered part of itself
     // predates the pin, so it keeps the plain rendering rather than shifting under its own receipts.
     if (!bodies && job.kind === 'publish' && !this.store.hasDeliveryEvidence(job.id) && members.some(post => post.mentions?.length)) {
       const mappings = this.store.mentionMappings();
-      bodies = members.map(post => renderXMentions(post, job.destination, mappings));
-      if (job.destination === 'bluesky' && this.config.mode === 'live') await resolveBlueskyMentions(bodies, this.config.bluesky.publicUrl, this.transport);
+      const rendered = members.map(post => renderXMentions(post, job.destination, mappings));
+      if (job.destination === 'bluesky' && this.config.mode === 'live') await resolveBlueskyMentions(rendered, this.config.bluesky.publicUrl, this.transport);
+      bodies = Object.fromEntries(members.map((post, index) => [post.id, rendered[index]!]));
       this.store.setSetting(planKey, bodies);
     }
     const output: PublishPart[] = [];
@@ -858,7 +867,7 @@ export class Engine {
           ? [await prepareVideo(attachment, { dataDir: this.config.dataDir, maxDownloadBytes: this.config.maxDownloadBytes, ffmpegPath: this.config.media.ffmpegPath, ffprobePath: this.config.media.ffprobePath }, this.transport)]
           : await prepareImages([attachment], this.config, this.transport));
       }
-      const body = bodies?.[postIndex] ?? { text: cleanXLinks(post.text), mentions: [] };
+      const body = bodies?.[post.id] ?? { text: cleanXLinks(post.text), mentions: [] };
       let text = body.text;
       const mentions = body.mentions;
       // Quoting your own already-synced X post quotes its copy on this destination. Telegram can only
@@ -1031,6 +1040,12 @@ export class Worker {
           });
           store.transaction(() => {
             store.finishStep(job.id, part.key, ref);
+            // The X original may have been found deleted while this send was in flight. The deletion
+            // check saw no delivered copy then, so queue the retraction now that one exists.
+            if (job.kind === 'publish' && part.key !== 'notice') {
+              const source = store.getPost('x', part.sourcePostId);
+              if (source?.classification === 'deleted') store.enqueue('retract', source.key, job.destination, now);
+            }
             if (part.key === 'notice' && ref.chatId && ref.messageIds?.[0]) {
               if (job.kind === 'ops') store.armReviewNotice(job.aggregateId, ref.chatId, ref.messageIds[0], now);
               else if (job.kind === 'reminder') store.armReminder(ref.messageIds[0], ref.chatId, job.aggregateId, `mirror:${job.aggregateId}`, now);

@@ -189,6 +189,8 @@ export function parseTweetFacts(input: {
   statusLinks?: string[]; replyingTo?: string; attachments?: Attachment[]; repost?: boolean; quoteUrl?: string;
   poll?: boolean;
   pollData?: PollSnapshot;
+  // The author's name row shows X's lock icon: the account is protected, so the post is not public.
+  protectedAccount?: boolean;
   // The author's own tweet shown directly above this one in a grouped self-thread, detected from the
   // timeline's visual reply connector (see hasReplyConnectorBelow). When set, this post is a known
   // self-reply to that tweet — the strongest signal available, because the Posts timeline omits the
@@ -211,7 +213,7 @@ export function parseTweetFacts(input: {
   const relationKnown = !isReply || Boolean(input.threadParentId) || Boolean(parentLink);
   return {
     platform: 'x',
-    visibility: 'public',
+    visibility: input.protectedAccount ? 'restricted' : 'public',
     id: input.id,
     url: ownUrl,
     authorId: input.authorId || ownerHandle,
@@ -556,6 +558,10 @@ export class XCollector implements Collector {
       return (clone as HTMLElement).innerText || '';
     }).catch(() => '');
     const sensitive = hasSensitiveWarning(chromeText);
+    // A protected account's own posts are readable in its signed-in browser but are not public.
+    // X marks them with a lock icon in the author's name row; such posts must never be mirrored.
+    const protectedAccount = await article.locator('[data-testid="User-Name"] [data-testid="icon-lock"]')
+      .evaluateAll(nodes => nodes.some(node => !node.closest('[data-testid="quoteTweet"]'))).catch(() => false);
     // Request the original pixels (name=orig) rather than the blurry timeline thumbnail.
     const shown: Attachment[] = images.map(image => ({ kind: 'image' as const, url: fullSizeImageUrl(image.url), alt: image.alt }));
     // The page has no downloadable video and no reliable order between photos and videos, so a video
@@ -582,7 +588,7 @@ export class XCollector implements Collector {
     // Expand any t.co short link the DOM left in the text to its real destination before the
     // post is handed downstream, so other platforms show the real URL, not a t.co short link.
     const resolved = await this.resolveShortLinks({ text: bodyText, mentions: body.mentions }, signal);
-    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: resolved.text, mentions: resolved.mentions, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor }, this.config.handle);
+    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: resolved.text, mentions: resolved.mentions, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor, protectedAccount }, this.config.handle);
     return { parsed, articleText };
   }
 

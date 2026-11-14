@@ -31,7 +31,7 @@
 
 - ❌ 自動登入 X、選檔、按 Post。程式碼中沒有任何 X 寫入路徑。
 - ❌ 反偵測、輪換代理、繞過驗證或速率限制。
-- ❌ 同步回覆他人、晚發的自回覆、轉貼、引用或非公開內容。
+- ❌ 同步回覆他人、晚發的自回覆、轉貼或非公開內容（受保護帳號的貼文也算非公開）。
 - ❌ 純音訊、動態圖片檔（APNG 等）、X Premium 長文：一律**保留**並通知原因。長文可由通知手動放行（發布時自動分段），其餘沒有發布路徑。
 
 投票不在上面兩類：Sharkey／Telegram 各建一份**獨立**原生投票（票數不與 X 或彼此合併，沿用 X 的截止時間）；Bluesky 與 Argon 說說沒有原生投票，改以文字列出選項並附 X 原投票連結。資料不完整、已過期或敏感的投票仍會保留。
@@ -67,7 +67,7 @@ npm run cli -- serve      # 啟動排程、worker 與網頁介面
 
 **`login` 不能省**：X 讀取靠一個持久化瀏覽器 profile。`login` 用你選的瀏覽器開可見視窗，你手動登入（含兩步驟驗證）後回終端機按 Enter，session 就存進 `X_PROFILE_DIR`，之後 `scan`／`serve` 都以無頭模式重用。沒登入的話會撞到登入牆、讀不到任何推文（`scan` 會回報 session 未登入）。
 
-**先用 preview 確認行為**：預設 `APP_MODE=preview` 時，讀取、分類、組批次照常執行（讀 X 是唯讀的），只有「發布」換成 stub 不對外送出。在網頁按「立刻檢查」就能看到偵測到哪些推文、預計發什麼。確認無誤再改 `live`。
+**先用 preview 確認行為**：預設 `APP_MODE=preview` 時，讀取、分類、組批次照常執行（讀 X 是唯讀的），只有「發布」換成 stub 不對外送出。在網頁按「立刻檢查」就能看到偵測到哪些推文、預計發什麼。確認無誤再改 `live`。**改 `live` 時請換一個新的 `DATA_DIR`**：preview 的工作已記為 `succeeded`，沿用同一個資料目錄不會把它們補發到真實平台。
 
 - Telegram 的對外發文、互動提醒、錯誤轉發**只在 `live` 送出**。指令與 session 上傳另需 `TELEGRAM_POLL_COMMANDS=true`。
 - 網頁介面預設只綁 `127.0.0.1:3000`。沒設 `WEB_TOKEN` 時只接受 `Host` 為 `127.0.0.1`／`localhost`／`[::1]` 的請求（擋 DNS rebinding）。綁其他位址時 `WEB_TOKEN` 必須至少 32 字元；設了 token 後，**所有 `/api/*`（讀取也算）**都要帶 `Authorization: Bearer <token>`，只有頁面本身與 `/healthz` 不需要。遠端存取請用 SSH 通道：`ssh -L 3000:127.0.0.1:3000 user@host`。
@@ -178,7 +178,8 @@ npm run cli -- import-session            # 安裝 X_SESSION_FILE 的登入
 | 回覆一串早已同步完成的舊推文 | `self_reply_outside_new_batch` |
 | 自回覆的上一則從未被收集到 | `self_reply_outside_new_batch`，並記一筆 `warn` 說明收集缺口 |
 | 串文分支（非線性） | 保留待審，不強行攤平 |
-| 轉貼、引用、非公開、超過 4 個附件 | 保留或忽略，不會靜默降級 |
+| 轉貼、非公開（含受保護帳號）、超過 4 個附件 | 保留或忽略，不會靜默降級 |
+| 引用推文 | 會同步你的引用評論：引用的是自己已同步的推文時，改引用下游的那份副本；否則附上被引用推文的連結 |
 | 影片、GIF | `VIDEO_ENABLED=true`、每支都解析得到 MP4、長度 ≤140 秒才同步；否則保留並說明理由。GIF 在 X 上本身就是 MP4，照影片流程同步：Bluesky 以 GIF 呈現（`presentation: gif`）、Telegram 單獨一個時用 `sendAnimation`（相簿裡則當影片）、Sharkey 上傳 MP4。 |
 | 圖片與影片混合 | 照原順序同步：Telegram 一個相簿、Sharkey 一則 note；Bluesky 不能混放，連續圖片共用一則、每支影片各一則，依序接成串文 |
 | 投票 | 見[會做與不會做](#scope)；資料不完整／已過期／敏感才保留 |

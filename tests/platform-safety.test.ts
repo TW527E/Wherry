@@ -286,6 +286,9 @@ test('the poll flag and sensitive label survive parsing into post facts', () => 
   const plain = parseTweetFacts({ ...base, text: 'hello' }, 'owner');
   assert.equal(plain.poll, false, 'a post with no poll widget is not a poll');
   assert.equal(plain.sensitive, false, 'a post with no warning is not sensitive');
+  assert.equal(plain.visibility, 'public');
+  const locked = parseTweetFacts({ ...base, text: 'private', protectedAccount: true }, 'owner');
+  assert.equal(locked.visibility, 'restricted', 'a protected account\'s post is never treated as public');
 });
 
 test('a timeline self-thread continuation is parsed as a self-reply to the tweet above it', () => {
