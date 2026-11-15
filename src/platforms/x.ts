@@ -542,7 +542,11 @@ export class XCollector implements Collector {
         counts = await photoCounts();
       }
     }
-    const mediaIncomplete = counts.rendered < counts.linked;
+    // `article` is an index-based locator. Scrolling can make the virtualised timeline drop the
+    // articles above it, so the same index may now point at a different tweet. Reading on would pair
+    // this tweet's id and text with another tweet's photos; stop instead and let the next scan retry.
+    if ((await articleIdentity(article)).id !== own) throw new Error(`X timeline changed while reading ${own}; it will be read again on the next scan`);
+    const domIncomplete = counts.rendered < counts.linked;
     const pictures = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.filter(node => !node.closest('[data-testid="quoteTweet"]'))
       .map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '',
         poster: node.closest('[data-testid="previewInterstitial"], [data-testid="videoPlayer"]') !== null })));
@@ -583,7 +587,12 @@ export class XCollector implements Collector {
     // The page has no downloadable video and no reliable order between photos and videos, so a video
     // tweet takes its whole media list from the embed endpoint. Without that, the page's photos plus a
     // source-less video stay held exactly as before.
-    const media = hasVideo ? await this.resolveMedia(own, signal) ?? [...shown, { kind: 'video', alt: '' }] : shown;
+    // The embed endpoint is also the way out when the page did not render every linked photo: if it
+    // lists them all, the post is complete and must not stay held as incomplete forever.
+    const embedded = hasVideo || domIncomplete ? await this.resolveMedia(own, signal) : undefined;
+    const embedComplete = embedded !== undefined && embedded.filter(item => item.kind === 'image').length >= counts.linked;
+    const media = hasVideo ? embedded ?? [...shown, { kind: 'video', alt: '' }] : domIncomplete && embedComplete ? embedded! : shown;
+    const mediaIncomplete = domIncomplete && !embedComplete;
     // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
     // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
     // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
