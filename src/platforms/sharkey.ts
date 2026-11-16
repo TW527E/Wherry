@@ -3,6 +3,7 @@ import type { AppConfig } from '../config.js';
 import { contentWarning, isSensitiveContent } from '../content-warning.js';
 import { nativePollPayload } from '../poll.js';
 import type { Attachment, Collector, PublishContext, PublishPart, Publisher, RemoteRef, SourcePost, SourceSnapshot, Transport } from '../types.js';
+import { DESTINATION_MAX_MEDIA } from '../media.js';
 import {
   PlatformError, httpsBase, isoDate, jsonBody, multipart, nonempty, object, own, positiveInteger,
   requestJson, schemaError, validateImage, warning, webUrl, type JsonObject,
@@ -235,7 +236,7 @@ export class SharkeyClient implements Publisher, Collector {
   async publish(part: PublishPart, context: PublishContext): Promise<RemoteRef> {
     if (!this.config.token) throw new PlatformError('A Sharkey API token is required for publishing', { code: 'MissingCredentials' });
     if (!nonempty(context.idempotencyKey)) throw new PlatformError('A durable idempotency key is required', { code: 'MissingIdempotencyKey' });
-    if (!Array.isArray(part.media) || part.media.length > 4) throw new PlatformError('At most four images or videos per note', { code: 'TooManyImages' });
+    if (!Array.isArray(part.media) || part.media.length > DESTINATION_MAX_MEDIA.sharkey) throw new PlatformError(`At most ${DESTINATION_MAX_MEDIA.sharkey} images or videos per note`, { code: 'TooManyImages' });
     if (part.poll) {
       if (part.media.length) throw new PlatformError('An X poll cannot be combined with media', { code: 'MixedMedia' });
       nativePollPayload(part.poll, 'sharkey', this.now().getTime());

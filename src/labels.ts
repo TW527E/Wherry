@@ -27,6 +27,7 @@ export const LABELS: Record<string, string> = {
   manual_mirror_registered: '已登記手動鏡像',
   manual_x_reminder: '已提醒你手動發到 X',
   more_than_four_images: '附件超過 4 個',
+  more_than_twenty_attachments: '附件超過 20 個',
   multiple_possible_manual_mirrors: '有多則可能是手動鏡像',
   native_relationship_unknown: '無法判斷回覆關係',
   no_mirror_evidence: '新內容',
