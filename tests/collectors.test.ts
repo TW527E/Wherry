@@ -90,6 +90,24 @@ test('the X video lookup asks syndication once per tweet, skips it when video is
   }
 });
 
+test('a photo-only post the page under-rendered gets every photo from the embed endpoint, video sync on or off', async () => {
+  const xConfig = (): ReturnType<typeof loadConfig>['x'] => loadConfig({ X_HANDLE: 'TW527E' }).x;
+  const photos = { mediaDetails: [1, 2, 3].map(n => ({ type: 'photo', media_url_https: `https://pbs.twimg.com/media/p${n}.jpg`, ext_alt_text: `alt ${n}` })) };
+  for (const media of [undefined, { video: false, maxDownloadBytes: 1 }, { video: true, maxDownloadBytes: 1 }]) {
+    const calls: string[] = [];
+    const collector = new XCollector(xConfig(), { async request(url) { calls.push(url); return json(photos); } }, media);
+    const resolved = await collector['resolveAllMedia']('321');
+    assert.deepEqual(resolved?.map(item => [item.kind, item.alt]), [['image', 'alt 1'], ['image', 'alt 2'], ['image', 'alt 3']]);
+    assert.match(resolved![0]!.url!, /^https:\/\/pbs\.twimg\.com\/media\/p1/);
+    await collector['resolveAllMedia']('321');
+    assert.equal(calls.length, 1, 'cached per tweet id');
+    // The video-only lookup still declines a photo-only payload.
+    assert.equal(await collector['resolveMedia']('321'), undefined);
+  }
+  assert.equal(await new XCollector(xConfig(), { async request() { return json({ mediaDetails: [] }); } })['resolveAllMedia']('1'), undefined);
+  assert.equal(await new XCollector(xConfig(), { async request() { throw new Error('offline'); } })['resolveAllMedia']('1'), undefined);
+});
+
 // The real PDS answers an expired access token with HTTP 400 ExpiredToken; 401 is kept for other servers.
 for (const expiredStatus of [400, 401]) test(`Bluesky retains rotated sessions without a persistence callback and retries with the refreshed token (HTTP ${expiredStatus})`, async () => {
   const requests: Array<{ method: string; token?: string }> = [];

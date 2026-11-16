@@ -114,8 +114,19 @@ export async function xPostState(transport: Transport, tweetId: string): Promise
 export function pickMedia(payload: unknown, maxDownloadBytes: number): Attachment[] | undefined {
   const details = object(payload)?.mediaDetails;
   if (!Array.isArray(details)) return undefined;
+  if (!details.map(object).some(entry => entry?.type === 'video' || entry?.type === 'animated_gif')) return undefined;
+  return embedAttachments(payload, maxDownloadBytes);
+}
+
+/**
+ * Every attachment the embed payload lists, photos included, whether or not there is a video. Used
+ * when the page rendered fewer photos than the post links: a photo-only post needs this as much as a
+ * video one, and needs it with video sync off too. Undefined when the payload lists no media.
+ */
+export function embedAttachments(payload: unknown, maxDownloadBytes: number): Attachment[] | undefined {
+  const details = object(payload)?.mediaDetails;
+  if (!Array.isArray(details) || !details.length) return undefined;
   const entries = details.map(object);
-  if (!entries.some(entry => entry?.type === 'video' || entry?.type === 'animated_gif')) return undefined;
   return entries.map((entry): Attachment => {
     const alt = typeof entry?.ext_alt_text === 'string' ? entry.ext_alt_text : '';
     const url = entry?.type === 'photo' ? fullSizeImageUrl(typeof entry.media_url_https === 'string' ? entry.media_url_https : undefined) : undefined;
@@ -343,6 +354,8 @@ export class XCollector implements Collector {
   // Resolved media of a video tweet, per tweet id (null = looked up, nothing usable). Cached for the
   // collector's lifetime so a tweet re-read on every scan costs at most one syndication request.
   private readonly videoMedia = new Map<string, Attachment[] | null>();
+  // Every attachment of a post whose page did not render all its photos, per tweet id (null = none).
+  private readonly allMedia = new Map<string, Attachment[] | null>();
   // The tweet a quote card shows, per quoting tweet id (null = looked up, unknown).
   private readonly quotes = new Map<string, string | null>();
   // A long post's full body HTML, per tweet id, read once from its own status page.
@@ -369,6 +382,21 @@ export class XCollector implements Collector {
     const resolved = payload === undefined ? undefined : pickMedia(payload, this.media.maxDownloadBytes);
     // A lookup cut short by shutdown is not a real "nothing here"; leave it uncached so the next run retries.
     if (!signal?.aborted) this.videoMedia.set(tweetId, resolved ?? null);
+    return resolved;
+  }
+
+  /**
+   * All of a post's media from the embed endpoint, photos included, regardless of the video setting:
+   * the way out for a post whose page rendered fewer photos than it links. A video in the answer is
+   * still held downstream when video sync is off.
+   */
+  private async resolveAllMedia(tweetId: string, signal?: AbortSignal): Promise<Attachment[] | undefined> {
+    if (!this.transport) return undefined;
+    const cached = this.allMedia.get(tweetId);
+    if (cached !== undefined) return cached ?? undefined;
+    const payload = await this.syndication(tweetId);
+    const resolved = payload === undefined ? undefined : embedAttachments(payload, this.media?.maxDownloadBytes ?? 0);
+    if (!signal?.aborted) this.allMedia.set(tweetId, resolved ?? null);
     return resolved;
   }
 
@@ -544,7 +572,11 @@ export class XCollector implements Collector {
         counts = await photoCounts();
       }
     }
-    const mediaIncomplete = counts.rendered < counts.linked;
+    // `article` is an index-based locator. Scrolling can make the virtualised timeline drop the
+    // articles above it, so the same index may now point at a different tweet. Reading on would pair
+    // this tweet's id and text with another tweet's photos; stop instead and let the next scan retry.
+    if ((await articleIdentity(article)).id !== own) throw new Error(`X timeline changed while reading ${own}; it will be read again on the next scan`);
+    const domIncomplete = counts.rendered < counts.linked;
     const pictures = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.filter(node => !node.closest('[data-testid="quoteTweet"]'))
       .map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '',
         poster: node.closest('[data-testid="previewInterstitial"], [data-testid="videoPlayer"]') !== null })));
@@ -589,7 +621,12 @@ export class XCollector implements Collector {
     // The page has no downloadable video and no reliable order between photos and videos, so a video
     // tweet takes its whole media list from the embed endpoint. Without that, the page's photos plus a
     // source-less video stay held exactly as before.
-    const media = hasVideo ? await this.resolveMedia(own, signal) ?? [...shown, { kind: 'video', alt: '' }] : shown;
+    // The embed endpoint is also the way out when the page did not render every linked photo: if it
+    // lists them all, the post is complete and must not stay held as incomplete forever.
+    const embedded = hasVideo ? await this.resolveMedia(own, signal) : domIncomplete ? await this.resolveAllMedia(own, signal) : undefined;
+    const embedComplete = embedded !== undefined && embedded.filter(item => item.kind === 'image').length >= counts.linked;
+    const media = hasVideo ? embedded ?? [...shown, { kind: 'video', alt: '' }] : domIncomplete && embedComplete ? embedded! : shown;
+    const mediaIncomplete = domIncomplete && !embedComplete;
     // A quote links to a DIFFERENT tweet id. Compare the parsed status id, not the raw path:
     // a tweet's own sub-pages (/analytics, /likes, /retweets, /photo/1) share the same id and
     // must not be mistaken for a quoted tweet. Only a link whose status id differs is a quote.
