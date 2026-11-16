@@ -628,7 +628,7 @@ section{padding:1rem}button{min-height:44px}.tabs button,.seg button,button.smal
 <main id="main">
 <div class="banners">
 <div id="offline" class="banner err" role="alert" hidden><span id="offline-text" style="flex:1">連不上 Wherry。</span><button type="button" id="retry-now" class="small">現在重試</button></div>
-<div id="preview" class="banner" hidden><span><b>預覽模式</b>：照常讀取與分類，但不會真的發布到任何平台。確認行為正確後把 <code>APP_MODE</code> 改成 <code>live</code>。</span></div>
+<div id="preview" class="banner" hidden><span><b>預覽模式</b>：照常讀取與分類，但不會真的發布到任何平台。確認行為正確後把 <code>APP_MODE</code> 改成 <code>live</code>，並換一個新的 <code>DATA_DIR</code>；這裡顯示「已完成」的預覽工作不會補發到真實平台。</span></div>
 <form id="token-box" class="token" hidden><div><b>輸入存取權杖</b><p class="hint" style="margin:0">這台 Wherry 有設定 WEB_TOKEN。權杖只存在這個瀏覽器。</p><div class="field"><label for="token">權杖</label><input id="token" type="password" autocomplete="off" aria-describedby="token-err"></div><div id="token-err" class="note bad" role="alert" hidden></div><div class="actions"><button type="submit" class="primary">確認並連線</button></div></div></form>
 </div>
 <div class="col col-main">
