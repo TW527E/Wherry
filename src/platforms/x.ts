@@ -195,6 +195,8 @@ export function parseTweetFacts(input: {
   // "Replying to" header and never embeds the parent status link for in-context continuations.
   threadParentId?: string;
   threadParentAuthor?: string;
+  // Some of the post's photos never rendered, so its attachment list is short.
+  mediaIncomplete?: boolean;
 }, ownerHandle: string): TweetFacts {
   const ownUrl = input.url;
   // Any link into the quoted tweet (its permalink, its /photo/1) belongs to the quote, not a reply parent.
@@ -227,7 +229,7 @@ export function parseTweetFacts(input: {
     ...(input.pollData ? { pollData: input.pollData } : {}),
     attachments: (input.attachments || []).map(a => ({ ...a, url: validMediaUrl(a.url) })),
     sensitive: Boolean(input.labels?.length),
-    metadataComplete: Boolean(input.id && input.authorId && input.createdAt && relationKnown),
+    metadataComplete: Boolean(input.id && input.authorId && input.createdAt && relationKnown && !input.mediaIncomplete),
   };
 }
 
@@ -521,6 +523,26 @@ export class XCollector implements Collector {
     // so a card-only tweet still carries its link downstream.
     const cardHref = await article.locator('[data-testid="card.wrapper"] a[href^="http"], a[data-testid="card.layoutLarge.media"], a[data-testid="card.layoutSmall.media"]')
       .evaluateAll(nodes => nodes.find(node => !node.closest('[data-testid="quoteTweet"]'))?.getAttribute('href') ?? null).catch(() => null);
+    // A post with more than four photos shows them in a carousel that renders its tweetPhoto images only
+    // once the post is on screen, while every photo's /photo/N link is already there. Reading it early
+    // would sync the post with some or none of its photos, so bring it into view and wait for them; if
+    // they still do not all appear, the post is held as incomplete rather than sent short.
+    const photoCounts = (): Promise<{ linked: number; rendered: number }> => article.evaluate((node: Element, id: string) => {
+      const own = (element: Element): boolean => !element.closest('[data-testid="quoteTweet"]');
+      const linked = new Set(Array.from(node.querySelectorAll(`a[href*="/status/${id}/photo/"]`)).filter(own)
+        .map(anchor => anchor.getAttribute('href')?.match(/\/photo\/(\d+)/)?.[1]).filter(Boolean)).size;
+      const rendered = Array.from(node.querySelectorAll('[data-testid="tweetPhoto"] img')).filter(own).length;
+      return { linked, rendered };
+    }, own).catch(() => ({ linked: 0, rendered: 0 }));
+    let counts = await photoCounts();
+    if (counts.rendered < counts.linked) {
+      await article.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+      for (let tries = 0; tries < 10 && counts.rendered < counts.linked && !signal?.aborted; tries++) {
+        await article.page().waitForTimeout(500);
+        counts = await photoCounts();
+      }
+    }
+    const mediaIncomplete = counts.rendered < counts.linked;
     const pictures = await article.locator('[data-testid="tweetPhoto"] img').evaluateAll(nodes => nodes.filter(node => !node.closest('[data-testid="quoteTweet"]'))
       .map(node => ({ url: (node as HTMLImageElement).src, alt: (node as HTMLImageElement).alt || '',
         poster: node.closest('[data-testid="previewInterstitial"], [data-testid="videoPlayer"]') !== null })));
@@ -582,7 +604,7 @@ export class XCollector implements Collector {
     // Expand any t.co short link the DOM left in the text to its real destination before the
     // post is handed downstream, so other platforms show the real URL, not a t.co short link.
     const resolved = await this.resolveShortLinks({ text: bodyText, mentions: body.mentions }, signal);
-    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: resolved.text, mentions: resolved.mentions, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor }, this.config.handle);
+    const parsed = parseTweetFacts({ id: own, url: `https://x.com/${this.config.handle}/status/${own}`, authorId, createdAt: time || undefined, text: resolved.text, mentions: resolved.mentions, replyingTo: replyMatch?.[1], statusLinks: links, attachments: media, repost: authorId.toLowerCase() !== this.config.handle.toLowerCase() || /reposted by/i.test(articleText), quoteUrl: quote, poll: hasPoll, pollData, labels: sensitive ? ['sensitive_media'] : undefined, threadParentId: ctx.threadParentId, threadParentAuthor: ctx.threadParentAuthor, mediaIncomplete }, this.config.handle);
     return { parsed, articleText };
   }
 
